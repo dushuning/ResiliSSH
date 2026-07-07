@@ -82,7 +82,7 @@ src-tauri/target/release/bundle/dmg/ResiliSSH_*.dmg
 
 ### 方式二：GitHub Releases
 
-在 [Releases](https://github.com/dushuning/ResiliSSH/releases) 下载 `ResiliSSH_1.0.0_*.dmg`（或最新版），打开后拖入「应用程序」。
+在 [Releases](https://github.com/dushuning/ResiliSSH/releases) 下载最新 `.dmg`（如 `ResiliSSH_1.0.0_aarch64.dmg`），打开后拖入「应用程序」。
 
 未签名构建首次打开若被拦截，请 **右键 → 打开**。
 
@@ -176,26 +176,7 @@ npm run icon         # 从 logo 重新生成图标（需项目内脚本环境）
 
 ---
 
-## 在 GitHub 创建公开仓库（维护者备忘）
-
-创建仓库时可填写：
-
-| 字段 | 建议值 |
-|------|--------|
-| **Repository name** | `ResiliSSH` |
-| **Visibility** | Public |
-| **Description** | `macOS SFTP tool for large file upload/download with weak-network resume, block verify, and SHA-256 checksum.` |
-| **Topics** | `macos` `sftp` `tauri` `rust` `file-transfer` `resume` `ssh` |
-
-首次推送后：
-
-1. `npm run app` 构建 `.dmg`
-2. 创建 tag `v1.0.0` 并上传 Release 附件
-3. 在 About 中勾选展示 Latest release（可选）
-
----
-
 ## 说明
 
-- 应用显示名：**ResiliSSH**（`com.resiliss.desktop`）  
+- 应用显示名：**ResiliSSH**（`com.resiliss.desktop`）
 - 本地开发目录若仍为 `sshutil`，与 GitHub 仓库名 `ResiliSSH` 不一致无影响
