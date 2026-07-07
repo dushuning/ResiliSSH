@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Tooling
+.icon-venv/
+
+# Build
+dist/
+src-tauri/target/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log

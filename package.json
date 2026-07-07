@@ -1,0 +1,25 @@
+{
+  "name": "sshutil",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "icon": ".icon-venv/bin/python scripts/fix_icon.py logo.png && tauri icon src-tauri/icons/source-square.png -o src-tauri/icons && cp src-tauri/icons/128x128.png public/app-logo.png",
+    "app:debug": "tauri build --debug",
+    "app": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.4.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-notification": "^2.3.3"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.4.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}
