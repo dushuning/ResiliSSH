@@ -498,7 +498,7 @@ const remoteBrowseCloseBtn = document.querySelector<HTMLButtonElement>("#remoteB
 let isTransferring = false;
 let cancelInFlight = false;
 let isReconnecting = false;
-type RunnerMood = "fast" | "steady" | "struggle" | "paused";
+type RunnerMood = "fast" | "steady" | "struggle" | "waiting";
 let runnerMood: RunnerMood = "steady";
 let runnerMoodCandidate: RunnerMood = "steady";
 let runnerMoodCandidateSince = 0;
@@ -1604,7 +1604,7 @@ function updateTransferActivityMood() {
   const target = resolveRunnerMood();
   const now = Date.now();
 
-  if (target === "paused" || target === "struggle") {
+  if (target === "waiting" || target === "struggle") {
     runnerMood = target;
     runnerMoodCandidate = target;
     runnerMoodCandidateSince = now;
@@ -1629,7 +1629,7 @@ function resolveRunnerMood(): RunnerMood {
     progressWrap.classList.contains("stalled") ||
     (lastProgressEventAt > 0 && Date.now() - lastProgressEventAt >= SPEED_STALE_MS)
   ) {
-    return "paused";
+    return "waiting";
   }
 
   const speed = estimateTransferSpeedBps();
@@ -1640,7 +1640,7 @@ function resolveRunnerMood(): RunnerMood {
 }
 
 function applyRunnerMood(mood: RunnerMood) {
-  transferScene.classList.remove("mood-fast", "mood-steady", "mood-struggle", "mood-paused");
+  transferScene.classList.remove("mood-fast", "mood-steady", "mood-struggle", "mood-waiting");
   transferScene.classList.add(`mood-${mood}`);
 }
 
@@ -1703,6 +1703,23 @@ function showProgressSpeed(text: string, stale = false) {
   progressSpeed.classList.remove("hidden");
   progressSpeed.classList.toggle("stale", stale);
   syncProgressStatsRow();
+}
+
+/** Stall/retry 副文本：动态计时，避免用户误以为界面卡死 */
+function showWaitingSpeedText(elapsedMs: number) {
+  const secs = Math.floor(elapsedMs / 1000);
+  const text = isReconnecting
+    ? retryCount > 0
+      ? `重连中... (第 ${retryCount} 次重试 · 已等待 ${secs}s)`
+      : `重连中... (已等待 ${secs}s)`
+    : `等待响应... (已等待 ${secs}s)`;
+  showProgressSpeed(text, true);
+}
+
+/** 刚进入重连时的副文本，不含等待秒数 */
+function showReconnectingSpeedText() {
+  const text = retryCount > 0 ? `重连中... (第 ${retryCount} 次重试)` : "重连中...";
+  showProgressSpeed(text, true);
 }
 
 function hideProgressSpeed() {
@@ -1900,22 +1917,23 @@ function refreshStallUi() {
   if (!isTransferring || lastProgressEventAt === 0) return;
 
   const elapsed = Date.now() - lastProgressEventAt;
-  if (elapsed < SPEED_STALE_MS) return;
+  if (elapsed < SPEED_STALE_MS && !isReconnecting) return;
 
-  progressSpeed.textContent = elapsed >= UI_STALL_WARN_MS ? "无响应" : "等待响应...";
-  showProgressSpeed(progressSpeed.textContent, true);
+  if (elapsed >= SPEED_STALE_MS) {
+    showWaitingSpeedText(elapsed);
+    updateTransferActivityMood();
+  }
 
   if (elapsed >= UI_STALL_WARN_MS) {
     progressWrap.classList.add("stalled");
     applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
-    updateTransferActivityMood();
   }
 }
 
 function startProgressWatchdog() {
   stopProgressWatchdog();
   markProgressActivity();
-  progressWatchdogTimer = window.setInterval(refreshStallUi, 2000);
+  progressWatchdogTimer = window.setInterval(refreshStallUi, SPEED_REFRESH_MS);
   speedDisplayTimer = window.setInterval(refreshSpeedDisplay, SPEED_REFRESH_MS);
 }
 
@@ -2664,7 +2682,9 @@ function handleProgressUpdate(
     isReconnecting = true;
     progressWrap.classList.add("stalled");
     applyActiveTransferBadge(direction);
-    showProgressSpeed("正在重连...", true);
+    showWaitingSpeedText(
+      lastProgressEventAt > 0 ? Date.now() - lastProgressEventAt : UI_STALL_WARN_MS,
+    );
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(message, "retry");
     updateTransferActivityMood();
@@ -2740,7 +2760,7 @@ function handleProgressUpdate(
     isReconnecting = true;
     setProgressState("retrying");
     setBadge("重试中", "retrying");
-    showProgressSpeed("重连中...", true);
+    showReconnectingSpeedText();
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(message, "retry");
     updateTransferActivityMood();
@@ -2820,7 +2840,7 @@ void listen<UploadRetryEvent>("upload-retry", (event) => {
   isReconnecting = true;
   setProgressState("retrying");
   setBadge("重试中", "retrying");
-  showProgressSpeed("重连中...", true);
+  showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
   updateTransferActivityMood();
 });
@@ -2830,7 +2850,7 @@ void listen<DownloadRetryEvent>("download-retry", (event) => {
   isReconnecting = true;
   setProgressState("retrying");
   setBadge("重试中", "retrying");
-  showProgressSpeed("重连中...", true);
+  showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
   updateTransferActivityMood();
 });

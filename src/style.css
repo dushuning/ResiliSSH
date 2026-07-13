@@ -552,13 +552,39 @@ button.ghost-link:hover {
 }
 
 .badge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
   font-weight: 600;
   padding: 3px 10px;
   border-radius: 999px;
   background: var(--btn-secondary-bg);
   color: var(--text-secondary);
+}
+
+.badge.stalled,
+.badge.retrying {
+  gap: 7px;
+}
+
+.badge.stalled::before,
+.badge.retrying::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  flex-shrink: 0;
+  opacity: 0.88;
+  animation: badge-spin 0.85s linear infinite;
+}
+
+@keyframes badge-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .badge.uploading {
@@ -612,7 +638,16 @@ progress::-webkit-progress-value {
 }
 
 .progress-wrap.retrying progress::-webkit-progress-value {
-  background: var(--progress-retry);
+  background: var(--progress-retry-shimmer, var(--progress-retry));
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--progress-retry) 0,
+    var(--progress-retry) 8px,
+    var(--progress-retry-stripe) 8px,
+    var(--progress-retry-stripe) 16px
+  );
+  background-size: 24px 24px;
+  animation: progress-shimmer 1.2s linear infinite;
 }
 
 .progress-wrap.verifying progress::-webkit-progress-value {
@@ -620,7 +655,39 @@ progress::-webkit-progress-value {
 }
 
 .progress-wrap.stalled progress::-webkit-progress-value {
-  background: var(--progress-retry);
+  background: var(--progress-retry-shimmer, var(--progress-retry));
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--progress-retry) 0,
+    var(--progress-retry) 8px,
+    var(--progress-retry-stripe) 8px,
+    var(--progress-retry-stripe) 16px
+  );
+  background-size: 24px 24px;
+  animation: progress-shimmer 1.2s linear infinite;
+}
+
+.progress-wrap.retrying progress::-moz-progress-bar,
+.progress-wrap.stalled progress::-moz-progress-bar {
+  background: var(--progress-retry-shimmer, var(--progress-retry));
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--progress-retry) 0,
+    var(--progress-retry) 8px,
+    var(--progress-retry-stripe) 8px,
+    var(--progress-retry-stripe) 16px
+  );
+  background-size: 24px 24px;
+  animation: progress-shimmer 1.2s linear infinite;
+}
+
+@keyframes progress-shimmer {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 24px 0;
+  }
 }
 
 .badge.stalled {
@@ -823,34 +890,44 @@ progress::-webkit-progress-value {
   );
 }
 
-.mood-paused .data-packet {
+.mood-waiting .data-packet {
   animation: none;
-  opacity: 0.38;
-  filter: saturate(0.65);
-  transform: scale(1);
+  opacity: 0.42;
+  filter: saturate(0.72);
+  transform: scale(0.94);
 }
 
-.mood-paused .data-packet:nth-child(1) {
+.mood-waiting .data-packet:nth-child(1) {
   left: 18%;
+  animation: packet-breathe 2.2s ease-in-out infinite;
+  animation-delay: 0s;
 }
 
-.mood-paused .data-packet:nth-child(2) {
+.mood-waiting .data-packet:nth-child(2) {
   left: 32%;
+  animation: packet-breathe 2.2s ease-in-out infinite;
+  animation-delay: 0.35s;
 }
 
-.mood-paused .data-packet:nth-child(3) {
+.mood-waiting .data-packet:nth-child(3) {
   left: 48%;
+  animation: packet-wait-drift 3.2s ease-in-out infinite;
+  animation-delay: 0.1s;
 }
 
-.mood-paused .data-packet:nth-child(4) {
+.mood-waiting .data-packet:nth-child(4) {
   left: 64%;
+  animation: packet-breathe 2.2s ease-in-out infinite;
+  animation-delay: 0.7s;
 }
 
-.mood-paused .data-packet:nth-child(5) {
+.mood-waiting .data-packet:nth-child(5) {
   left: 78%;
+  animation: packet-breathe 2.2s ease-in-out infinite;
+  animation-delay: 1.05s;
 }
 
-.mood-paused .data-flow-pipe-track {
+.mood-waiting .data-flow-pipe-track {
   background: linear-gradient(
     90deg,
     transparent 0%,
@@ -860,9 +937,47 @@ progress::-webkit-progress-value {
   );
 }
 
-.mood-paused .data-flow-remote {
+.mood-waiting .data-flow-remote {
   background: linear-gradient(145deg, var(--accent-orange), var(--accent-orange-text));
-  box-shadow: 0 1px 6px rgba(255, 149, 0, 0.25);
+  animation: remote-wait-pulse 2s ease-in-out infinite;
+}
+
+@keyframes packet-breathe {
+  0%,
+  100% {
+    opacity: 0.28;
+    transform: scale(0.88);
+  }
+  50% {
+    opacity: 0.68;
+    transform: scale(1);
+  }
+}
+
+@keyframes packet-wait-drift {
+  0%,
+  100% {
+    left: 45%;
+    opacity: 0.32;
+    transform: scale(0.9);
+  }
+  50% {
+    left: 52%;
+    opacity: 0.72;
+    transform: scale(1);
+  }
+}
+
+@keyframes remote-wait-pulse {
+  0%,
+  100% {
+    box-shadow: 0 1px 6px rgba(255, 149, 0, 0.22);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 1px 14px rgba(255, 149, 0, 0.42);
+    transform: scale(1.07);
+  }
 }
 
 @keyframes data-packet-flow {
@@ -886,6 +1001,49 @@ progress::-webkit-progress-value {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .badge.stalled::before,
+  .badge.retrying::before {
+    animation: none;
+    border-top-color: currentColor;
+    opacity: 0.65;
+  }
+
+  .progress-wrap.stalled progress::-webkit-progress-value,
+  .progress-wrap.retrying progress::-webkit-progress-value,
+  .progress-wrap.stalled progress::-moz-progress-bar,
+  .progress-wrap.retrying progress::-moz-progress-bar {
+    animation: none;
+  }
+
+  .mood-waiting .data-packet {
+    animation: none;
+    opacity: 0.45;
+  }
+
+  .mood-waiting .data-packet:nth-child(1) {
+    left: 18%;
+  }
+
+  .mood-waiting .data-packet:nth-child(2) {
+    left: 36%;
+  }
+
+  .mood-waiting .data-packet:nth-child(3) {
+    left: 54%;
+  }
+
+  .mood-waiting .data-packet:nth-child(4) {
+    left: 72%;
+  }
+
+  .mood-waiting .data-packet:nth-child(5) {
+    left: 86%;
+  }
+
+  .mood-waiting .data-flow-remote {
+    animation: none;
+  }
+
   .data-packet {
     animation: none;
     opacity: 0.45;

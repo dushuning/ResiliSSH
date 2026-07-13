@@ -54,6 +54,7 @@
   --progress-active: #64b5f6;
   --progress-upload: #34c759;
   --progress-retry: #ff9500;
+  --progress-retry-stripe: color-mix(in srgb, var(--progress-retry) 58%, transparent);
   --drop-highlight-bg: #f0f7ff;
   --radio-checked-bg: #f0f7ff;
   --radio-checked-text: #0058b0;
@@ -128,6 +129,7 @@
     --progress-active: #409cff;
     --progress-upload: #30d158;
     --progress-retry: #ff9f0a;
+    --progress-retry-stripe: color-mix(in srgb, var(--progress-retry) 58%, transparent);
     --drop-highlight-bg: #1a2a3d;
     --radio-checked-bg: rgba(10, 132, 255, 0.15);
     --radio-checked-text: #64b5f6;
@@ -202,6 +204,7 @@ html[data-theme="dark"] {
   --progress-active: #409cff;
   --progress-upload: #30d158;
   --progress-retry: #ff9f0a;
+  --progress-retry-stripe: color-mix(in srgb, var(--progress-retry) 58%, transparent);
   --drop-highlight-bg: #1a2a3d;
   --radio-checked-bg: rgba(10, 132, 255, 0.15);
   --radio-checked-text: #64b5f6;
@@ -275,6 +278,7 @@ html[data-theme="light"] {
   --progress-active: #64b5f6;
   --progress-upload: #34c759;
   --progress-retry: #ff9500;
+  --progress-retry-stripe: color-mix(in srgb, var(--progress-retry) 58%, transparent);
   --drop-highlight-bg: #f0f7ff;
   --radio-checked-bg: #f0f7ff;
   --radio-checked-text: #0058b0;
