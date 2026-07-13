@@ -98,7 +98,7 @@ pub fn spawn_stall_watchdog(
             };
 
             log::warn!(
-                "upload stall detected at {stalled_bytes} bytes after {:?}, aborting socket",
+                "transfer stall detected at {stalled_bytes} bytes after {:?}, aborting socket",
                 stall_timeout
             );
 

@@ -498,7 +498,15 @@ const remoteBrowseCloseBtn = document.querySelector<HTMLButtonElement>("#remoteB
 let isTransferring = false;
 let cancelInFlight = false;
 let isReconnecting = false;
-type RunnerMood = "fast" | "steady" | "struggle" | "waiting";
+/** 传输已发起但尚未收到首条进度：与 stall 等待区分，避免误判为卡死 */
+let isConnecting = false;
+/** 块读回校验进行中：对用户透明，仅用于抑制误报 stall */
+let isChunkVerifying = false;
+/** 全文件 SHA-256 校验进行中 */
+let isFullVerifying = false;
+let retryDelayMs = 0;
+let retryScheduledAt = 0;
+type RunnerMood = "fast" | "steady" | "struggle" | "waiting" | "connecting" | "verifying";
 let runnerMood: RunnerMood = "steady";
 let runnerMoodCandidate: RunnerMood = "steady";
 let runnerMoodCandidateSince = 0;
@@ -650,6 +658,7 @@ function setTransferring(running: boolean) {
   transferActivity.classList.toggle("hidden", !running);
   transferActivity.setAttribute("aria-hidden", running ? "false" : "true");
   if (running) {
+    isConnecting = true;
     clearProbeDebounce();
     backgroundProbeGeneration++;
     lastProbe = null;
@@ -661,6 +670,11 @@ function setTransferring(running: boolean) {
     cancelInFlight = false;
     cancelBtn.disabled = false;
     isReconnecting = false;
+    isConnecting = false;
+    isChunkVerifying = false;
+    isFullVerifying = false;
+    retryDelayMs = 0;
+    retryScheduledAt = 0;
     stopProgressWatchdog();
     progressDetail.classList.add("hidden");
     hideProgressSpeed();
@@ -1393,9 +1407,10 @@ async function startDownloadFlow() {
   setTransferring(true);
   retryCount = 0;
   resetSpeedTracker();
+  isConnecting = true;
   setProgressState("uploading");
-  setBadge("下载中", "uploading");
-  showProgressSpeed("正在连接…");
+  applyActiveTransferBadge("download");
+  showProgressSpeed("正在建立 SSH 连接…");
 
   await invokeStartDownload(forceOverwrite);
 }
@@ -1476,9 +1491,10 @@ async function startUploadFlow() {
   setUploading(true);
   retryCount = 0;
   resetSpeedTracker();
+  isConnecting = true;
   setProgressState("uploading");
-  setBadge("上传中", "uploading");
-  showProgressSpeed("正在连接…");
+  applyActiveTransferBadge("upload");
+  showProgressSpeed("正在建立 SSH 连接…");
 
   await invokeStartUpload(forceOverwrite);
 }
@@ -1575,9 +1591,14 @@ function setProgressState(state: "idle" | "uploading" | "retrying" | "verifying"
   if (state === "verifying") progressWrap.classList.add("verifying");
 }
 
-/** 传输进行中徽章：仅在重连/无响应时显示异常态，累计重试次数不影响「上传中」 */
+/** 传输进行中徽章：连接中 / 重连无响应 / 正常传输 */
 function applyActiveTransferBadge(direction: TransferDirection) {
   const badgeActive = direction === "upload" ? "上传中" : "下载中";
+  if (isConnecting) {
+    setProgressState("uploading");
+    setBadge("连接中", "retrying");
+    return;
+  }
   if (progressWrap.classList.contains("stalled")) {
     setProgressState("retrying");
     setBadge("等待响应", "stalled");
@@ -1592,7 +1613,7 @@ function applyActiveTransferBadge(direction: TransferDirection) {
   setBadge(badgeActive, "uploading");
 }
 
-/** 数据流动画流速随网速三态变化 */
+/** 数据流动画流速随网速与传输阶段变化 */
 function updateTransferActivityMood() {
   if (!isTransferring) {
     runnerMood = "steady";
@@ -1604,7 +1625,7 @@ function updateTransferActivityMood() {
   const target = resolveRunnerMood();
   const now = Date.now();
 
-  if (target === "waiting" || target === "struggle") {
+  if (target === "waiting" || target === "struggle" || target === "connecting" || target === "verifying") {
     runnerMood = target;
     runnerMoodCandidate = target;
     runnerMoodCandidateSince = now;
@@ -1624,6 +1645,15 @@ function updateTransferActivityMood() {
 }
 
 function resolveRunnerMood(): RunnerMood {
+  if (isConnecting) {
+    return "connecting";
+  }
+  if (isFullVerifying) {
+    return "verifying";
+  }
+  if (isChunkVerifying) {
+    return "steady";
+  }
   if (
     isReconnecting ||
     progressWrap.classList.contains("stalled") ||
@@ -1641,7 +1671,10 @@ function resolveRunnerMood(): RunnerMood {
 
 function applyRunnerMood(mood: RunnerMood) {
   transferScene.classList.remove("mood-fast", "mood-steady", "mood-struggle", "mood-waiting");
-  transferScene.classList.add(`mood-${mood}`);
+  // connecting/verifying 无独立粒子样式，复用 steady 表现
+  const visual =
+    mood === "connecting" || mood === "verifying" ? "steady" : mood;
+  transferScene.classList.add(`mood-${visual}`);
 }
 
 function estimateTransferSpeedBps(): number | null {
@@ -1705,21 +1738,36 @@ function showProgressSpeed(text: string, stale = false) {
   syncProgressStatsRow();
 }
 
+/** 重试退避剩余秒数，供副文本展示 */
+function formatRetryDelayHint(): string {
+  if (retryScheduledAt <= 0 || retryDelayMs <= 0) return "";
+  const remaining = Math.max(0, Math.ceil((retryScheduledAt + retryDelayMs - Date.now()) / 1000));
+  return remaining > 0 ? `约 ${remaining}s 后重试` : "";
+}
+
 /** Stall/retry 副文本：动态计时，避免用户误以为界面卡死 */
 function showWaitingSpeedText(elapsedMs: number) {
   const secs = Math.floor(elapsedMs / 1000);
-  const text = isReconnecting
-    ? retryCount > 0
-      ? `重连中... (第 ${retryCount} 次重试 · 已等待 ${secs}s)`
-      : `重连中... (已等待 ${secs}s)`
-    : `等待响应... (已等待 ${secs}s)`;
-  showProgressSpeed(text, true);
+  const delayHint = formatRetryDelayHint();
+  const details: string[] = [];
+  if (isReconnecting && retryCount > 0) details.push(`第 ${retryCount} 次重试`);
+  if (delayHint) details.push(delayHint);
+  details.push(`已等待 ${secs}s`);
+  const prefix = isReconnecting ? "重连中..." : "等待响应...";
+  showProgressSpeed(`${prefix} (${details.join(" · ")})`, true);
 }
 
-/** 刚进入重连时的副文本，不含等待秒数 */
+/** 刚进入重连时的副文本 */
 function showReconnectingSpeedText() {
-  const text = retryCount > 0 ? `重连中... (第 ${retryCount} 次重试)` : "重连中...";
-  showProgressSpeed(text, true);
+  const delayHint = formatRetryDelayHint();
+  const details: string[] = [];
+  if (retryCount > 0) details.push(`第 ${retryCount} 次重试`);
+  if (delayHint) details.push(delayHint);
+  const prefix = "重连中...";
+  showProgressSpeed(
+    details.length > 0 ? `${prefix} (${details.join(" · ")})` : prefix,
+    true,
+  );
 }
 
 function hideProgressSpeed() {
@@ -1851,6 +1899,11 @@ function resetSpeedTracker() {
   lastProgressBarBytes = 0;
   speedSamples = [];
   isReconnecting = false;
+  isConnecting = false;
+  isChunkVerifying = false;
+  isFullVerifying = false;
+  retryDelayMs = 0;
+  retryScheduledAt = 0;
   hideProgressSpeed();
   progressWrap.classList.remove("stalled");
   progressDetail.classList.add("hidden");
@@ -1859,6 +1912,10 @@ function resetSpeedTracker() {
 
 function markProgressActivity() {
   lastProgressEventAt = Date.now();
+  isConnecting = false;
+  isChunkVerifying = false;
+  retryDelayMs = 0;
+  retryScheduledAt = 0;
   const wasStalled = progressWrap.classList.contains("stalled");
   const wasReconnecting = isReconnecting;
   progressWrap.classList.remove("stalled");
@@ -1916,6 +1973,17 @@ function refreshSpeedDisplay() {
 function refreshStallUi() {
   if (!isTransferring || lastProgressEventAt === 0) return;
 
+  if (isConnecting) {
+    applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
+    showProgressSpeed("正在建立 SSH 连接…");
+    updateTransferActivityMood();
+    return;
+  }
+
+  if (isChunkVerifying) {
+    return;
+  }
+
   const elapsed = Date.now() - lastProgressEventAt;
   if (elapsed < SPEED_STALE_MS && !isReconnecting) return;
 
@@ -1932,7 +2000,7 @@ function refreshStallUi() {
 
 function startProgressWatchdog() {
   stopProgressWatchdog();
-  markProgressActivity();
+  lastProgressEventAt = Date.now();
   progressWatchdogTimer = window.setInterval(refreshStallUi, SPEED_REFRESH_MS);
   speedDisplayTimer = window.setInterval(refreshSpeedDisplay, SPEED_REFRESH_MS);
 }
@@ -2676,6 +2744,16 @@ function handleProgressUpdate(
   verify_summary?: string | null,
 ) {
   retryCount = retry_count;
+
+  if (
+    status !== "completed" &&
+    status !== "cancelled" &&
+    status !== "failed" &&
+    status !== "cancelling"
+  ) {
+    isConnecting = false;
+  }
+
   const uploading = direction === "upload";
 
   if (status === "stalled") {
@@ -2747,14 +2825,33 @@ function handleProgressUpdate(
   }
 
   if (status === "verifying") {
+    isChunkVerifying = false;
+    isFullVerifying = true;
+    markProgressActivity();
     setProgressState("verifying");
     setBadge("校验中", "verifying");
     updateProgressBarIfNeeded(transferred, total, true);
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus("正在校验文件完整性，请稍候…");
     showProgressSpeed("校验中");
+    updateTransferActivityMood();
     return;
   }
+
+  if (status === "chunk_verifying") {
+    // 块读回校验对用户透明，外观与正常传输一致，仅刷新心跳避免误报 stall
+    isChunkVerifying = true;
+    markProgressActivity();
+    applyActiveTransferBadge(direction);
+    updateProgressBarIfNeeded(transferred, total);
+    updateProgressDetail(transferred, total, retry_count);
+    hideTransferStatus();
+    updateTransferActivityMood();
+    return;
+  }
+
+  isChunkVerifying = false;
+  isFullVerifying = false;
 
   if (status === "retrying") {
     isReconnecting = true;
@@ -2837,7 +2934,10 @@ void listen<DownloadProgressEvent>("download-progress", (event) => {
 
 void listen<UploadRetryEvent>("upload-retry", (event) => {
   retryCount = event.payload.retry_count;
+  retryDelayMs = event.payload.delay_ms;
+  retryScheduledAt = Date.now();
   isReconnecting = true;
+  isConnecting = false;
   setProgressState("retrying");
   setBadge("重试中", "retrying");
   showReconnectingSpeedText();
@@ -2847,7 +2947,10 @@ void listen<UploadRetryEvent>("upload-retry", (event) => {
 
 void listen<DownloadRetryEvent>("download-retry", (event) => {
   retryCount = event.payload.retry_count;
+  retryDelayMs = event.payload.delay_ms;
+  retryScheduledAt = Date.now();
   isReconnecting = true;
+  isConnecting = false;
   setProgressState("retrying");
   setBadge("重试中", "retrying");
   showReconnectingSpeedText();

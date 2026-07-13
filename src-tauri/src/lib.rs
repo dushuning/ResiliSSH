@@ -39,6 +39,21 @@ use tauri_plugin_notification::NotificationExt;
 
 const UPLOAD_STALL_TIMEOUT_SECS: u64 = 45;
 
+/// 按传输阶段同步 stall 心跳：全文件校验关闭检测，块校验仅 defer，正常传输 touch
+fn sync_transfer_heartbeat(heartbeat: &ProgressHeartbeat, bytes: u64, status: &str) {
+    match status {
+        "verifying" => heartbeat.set_active(false),
+        "chunk_verifying" => {
+            heartbeat.set_active(true);
+            heartbeat.defer_next_check();
+        }
+        _ => {
+            heartbeat.set_active(true);
+            heartbeat.touch(bytes);
+        }
+    }
+}
+
 #[derive(Default)]
 struct UploadRuntime {
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -1003,13 +1018,9 @@ fn start_upload(
             UploadCallbacks {
                 on_progress: Box::new({
                     let app = app.clone();
-                    let checkpoint = checkpoint_for_thread.clone();
                     let heartbeat = heartbeat.clone();
                     move |uploaded, total, status, retry_count| {
-                        heartbeat.touch(uploaded);
-                        if let Ok(cp) = checkpoint.lock() {
-                            let _ = save_checkpoint(&cp);
-                        }
+                        sync_transfer_heartbeat(&heartbeat, uploaded, status);
                         let retry_hint = if retry_count > 0 {
                             format!(" · 重试 {retry_count} 次")
                         } else {
@@ -1037,7 +1048,7 @@ fn start_upload(
                             .lock()
                             .map(|cp| (cp.uploaded_bytes, cp.file_size))
                             .unwrap_or((0, 0));
-                        heartbeat.touch(uploaded);
+                        sync_transfer_heartbeat(&heartbeat, uploaded, "retrying");
                         if let Ok(cp) = checkpoint.lock() {
                             let _ = save_checkpoint(&cp);
                         }
@@ -1061,6 +1072,12 @@ fn start_upload(
                                 verify_summary: None,
                             },
                         );
+                    }
+                }),
+                on_activity: Box::new({
+                    let heartbeat = heartbeat.clone();
+                    move || {
+                        heartbeat.defer_next_check();
                     }
                 }),
             },
@@ -1456,13 +1473,9 @@ fn start_download(
             DownloadCallbacks {
                 on_progress: Box::new({
                     let app = app.clone();
-                    let checkpoint = checkpoint_for_thread.clone();
                     let heartbeat = heartbeat.clone();
                     move |downloaded, total, status, retry_count| {
-                        heartbeat.touch(downloaded);
-                        if let Ok(cp) = checkpoint.lock() {
-                            let _ = save_download_checkpoint(&cp);
-                        }
+                        sync_transfer_heartbeat(&heartbeat, downloaded, status);
                         let retry_hint = if retry_count > 0 {
                             format!(" · 重试 {retry_count} 次")
                         } else {
@@ -1490,7 +1503,7 @@ fn start_download(
                             .lock()
                             .map(|cp| (cp.downloaded_bytes, cp.file_size))
                             .unwrap_or((0, 0));
-                        heartbeat.touch(downloaded);
+                        sync_transfer_heartbeat(&heartbeat, downloaded, "retrying");
                         if let Ok(cp) = checkpoint.lock() {
                             let _ = save_download_checkpoint(&cp);
                         }
@@ -1514,6 +1527,12 @@ fn start_download(
                                 verify_summary: None,
                             },
                         );
+                    }
+                }),
+                on_activity: Box::new({
+                    let heartbeat = heartbeat.clone();
+                    move || {
+                        heartbeat.defer_next_check();
                     }
                 }),
             },

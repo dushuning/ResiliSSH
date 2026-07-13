@@ -21,6 +21,8 @@ const PROGRESS_SLICE_SIZE: usize = 64 * 1024;
 pub struct DownloadCallbacks {
     pub on_progress: Box<dyn Fn(u64, u64, &str, u32) + Send + Sync>,
     pub on_retry: Box<dyn Fn(u32, u64, &str) + Send + Sync>,
+    /// 块读回校验等长时间无字节进度时刷新 stall 心跳，避免误判断连
+    pub on_activity: Box<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Debug, Error)]
@@ -342,12 +344,19 @@ fn transfer_chunks(
         truncate_first = false;
 
         if strict_chunk_verify.load(Ordering::Relaxed) {
+            (callbacks.on_progress)(
+                chunk_start,
+                remote_size,
+                "chunk_verifying",
+                retry_count,
+            );
             verify_written_chunk(
                 &sftp,
                 Path::new(&resolved_local_path),
                 &actual_remote_path,
                 chunk_start,
                 chunk_len as u64,
+                &callbacks.on_activity,
             )?;
         }
 
@@ -504,12 +513,15 @@ fn verify_written_chunk(
     remote_path: &str,
     offset: u64,
     len: u64,
+    on_activity: &dyn Fn(),
 ) -> Result<(), DownloadError> {
     if len == 0 {
         return Ok(());
     }
-    let local_hash = sha256_local_range(local_path, offset, len)?;
-    let remote_hash = sha256_remote_range(sftp, remote_path, offset, len)?;
+    on_activity();
+    let local_hash = sha256_local_range(local_path, offset, len, Some(on_activity))?;
+    on_activity();
+    let remote_hash = sha256_remote_range(sftp, remote_path, offset, len, Some(on_activity))?;
     if local_hash == remote_hash {
         return Ok(());
     }
@@ -681,7 +693,12 @@ fn sha256_remote_file(
     Ok(hasher.finalize().into())
 }
 
-fn sha256_local_range(path: &Path, offset: u64, len: u64) -> Result<[u8; 32], DownloadError> {
+fn sha256_local_range(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    on_read: Option<&dyn Fn()>,
+) -> Result<[u8; 32], DownloadError> {
     let mut file = File::open(path).map_err(|e| DownloadError::LocalIo(e.to_string()))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| DownloadError::LocalIo(e.to_string()))?;
@@ -689,6 +706,9 @@ fn sha256_local_range(path: &Path, offset: u64, len: u64) -> Result<[u8; 32], Do
     let mut remaining = len;
     let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
     while remaining > 0 {
+        if let Some(defer) = on_read {
+            defer();
+        }
         let to_read = (buffer.len() as u64).min(remaining) as usize;
         file.read_exact(&mut buffer[..to_read])
             .map_err(|e| DownloadError::LocalIo(e.to_string()))?;
@@ -703,6 +723,7 @@ fn sha256_remote_range(
     remote_path: &str,
     offset: u64,
     len: u64,
+    on_read: Option<&dyn Fn()>,
 ) -> Result<[u8; 32], DownloadError> {
     let mut remote_file = sftp
         .open_mode(Path::new(remote_path), OpenFlags::READ, 0, OpenType::File)
@@ -714,6 +735,9 @@ fn sha256_remote_range(
     let mut remaining = len;
     let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
     while remaining > 0 {
+        if let Some(defer) = on_read {
+            defer();
+        }
         let to_read = (buffer.len() as u64).min(remaining) as usize;
         let read_bytes = remote_file
             .read(&mut buffer[..to_read])
