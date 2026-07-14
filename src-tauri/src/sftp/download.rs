@@ -351,9 +351,8 @@ fn transfer_chunks(
                 retry_count,
             );
             verify_written_chunk(
-                &sftp,
                 Path::new(&resolved_local_path),
-                &actual_remote_path,
+                &chunk_buffer[..chunk_len],
                 chunk_start,
                 chunk_len as u64,
                 &callbacks.on_activity,
@@ -464,7 +463,11 @@ fn write_local_chunk<F: FnMut(u64)>(
         written = end;
         on_partial_progress(offset + written as u64);
     }
-    file.flush()
+    // 必须 sync_all（fsync）而非 flush：flush 对 std::fs::File 是空操作，
+    // 数据仍停留在 OS page cache。断点随后会把这些字节标记为 verified，
+    // 若此时掉电/崩溃，断点会指向尚未落盘的数据。逐块 fsync 相对网络传输开销可忽略，
+    // 换取「断点声称已下载即真正落盘」的持久性保证。
+    file.sync_all()
         .map_err(|e| DownloadError::LocalIo(e.to_string()))?;
     Ok(())
 }
@@ -483,6 +486,7 @@ fn verify_download_integrity(
     let remote_hash = match sha256_remote_file(&sftp, remote_path, remote_size, cancel_flag, checkpoint) {
         Ok(hash) => hash,
         Err(DownloadError::Sftp(detail)) => {
+            log::warn!("full-file remote read failed during download verify: {detail}");
             let mut cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
             cp.failure_reason = Some("verify_read_failed".into());
             cp.status = CheckpointStatus::Failed;
@@ -495,6 +499,10 @@ fn verify_download_integrity(
     };
 
     if local_hash != remote_hash {
+        log::error!(
+            "download sha256 mismatch for {remote_path} (size={remote_size}), deleting local file {}",
+            local_path.display()
+        );
         let _ = fs::remove_file(local_path);
         let mut cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
         cp.downloaded_bytes = 0;
@@ -504,13 +512,16 @@ fn verify_download_integrity(
         let _ = save_download_checkpoint(&cp);
         return Err(DownloadError::HashMismatch);
     }
+    log::info!("download sha256 verified for {remote_path}");
     Ok(current_retry_count(checkpoint))
 }
 
+/// 每写完一块立即读回比对 SHA-256，失败则截断本地并拒绝推进 verified 断点。
+/// 本地侧真读回磁盘（写入目标，必须验证）；远端侧直接哈希内存缓冲（刚下载的字节），
+/// 省去一次远端往返——弱网下这是每块一次的显著开销。
 fn verify_written_chunk(
-    sftp: &Sftp,
     local_path: &Path,
-    remote_path: &str,
+    remote_bytes: &[u8],
     offset: u64,
     len: u64,
     on_activity: &dyn Fn(),
@@ -520,8 +531,7 @@ fn verify_written_chunk(
     }
     on_activity();
     let local_hash = sha256_local_range(local_path, offset, len, Some(on_activity))?;
-    on_activity();
-    let remote_hash = sha256_remote_range(sftp, remote_path, offset, len, Some(on_activity))?;
+    let remote_hash = sha256_bytes(remote_bytes);
     if local_hash == remote_hash {
         return Ok(());
     }
@@ -567,7 +577,7 @@ fn verify_resume_boundary(
 fn resolve_download_offset(
     local_path: &Path,
     local_stat_size: u64,
-    _remote_size: u64,
+    remote_size: u64,
     force_overwrite: &AtomicBool,
     checkpoint: &DownloadCheckpoint,
 ) -> Result<u64, DownloadError> {
@@ -576,10 +586,23 @@ fn resolve_download_offset(
     }
     let trusted = effective_verified_bytes(checkpoint);
     if trusted > 0 {
-        if local_stat_size > trusted {
-            truncate_local_file(local_path, trusted)?;
+        // 续传位置不能超过本地实际已有字节，也不能超过远端实际字节，否则
+        // verify_resume_boundary 会读过 EOF：本地不足 → LocalIo（永久失败）；
+        // 远端不足 → Sftp "failed to fill whole buffer"（非永久）会无限重连死循环。
+        let safe = safe_resume_offset(trusted, local_stat_size, remote_size);
+        if safe < trusted {
+            log::warn!(
+                "checkpoint trusts {trusted} but local={local_stat_size} remote={remote_size}; \
+                 checkpoint stale, resume from block-aligned {safe}"
+            );
         }
-        return Ok(trusted);
+        if local_stat_size > safe {
+            truncate_local_file(local_path, safe)?;
+        }
+        if safe > 0 {
+            return Ok(safe);
+        }
+        // safe == 0：本地/远端没有可信共同前缀，落到下面从头开始的逻辑。
     }
     if local_stat_size > 0 {
         log::info!(
@@ -718,41 +741,31 @@ fn sha256_local_range(
     Ok(hasher.finalize().into())
 }
 
-fn sha256_remote_range(
-    sftp: &Sftp,
-    remote_path: &str,
-    offset: u64,
-    len: u64,
-    on_read: Option<&dyn Fn()>,
-) -> Result<[u8; 32], DownloadError> {
-    let mut remote_file = sftp
-        .open_mode(Path::new(remote_path), OpenFlags::READ, 0, OpenType::File)
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
-    remote_file
-        .seek(SeekFrom::Start(offset))
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+/// 直接对内存字节求 SHA-256。下载时远端块内容已在缓冲区里（刚下载的字节），
+/// 无需再向远端读一遍即可与本地磁盘读回结果比对——省去一次远端往返（弱网关键）。
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    let mut remaining = len;
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-    while remaining > 0 {
-        if let Some(defer) = on_read {
-            defer();
-        }
-        let to_read = (buffer.len() as u64).min(remaining) as usize;
-        let read_bytes = remote_file
-            .read(&mut buffer[..to_read])
-            .map_err(|e| DownloadError::Sftp(e.to_string()))?;
-        if read_bytes == 0 {
-            return Err(DownloadError::Sftp("读取远端块用于校验时意外结束".into()));
-        }
-        hasher.update(&buffer[..read_bytes]);
-        remaining -= read_bytes as u64;
-    }
-    Ok(hasher.finalize().into())
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 fn align_down(offset: u64) -> u64 {
     offset - (offset % CHUNK_SIZE)
+}
+
+/// 给定断点可信续传位置、本地实际字节、远端实际字节，返回安全的续传偏移。
+/// 下载同时依赖本地已写字节与远端可读字节，任一侧不足都会让边界校验读过 EOF：
+/// 本地不足 → LocalIo（永久失败）；远端不足 → 非永久错误会无限重连死循环。
+/// 因此夹紧到两侧都满足的块对齐位置。
+fn safe_resume_offset(trusted: u64, local_size: u64, remote_size: u64) -> u64 {
+    let mut safe = trusted;
+    if local_size < safe {
+        safe = align_down(local_size);
+    }
+    if remote_size < safe {
+        safe = align_down(remote_size);
+    }
+    safe
 }
 
 fn strip_sftp_wrapper(message: &str) -> &str {
@@ -830,5 +843,31 @@ mod tests {
     fn resolves_local_directory_path() {
         let path = resolve_local_path("/tmp/downloads/", "demo.jar").unwrap();
         assert_eq!(path, "/tmp/downloads/demo.jar");
+    }
+
+    // 回归：本地或远端字节 < 断点可信位置时须夹紧到两侧都满足的块对齐位置，
+    // 否则边界校验读过 EOF（远端不足会无限重连死循环）。
+    #[test]
+    fn safe_resume_offset_clamps_to_shorter_side() {
+        // 两侧都足够：用可信位置
+        assert_eq!(
+            safe_resume_offset(2 * CHUNK_SIZE, 5 * CHUNK_SIZE, 5 * CHUNK_SIZE),
+            2 * CHUNK_SIZE
+        );
+        // 远端更短：夹到远端块对齐位置
+        assert_eq!(
+            safe_resume_offset(5 * CHUNK_SIZE, 5 * CHUNK_SIZE, 3 * CHUNK_SIZE + 9),
+            3 * CHUNK_SIZE
+        );
+        // 本地更短：夹到本地块对齐位置
+        assert_eq!(
+            safe_resume_offset(5 * CHUNK_SIZE, 2 * CHUNK_SIZE + 7, 5 * CHUNK_SIZE),
+            2 * CHUNK_SIZE
+        );
+        // 取两侧更小者
+        assert_eq!(
+            safe_resume_offset(5 * CHUNK_SIZE, 4 * CHUNK_SIZE, 2 * CHUNK_SIZE),
+            2 * CHUNK_SIZE
+        );
     }
 }

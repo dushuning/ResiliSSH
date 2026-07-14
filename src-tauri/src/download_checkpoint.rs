@@ -33,11 +33,9 @@ pub fn checkpoint_path() -> PathBuf {
 
 pub fn save_download_checkpoint(checkpoint: &DownloadCheckpoint) -> Result<(), String> {
     let path = checkpoint_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let json = serde_json::to_string_pretty(checkpoint).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    // 原子写：断点每块都要落盘，若写到一半崩溃会丢失全部续传进度。
+    crate::storage::atomic_write(&path, json.as_bytes())
 }
 
 pub fn load_download_checkpoint() -> Result<Option<DownloadCheckpoint>, String> {

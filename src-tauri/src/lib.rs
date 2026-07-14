@@ -59,6 +59,9 @@ struct UploadRuntime {
     cancel_flag: Option<Arc<AtomicBool>>,
     abort_socket: Option<Arc<Mutex<Option<TcpStream>>>>,
     is_running: bool,
+    /// 传输 worker 线程句柄。reset 时须 join 旧线程，确保它不再写断点文件，
+    /// 否则新传输可能与旧线程并发写同一断点文件导致内容交错损坏。
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -66,6 +69,8 @@ struct DownloadRuntime {
     cancel_flag: Option<Arc<AtomicBool>>,
     abort_socket: Option<Arc<Mutex<Option<TcpStream>>>>,
     is_running: bool,
+    /// 同 UploadRuntime::worker。
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 const DOWNLOAD_STALL_TIMEOUT_SECS: u64 = 45;
@@ -811,13 +816,32 @@ fn cancel_upload(
 
 #[tauri::command]
 fn reset_upload_state(runtime: State<'_, Mutex<UploadRuntime>>) -> Result<(), String> {
-    let mut state = runtime.lock().map_err(|e| e.to_string())?;
-    if let Some(flag) = &state.cancel_flag {
-        flag.store(true, Ordering::Relaxed);
+    // 置取消位 + 中断在途 IO，取出 worker 句柄后释放锁再 join：
+    // worker 结束时会回锁 runtime 设 is_running=false，若持锁 join 会死锁。
+    let worker = {
+        let mut state = runtime.lock().map_err(|e| e.to_string())?;
+        if let Some(flag) = &state.cancel_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
+        // 主动关闭 socket 让 worker 尽快跳出阻塞的网络 syscall，避免 join 长时间等待。
+        if let Some(holder) = &state.abort_socket {
+            if let Ok(guard) = holder.lock() {
+                if let Some(socket) = guard.as_ref() {
+                    abort_socket(socket);
+                }
+            }
+        }
+        state.worker.take()
+    };
+    // 等旧 worker 真正退出，确保它不再写断点文件，再放行新传输。
+    if let Some(handle) = worker {
+        let _ = handle.join();
     }
+    let mut state = runtime.lock().map_err(|e| e.to_string())?;
     state.is_running = false;
     state.cancel_flag = None;
     state.abort_socket = None;
+    state.worker = None;
     Ok(())
 }
 
@@ -970,7 +994,7 @@ fn start_upload(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_uploaded_bytes));
         let stall_timeout = Duration::from_secs(UPLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = UPLOAD_STALL_TIMEOUT_SECS;
@@ -1203,6 +1227,9 @@ fn start_upload(
         }
     });
 
+    // 记录 worker 句柄，供 reset_upload_state join，避免与新传输并发写断点。
+    state.worker = Some(worker);
+
     Ok(())
 }
 
@@ -1245,13 +1272,29 @@ fn cancel_download(
 
 #[tauri::command]
 fn reset_download_state(runtime: State<'_, Mutex<DownloadRuntime>>) -> Result<(), String> {
-    let mut state = runtime.lock().map_err(|e| e.to_string())?;
-    if let Some(flag) = &state.cancel_flag {
-        flag.store(true, Ordering::Relaxed);
+    // 见 reset_upload_state：取出 worker 句柄后释放锁再 join，避免死锁并杜绝并发写断点。
+    let worker = {
+        let mut state = runtime.lock().map_err(|e| e.to_string())?;
+        if let Some(flag) = &state.cancel_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(holder) = &state.abort_socket {
+            if let Ok(guard) = holder.lock() {
+                if let Some(socket) = guard.as_ref() {
+                    abort_socket(socket);
+                }
+            }
+        }
+        state.worker.take()
+    };
+    if let Some(handle) = worker {
+        let _ = handle.join();
     }
+    let mut state = runtime.lock().map_err(|e| e.to_string())?;
     state.is_running = false;
     state.cancel_flag = None;
     state.abort_socket = None;
+    state.worker = None;
     Ok(())
 }
 
@@ -1425,7 +1468,7 @@ fn start_download(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_downloaded_bytes));
         let stall_timeout = Duration::from_secs(DOWNLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = DOWNLOAD_STALL_TIMEOUT_SECS;
@@ -1657,6 +1700,9 @@ fn start_download(
             }
         }
     });
+
+    // 记录 worker 句柄，供 reset_download_state join，避免与新传输并发写断点。
+    state.worker = Some(worker);
 
     Ok(())
 }

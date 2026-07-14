@@ -153,10 +153,6 @@ pub fn format_remote_sftp_error(message: &str, remote_path: &str) -> String {
     format!("远端路径「{remote_path}」操作失败：{message}")
 }
 
-fn enhance_sftp_error(message: &str, remote_path: &str) -> String {
-    format_remote_sftp_error(message, remote_path)
-}
-
 /// 递归创建远端父目录（类似 mkdir -p），仅创建路径中缺失的目录。
 fn ensure_remote_parent_directories(sftp: &Sftp, remote_file: &str) -> Result<(), UploadError> {
     let path = Path::new(remote_file.trim());
@@ -181,7 +177,7 @@ fn ensure_remote_parent_directories(sftp: &Sftp, remote_file: &str) -> Result<()
             continue;
         }
         sftp.mkdir(dir, 0o755).map_err(|e| {
-            UploadError::Sftp(enhance_sftp_error(
+            UploadError::Sftp(format_remote_sftp_error(
                 &format!("创建远端目录「{current}」失败: {e}"),
                 remote_file,
             ))
@@ -539,6 +535,17 @@ fn align_down(offset: u64) -> u64 {
     offset - (offset % CHUNK_SIZE)
 }
 
+/// 给定断点可信续传位置与远端实际字节数，返回安全的续传偏移。
+/// 远端不少于可信位置时直接用可信位置；否则夹紧到远端块对齐位置——
+/// 否则续传边界校验会 read_exact 读过远端 EOF，抛出非永久错误而无限重连死循环。
+fn safe_resume_offset(trusted: u64, remote_size: u64) -> u64 {
+    if remote_size >= trusted {
+        trusted
+    } else {
+        align_down(remote_size)
+    }
+}
+
 fn strip_sftp_wrapper(message: &str) -> &str {
     if let Some(pos) = message.find('」') {
         if message.starts_with("远端路径「") {
@@ -682,32 +689,12 @@ fn effective_verified_bytes(cp: &UploadCheckpoint) -> u64 {
     0
 }
 
-fn sha256_local_range(
-    path: &Path,
-    offset: u64,
-    len: u64,
-    on_read: Option<&dyn Fn()>,
-) -> Result<[u8; 32], UploadError> {
-    let mut file = File::open(path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-
+/// 直接对内存字节求 SHA-256。上传时本地块内容已在缓冲区里（刚从本地文件读入），
+/// 无需再打开+读一遍本地文件即可与远端读回结果比对。
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    let mut remaining = len;
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-
-    while remaining > 0 {
-        if let Some(defer) = on_read {
-            defer();
-        }
-        let to_read = (buffer.len() as u64).min(remaining) as usize;
-        file.read_exact(&mut buffer[..to_read])
-            .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-        hasher.update(&buffer[..to_read]);
-        remaining -= to_read as u64;
-    }
-
-    Ok(hasher.finalize().into())
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 fn sha256_remote_range(
@@ -754,7 +741,7 @@ fn sha256_remote_range(
 /// 每写完一块立即读回比对 SHA-256，失败则截断远端并拒绝推进 verified 断点。
 fn verify_written_chunk(
     sftp: &Sftp,
-    local_path: &Path,
+    local_bytes: &[u8],
     remote_path: &str,
     offset: u64,
     len: u64,
@@ -764,8 +751,8 @@ fn verify_written_chunk(
         return Ok(());
     }
 
-    on_activity();
-    let local_hash = sha256_local_range(local_path, offset, len, Some(on_activity))?;
+    // 本地块内容已在内存缓冲，直接哈希；远端侧必须真读回，这正是要验证的目标。
+    let local_hash = sha256_bytes(local_bytes);
     on_activity();
     let remote_hash = sha256_remote_range(sftp, remote_path, offset, len, Some(on_activity))?;
 
@@ -799,15 +786,23 @@ fn resolve_resume_offset(
 
     let trusted = effective_verified_bytes(checkpoint);
     if trusted > 0 && !force_overwrite.load(Ordering::Relaxed) {
+        // 远端多于可信位置：多出的部分未经校验，先截断回可信位置。
         if remote_stat_size > trusted {
             log::warn!(
                 "remote has {remote_stat_size} bytes but only {trusted} verified, truncate"
             );
             truncate_remote_file(sftp, remote_path, trusted)?;
         }
-        if trusted > 0 {
-            return Ok(trusted);
+        let safe = safe_resume_offset(trusted, remote_stat_size);
+        if safe < trusted {
+            // 远端字节比断点声称的可信位置还少（文件被外部删改/替换、断点过期），
+            // 回退到远端真实拥有的块对齐位置，让边界校验重新确认这一块。
+            log::warn!(
+                "remote has only {remote_stat_size} bytes but checkpoint trusts {trusted}; \
+                 checkpoint stale, resume from block-aligned {safe}"
+            );
         }
+        return Ok(safe);
     }
 
     if remote_stat_size > 0 {
@@ -981,7 +976,7 @@ fn transfer_chunks(
             );
             verify_written_chunk(
                 &sftp,
-                local_path,
+                &chunk_buffer[..chunk_len],
                 &actual_remote_path,
                 chunk_start,
                 chunk_len as u64,
@@ -1040,5 +1035,21 @@ mod tests {
         let wrapped = format_remote_sftp_error("Timed out waiting on socket", "/tmp/a.jar");
         assert!(!is_permanent_sftp_error(&wrapped, 19_922_944));
         assert!(!is_permanent_sftp_error("Timed out waiting on socket", 19_922_944));
+    }
+
+    // 回归：远端字节 < 断点可信位置时必须夹紧到远端块对齐位置，
+    // 否则边界校验读过 EOF 会无限重连死循环。
+    #[test]
+    fn safe_resume_offset_clamps_when_remote_shorter_than_checkpoint() {
+        // 远端足够：用可信位置
+        assert_eq!(safe_resume_offset(2 * CHUNK_SIZE, 5 * CHUNK_SIZE), 2 * CHUNK_SIZE);
+        assert_eq!(safe_resume_offset(2 * CHUNK_SIZE, 2 * CHUNK_SIZE), 2 * CHUNK_SIZE);
+        // 远端更短：夹紧到远端块对齐位置
+        assert_eq!(
+            safe_resume_offset(5 * CHUNK_SIZE, 2 * CHUNK_SIZE + 123),
+            2 * CHUNK_SIZE
+        );
+        // 远端只剩不足一块：从头开始
+        assert_eq!(safe_resume_offset(5 * CHUNK_SIZE, 42), 0);
     }
 }

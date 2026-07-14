@@ -82,11 +82,9 @@ pub fn file_fingerprint(path: &Path) -> Result<(u64, u64), String> {
 /// 断点文件让应用重启后仍可续传，避免大文件因中断从头再来。
 pub fn save_checkpoint(checkpoint: &UploadCheckpoint) -> Result<(), String> {
     let path = checkpoint_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let json = serde_json::to_string_pretty(checkpoint).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    // 原子写：断点每块都要落盘，若写到一半崩溃会丢失全部续传进度。
+    crate::storage::atomic_write(&path, json.as_bytes())
 }
 
 pub fn load_checkpoint() -> Result<Option<UploadCheckpoint>, String> {
