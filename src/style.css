@@ -802,49 +802,128 @@ progress::-webkit-progress-value {
   z-index: 1;
 }
 
+/* 数据流小圆点：统一淡色、低存在感，只作背景「数据在流」的氛围，
+   不与信使 emoji 抢视觉；节奏由 animation-delay 错开，颜色/大小保持一致。 */
 .data-packet {
   position: absolute;
   top: 50%;
-  width: 10px;
-  height: 10px;
-  margin-top: -5px;
-  border-radius: 2px;
-  background: var(--accent);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5), 0 1px 3px rgba(0, 113, 227, 0.35);
+  width: 5px;
+  height: 5px;
+  margin-top: -2.5px;
+  border-radius: 50%;
+  background: var(--progress-active);
   opacity: 0;
   animation: data-packet-flow 2.4s linear infinite;
 }
 
 .data-packet:nth-child(1) {
   animation-delay: 0s;
-  background: var(--accent);
 }
 
 .data-packet:nth-child(2) {
   animation-delay: 0.5s;
-  width: 8px;
-  height: 8px;
-  margin-top: -4px;
-  background: #3395ff;
 }
 
 .data-packet:nth-child(3) {
   animation-delay: 1s;
-  background: #28a745;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5), 0 1px 3px rgba(40, 167, 69, 0.35);
 }
 
 .data-packet:nth-child(4) {
   animation-delay: 1.5s;
-  width: 8px;
-  height: 8px;
-  margin-top: -4px;
-  background: #0071e3;
 }
 
 .data-packet:nth-child(5) {
   animation-delay: 2s;
-  background: #5ac8fa;
+}
+
+/* 传输小信使：一个随网速情绪变化的小角色，弱网久等时给用户解闷。
+   横向位移由 .data-flow-courier 承担，表情与情绪抖动由 ::after 承担，两者互不干扰。 */
+.data-flow-courier {
+  position: absolute;
+  top: 50%;
+  left: 4%;
+  z-index: 3;
+  margin-top: -11px;
+  font-size: 18px;
+  line-height: 1;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.28));
+  will-change: left;
+}
+
+.data-flow-courier::after {
+  content: "📦";
+  display: block;
+}
+
+@keyframes courier-fly {
+  0% {
+    left: 3%;
+  }
+  100% {
+    left: 91%;
+  }
+}
+
+/* 慢速时一颠一颠地「喘气」前进 */
+@keyframes courier-chug {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(2px);
+  }
+}
+
+/* 等待时原地打盹、左右张望 */
+@keyframes courier-wait {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  25% {
+    transform: translateY(-2px) rotate(-7deg);
+  }
+  75% {
+    transform: translateY(-2px) rotate(7deg);
+  }
+}
+
+.mood-fast .data-flow-courier {
+  animation: courier-fly 1.6s linear infinite;
+}
+
+.mood-fast .data-flow-courier::after {
+  content: "🚀";
+}
+
+.mood-steady .data-flow-courier {
+  animation: courier-fly 3s linear infinite;
+}
+
+.mood-steady .data-flow-courier::after {
+  content: "📦";
+}
+
+.mood-struggle .data-flow-courier {
+  animation: courier-fly 5.4s linear infinite;
+}
+
+.mood-struggle .data-flow-courier::after {
+  content: "🐌";
+  animation: courier-chug 1.2s ease-in-out infinite;
+}
+
+/* 等待/重连：信使停在管道中间打盹，呼应远端节点的橙色脉冲 */
+.mood-waiting .data-flow-courier {
+  left: 46%;
+  animation: none;
+}
+
+.mood-waiting .data-flow-courier::after {
+  content: "😴";
+  animation: courier-wait 2.6s ease-in-out infinite;
 }
 
 .mood-steady .data-flow-pipe-track {
@@ -867,7 +946,6 @@ progress::-webkit-progress-value {
 
 .mood-struggle .data-packet {
   animation-duration: 3.6s;
-  filter: saturate(0.88);
 }
 
 .mood-fast .data-flow-pipe-track {
@@ -984,14 +1062,14 @@ progress::-webkit-progress-value {
   0% {
     left: 4%;
     opacity: 0;
-    transform: scale(0.5);
+    transform: scale(0.6);
   }
-  10% {
-    opacity: 1;
+  15% {
+    opacity: 0.4;
     transform: scale(1);
   }
-  90% {
-    opacity: 1;
+  85% {
+    opacity: 0.4;
   }
   100% {
     left: 96%;
@@ -1067,6 +1145,16 @@ progress::-webkit-progress-value {
 
   .data-packet:nth-child(5) {
     left: 86%;
+  }
+
+  /* 减少动态偏好：信使停在管道中间静止显示，仍保留表情传达情绪 */
+  .data-flow-courier,
+  .data-flow-courier::after {
+    animation: none !important;
+  }
+
+  .data-flow-courier {
+    left: 46%;
   }
 }
 

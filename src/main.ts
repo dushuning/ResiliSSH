@@ -369,6 +369,8 @@ app.innerHTML = `
                 <span class="data-packet"></span>
                 <span class="data-packet"></span>
               </div>
+              <!-- 传输小信使：随网速切换表情（🚀快 / ✈️正常 / 🐌慢 / 😴等待），给等待的用户解闷 -->
+              <span class="data-flow-courier" aria-hidden="true"></span>
             </div>
           </div>
         </div>
@@ -1506,10 +1508,6 @@ function updateAuthFields() {
   updateConnectionSummary();
   updateTransferStatePanel();
   updateAuthHintVisibility();
-}
-
-function usesPasswordAuth(): boolean {
-  return authTypeSelect.value === "password";
 }
 
 function formatBytes(bytes: number): string {
