@@ -19,8 +19,8 @@ use download_checkpoint::{
     clear_download_checkpoint, load_download_checkpoint, save_download_checkpoint, DownloadCheckpoint,
 };
 use profiles::{
-    delete_profile, list_profiles, profile_secrets, save_profile, ConnectionProfile, ProfileSecrets,
-    SaveProfileRequest,
+    delete_profile, list_profiles, profile_secrets, save_profile, update_profile_extras,
+    ConnectionProfile, ProfileSecrets, SaveProfileRequest, UpdateProfileExtrasRequest,
 };
 use sftp::{
     abort_socket, connect_session, create_remote_directory, download_with_resume,
@@ -546,6 +546,13 @@ fn list_saved_profiles() -> Result<Vec<ConnectionProfile>, String> {
 }
 
 /// 读钥匙串可能等待用户在系统授权框里操作，必须 async，不能卡住 UI 线程。
+#[tauri::command(async)]
+fn update_connection_profile_extras(
+    request: UpdateProfileExtrasRequest,
+) -> Result<ConnectionProfile, String> {
+    update_profile_extras(request)
+}
+
 #[tauri::command]
 fn list_activity_log() -> Vec<activity::ActivityEntry> {
     activity::entries()
@@ -1939,6 +1946,7 @@ pub fn run() {
             get_profile_secrets,
             list_activity_log,
             clear_activity_log,
+            update_connection_profile_extras,
             save_connection_profile,
             delete_connection_profile,
             list_upload_history,

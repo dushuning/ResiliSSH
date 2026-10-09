@@ -21,6 +21,12 @@ pub struct ConnectionProfile {
     #[serde(default)]
     pub key_passphrase: Option<String>,
     pub created_at: i64,
+    /// 收藏的远端目录：同一台服务器反复往固定几个目录传，省去每次手敲路径。
+    #[serde(default)]
+    pub bookmarks: Vec<String>,
+    /// 常用的「传完后执行」命令，如重启服务；按服务器保存，因为命令依赖目标机环境。
+    #[serde(default)]
+    pub post_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +208,11 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         return Err("密码登录保存时请填写密码".into());
     }
 
+    // 收藏目录与常用命令不在连接表单里编辑，保存连接时必须沿用旧值，否则一保存就被清空。
+    let (bookmarks, post_commands) = existing
+        .as_ref()
+        .map(|p| (p.bookmarks.clone(), p.post_commands.clone()))
+        .unwrap_or_default();
     let created_at = existing.map(|p| p.created_at).unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -224,6 +235,8 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         password: None,
         key_passphrase: None,
         created_at,
+        bookmarks,
+        post_commands,
     };
 
     store.profiles.retain(|p| p.name != profile.name);
@@ -247,4 +260,68 @@ pub fn delete_profile(id: String) -> Result<(), String> {
     delete_secret(&id, SecretKind::Password);
     delete_secret(&id, SecretKind::KeyPassphrase);
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateProfileExtrasRequest {
+    pub id: String,
+    pub bookmarks: Option<Vec<String>>,
+    pub post_commands: Option<Vec<String>>,
+}
+
+/// 上限：列表是给人挑的，太长反而找不到；也避免前端异常时无限追加。
+const MAX_PROFILE_LIST_ITEMS: usize = 20;
+
+/// 清洗列表：去空白、去重并保留首次出现的顺序（越靠前越常用）。
+fn normalize_list(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty() && seen.insert(item.clone()))
+        .take(MAX_PROFILE_LIST_ITEMS)
+        .collect()
+}
+
+/// 只更新收藏目录 / 常用命令，不触碰凭据：这些操作发生在传输页，不应要求重新输入密码。
+pub fn update_profile_extras(request: UpdateProfileExtrasRequest) -> Result<ConnectionProfile, String> {
+    let mut store = load_store()?;
+    let profile = store
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == request.id)
+        .ok_or_else(|| "连接配置不存在".to_string())?;
+    if let Some(bookmarks) = request.bookmarks {
+        profile.bookmarks = normalize_list(bookmarks);
+    }
+    if let Some(commands) = request.post_commands {
+        profile.post_commands = normalize_list(commands);
+    }
+    let updated = profile.clone();
+    save_store(&store)?;
+    Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_list_trims_dedups_and_keeps_order() {
+        let input = vec![
+            " /opt/app/ ".to_string(),
+            "".to_string(),
+            "/data/".to_string(),
+            "/opt/app/".to_string(),
+        ];
+        assert_eq!(normalize_list(input), vec!["/opt/app/", "/data/"]);
+    }
+
+    #[test]
+    fn old_profile_json_without_extras_still_loads() {
+        let json = r#"{"id":"1","name":"a","host":"h","port":22,"username":"u",
+            "auth_kind":"password","key_path":null,"created_at":0}"#;
+        let profile: ConnectionProfile = serde_json::from_str(json).unwrap();
+        assert!(profile.bookmarks.is_empty() && profile.post_commands.is_empty());
+    }
 }

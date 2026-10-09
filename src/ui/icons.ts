@@ -16,6 +16,12 @@ export const icons = {
   ),
   logs: svg('<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>'),
   copy: svg('<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>', 14),
+  star: svg('<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9Z"/>', 16),
+  starFilled:
+    '<svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9Z"/></svg>',
+  chevronDown: svg('<path d="m6 9 6 6 6-6"/>', 14),
+  close: svg('<path d="M6 6l12 12M18 6 6 18"/>', 12),
+  terminal: svg('<path d="m4 7 5 5-5 5"/><path d="M12 19h8"/>', 16),
   upload: svg('<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'),
   download: svg('<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>'),
   file: svg('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/>'),

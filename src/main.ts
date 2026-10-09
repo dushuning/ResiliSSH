@@ -9,6 +9,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ActivityLogView, copyText, type ActivityEntry, type LogFilter } from "./ui/activityLog";
 import { BlockMap, type BlockMapPhase } from "./ui/blockMap";
 import { icons } from "./ui/icons";
+import { Popover, type PopoverItem } from "./ui/popover";
 import { appTemplate } from "./ui/template";
 
 interface SshHostEntry {
@@ -30,6 +31,8 @@ interface ConnectionProfile {
   password?: string | null;
   key_passphrase?: string | null;
   created_at: number;
+  bookmarks: string[];
+  post_commands: string[];
 }
 
 interface ProfileSecrets {
@@ -266,6 +269,12 @@ const miniTransferFill = document.querySelector<HTMLDivElement>("#miniTransferFi
 const miniTransferSpeed = document.querySelector<HTMLDivElement>("#miniTransferSpeed")!;
 const appVersion = document.querySelector<HTMLSpanElement>("#appVersion")!;
 const viewLogBtn = document.querySelector<HTMLButtonElement>("#viewLogBtn")!;
+const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmarkBtn")!;
+const pathMenuBtn = document.querySelector<HTMLButtonElement>("#pathMenuBtn")!;
+const pathMenu = new Popover(
+  document.querySelector<HTMLDivElement>("#pathMenu")!,
+  document.querySelector<HTMLDivElement>(".path-field")!,
+);
 const legendResumed = document.querySelector<HTMLSpanElement>("#legendResumed")!;
 const legendRetry = document.querySelector<HTMLSpanElement>("#legendRetry")!;
 const mapLegend = document.querySelector<HTMLDivElement>("#mapLegend")!;
@@ -370,6 +379,8 @@ const TRANSFER_LOCK_SELECTORS = [
   'input[name="transferMode"]',
   "#newServerBtn",
   ".server-item",
+  "#bookmarkBtn",
+  "#pathMenuBtn",
 ] as const;
 
 let probeDebounceTimer: number | null = null;
@@ -620,6 +631,7 @@ function updateConnectionSummary() {
   connectionSummary.classList.toggle("warn", !state.ready);
   updateAuthHintVisibility();
   highlightSelectedServer();
+  updateBookmarkButton();
 }
 
 function updateAuthHintVisibility() {
@@ -1324,6 +1336,118 @@ function formatTime(ts: number): string {
   });
 }
 
+/** 最近使用的目录最多列几个：太多会把收藏挤出视野。 */
+const RECENT_DIR_LIMIT = 6;
+
+function currentProfile(): ConnectionProfile | undefined {
+  return savedProfiles.find((p) => p.id === profileSelect.value);
+}
+
+/** 收藏的是目录：填的是文件路径时取其所在目录，统一以 / 结尾，便于直接作为上传目标。 */
+function remoteDirOf(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "";
+  if (trimmed.endsWith("/")) return trimmed;
+  const slash = trimmed.lastIndexOf("/");
+  return slash >= 0 ? trimmed.slice(0, slash + 1) : "";
+}
+
+function updateBookmarkButton() {
+  const profile = currentProfile();
+  const dir = remoteDirOf(remotePathInput.value);
+  const bookmarked = Boolean(profile && dir && profile.bookmarks.includes(dir));
+  bookmarkBtn.disabled = !profile || !dir || isTransferring;
+  bookmarkBtn.classList.toggle("is-active", bookmarked);
+  bookmarkBtn.innerHTML = bookmarked ? icons.starFilled : icons.star;
+  bookmarkBtn.title = !profile
+    ? "保存服务器后才能收藏目录"
+    : !dir
+      ? "填写远端目录后可收藏"
+      : bookmarked
+        ? `取消收藏 ${dir}`
+        : `收藏 ${dir}`;
+}
+
+async function saveProfileExtras(
+  profile: ConnectionProfile,
+  changes: { bookmarks?: string[]; post_commands?: string[] },
+) {
+  const updated = await invoke<ConnectionProfile>("update_connection_profile_extras", {
+    request: { id: profile.id, ...changes },
+  });
+  const index = savedProfiles.findIndex((p) => p.id === updated.id);
+  if (index >= 0) savedProfiles[index] = updated;
+  return updated;
+}
+
+async function toggleBookmark() {
+  const profile = currentProfile();
+  const dir = remoteDirOf(remotePathInput.value);
+  if (!profile || !dir) return;
+  const bookmarks = profile.bookmarks.includes(dir)
+    ? profile.bookmarks.filter((b) => b !== dir)
+    : [dir, ...profile.bookmarks];
+  try {
+    await saveProfileExtras(profile, { bookmarks });
+    updateBookmarkButton();
+  } catch (error) {
+    setStatus(describeError(error), "error");
+  }
+}
+
+/** 最近目录从传输历史推导，不额外存储：历史本来就记录了每次传到哪里。 */
+function recentDirsForCurrentServer(exclude: string[]): string[] {
+  const host = hostInput.value.trim();
+  const port = Number(portInput.value) || 22;
+  const user = usernameInput.value.trim();
+  const dirs: string[] = [];
+  for (const entry of historyEntries) {
+    if (entry.host !== host || entry.port !== port || entry.username !== user) continue;
+    const dir = remoteDirOf(entry.remote_path);
+    if (dir && !dirs.includes(dir) && !exclude.includes(dir)) dirs.push(dir);
+    if (dirs.length >= RECENT_DIR_LIMIT) break;
+  }
+  return dirs;
+}
+
+function useRemotePath(path: string) {
+  remotePathInput.value = path;
+  updateResolvedPathHint();
+  clearProbeResult();
+  scheduleBackgroundProbe();
+  updateBookmarkButton();
+  remotePathInput.focus();
+}
+
+function openPathMenu() {
+  const profile = currentProfile();
+  const bookmarks = profile?.bookmarks ?? [];
+  const bookmarkItems: PopoverItem[] = bookmarks.map((dir) => ({
+    label: dir,
+    onSelect: () => useRemotePath(dir),
+    onRemove: () => {
+      if (!profile) return;
+      void saveProfileExtras(profile, { bookmarks: bookmarks.filter((b) => b !== dir) }).then(() => {
+        updateBookmarkButton();
+        openPathMenu();
+      });
+    },
+  }));
+  const recentItems: PopoverItem[] = recentDirsForCurrentServer(bookmarks).map((dir) => ({
+    label: dir,
+    onSelect: () => useRemotePath(dir),
+  }));
+  pathMenu.show(
+    [
+      { heading: "收藏", items: bookmarkItems },
+      { heading: "最近使用", items: recentItems },
+    ],
+    profile
+      ? "还没有常用目录\n填好远端目录后点输入框里的 ☆ 收藏"
+      : "这台服务器还没保存\n到「服务器」页保存后即可收藏目录",
+  );
+}
+
 /** 本次运行中已确认可信的 host:port，避免每次浏览目录/预检都多一次握手（弱网下很贵）。 */
 const trustedHostsThisSession = new Set<string>();
 
@@ -1873,6 +1997,8 @@ function previewResolvedPath(): string | null {
 }
 
 function updateResolvedPathHint() {
+  // 所有改动远端路径的入口（浏览选择、复用历史、恢复断点）都会走到这里，顺带同步收藏星标。
+  updateBookmarkButton();
   const resolved = previewResolvedPath();
   const remote = remotePathInput.value.trim();
   if (resolved && resolved !== remote && resolved !== localPathInput.value.trim()) {
@@ -2641,6 +2767,12 @@ localPathInput.addEventListener("input", () => {
 
 localPathInput.addEventListener("blur", () => {
   if (!isTransferring) void runBackgroundProbe();
+});
+
+bookmarkBtn.addEventListener("click", () => void toggleBookmark());
+pathMenuBtn.addEventListener("click", () => {
+  if (pathMenu.isOpen) pathMenu.close();
+  else openPathMenu();
 });
 
 remotePathInput.addEventListener("input", () => {

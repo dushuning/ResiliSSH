@@ -102,9 +102,16 @@ export function appTemplate(appName: string): string {
                 <label for="remotePath" id="remotePathLabel">远端路径</label>
                 <span class="field-hint" id="pathHint"></span>
               </div>
-              <div class="input-row">
-                <input id="remotePath" placeholder="/home/user/dir/" spellcheck="false" />
-                <button class="btn btn-secondary" id="browseRemoteBtn" type="button">浏览…</button>
+              <div class="path-field">
+                <div class="input-row">
+                  <div class="path-input-wrap">
+                    <input id="remotePath" placeholder="/home/user/dir/" spellcheck="false" />
+                    <button class="path-star" id="bookmarkBtn" type="button" title="收藏此目录">${icons.star}</button>
+                  </div>
+                  <button class="btn btn-secondary" id="pathMenuBtn" type="button" aria-haspopup="menu">常用${icons.chevronDown}</button>
+                  <button class="btn btn-secondary" id="browseRemoteBtn" type="button">浏览…</button>
+                </div>
+                <div class="popover hidden" id="pathMenu" role="menu" aria-label="常用目录"></div>
               </div>
               <p id="resolvedPathHint" class="resolved-path hidden"></p>
             </div>
