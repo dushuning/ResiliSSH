@@ -1,8 +1,10 @@
+mod activity;
 mod checkpoint;
 mod download_checkpoint;
 mod history;
 mod profiles;
 mod retry;
+mod secrets;
 mod sftp;
 mod ssh_config;
 mod stall;
@@ -16,20 +18,23 @@ use history::{list_history, record_download_result, record_upload_result};
 use download_checkpoint::{
     clear_download_checkpoint, load_download_checkpoint, save_download_checkpoint, DownloadCheckpoint,
 };
-use profiles::{delete_profile, list_profiles, save_profile, ConnectionProfile, SaveProfileRequest};
+use profiles::{
+    delete_profile, list_profiles, profile_secrets, save_profile, ConnectionProfile, ProfileSecrets,
+    SaveProfileRequest,
+};
 use sftp::{
     abort_socket, connect_session, create_remote_directory, download_with_resume,
-    format_remote_sftp_error, list_remote_directory, remote_file_name, remote_parent_status,
+    format_remote_sftp_error, inspect_host_key, list_remote_directory, open_handshake, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
-    DownloadCallbacks, DownloadError, RemoteDirListing, UploadCallbacks, UploadError,
+    DownloadCallbacks, DownloadError, HostKeyInfo, RemoteDirListing, UploadCallbacks, UploadError,
 };
 
 use serde::{Deserialize, Serialize};
 use ssh_config::{list_ssh_hosts, resolve_host, SshHostEntry};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use stall::{spawn_stall_watchdog, ProgressHeartbeat};
@@ -82,6 +87,19 @@ struct CloseGate(AtomicBool);
 struct TransferRunningState {
     upload_running: bool,
     download_running: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostKeyRequest {
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustHostKeyRequest {
+    host: String,
+    port: u16,
+    fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +266,18 @@ fn build_connection_config(request: &ConnectionRequest) -> Result<ConnectionConf
     })
 }
 
+/// 传输函数在最终校验读远端失败时写下的 failure_reason（见 sftp::upload/download）。
+const FAILURE_VERIFY_READ: &str = "verify_read_failed";
+
+/// 数据全部传完、只是最终校验时读远端断了（弱网常见）：此时 trusted == file_size，
+/// 也必须走续传，传输循环会直接跳到校验阶段。若当成「无可续传进度」处理，
+/// 预检提示「仅需重试校验」，实际却会把整个大文件从头重传。
+fn can_resume_from(trusted: u64, file_size: u64, failure_reason: Option<&str>) -> bool {
+    trusted > 0
+        && (trusted < file_size
+            || (trusted == file_size && failure_reason == Some(FAILURE_VERIFY_READ)))
+}
+
 fn remote_paths_compatible(
     checkpoint_remote: &str,
     resolved_remote: &str,
@@ -374,7 +404,9 @@ struct CreateRemoteDirRequest {
     dir_name: String,
 }
 
-#[tauri::command]
+// 约定：凡是会联网、等待其他线程或可能触发钥匙串授权弹窗的命令都标 async。
+// Tauri 2 中非 async 命令跑在主线程，弱网下一次握手就能让整个窗口卡死几十秒。
+#[tauri::command(async)]
 fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing, String> {
     if request.host.trim().is_empty() {
         return Err("请填写主机".into());
@@ -396,7 +428,7 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_remote_dir(request: ListRemoteDirRequest) -> Result<RemoteDirListing, String> {
     if request.host.trim().is_empty() {
         return Err("请填写主机".into());
@@ -508,17 +540,33 @@ fn clear_saved_download_checkpoint() -> Result<(), String> {
     clear_download_checkpoint()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_saved_profiles() -> Result<Vec<ConnectionProfile>, String> {
     list_profiles()
 }
 
+/// 读钥匙串可能等待用户在系统授权框里操作，必须 async，不能卡住 UI 线程。
 #[tauri::command]
+fn list_activity_log() -> Vec<activity::ActivityEntry> {
+    activity::entries()
+}
+
+#[tauri::command]
+fn clear_activity_log() {
+    activity::clear();
+}
+
+#[tauri::command(async)]
+fn get_profile_secrets(id: String) -> ProfileSecrets {
+    profile_secrets(&id)
+}
+
+#[tauri::command(async)]
 fn save_connection_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, String> {
     save_profile(request)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_connection_profile(id: String) -> Result<(), String> {
     delete_profile(id)
 }
@@ -528,7 +576,7 @@ fn list_upload_history() -> Result<Vec<history::UploadHistoryEntry>, String> {
     list_history()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe, String> {
     if request.host.trim().is_empty() {
         return Err("请填写主机".into());
@@ -647,7 +695,7 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownloadProbe, String> {
     if request.host.trim().is_empty() {
         return Err("请填写主机".into());
@@ -764,7 +812,7 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn test_connection(request: ConnectionRequest) -> Result<String, String> {
     if request.host.trim().is_empty() {
         return Err("请填写主机".into());
@@ -775,6 +823,25 @@ fn test_connection(request: ConnectionRequest) -> Result<String, String> {
 
     let config = build_connection_config(&request)?;
     test_sftp_connection(&config).map_err(|e| e.to_string())
+}
+
+/// 前端在任何需要认证的连接前先调这个：未知主机时拿到指纹弹窗让用户确认，
+/// 而不是等连接失败后再从错误字符串里解析。async 是为了握手期间不阻塞 UI 线程。
+#[tauri::command(async)]
+fn check_host_key(request: HostKeyRequest) -> Result<HostKeyInfo, String> {
+    let host = request.host.trim();
+    if host.is_empty() {
+        return Err("请填写主机".into());
+    }
+    let (session, _) = open_handshake(host, request.port).map_err(|e| e.to_string())?;
+    inspect_host_key(&session, host, request.port).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn trust_host_key(request: TrustHostKeyRequest) -> Result<(), String> {
+    let host = request.host.trim();
+    let (session, _) = open_handshake(host, request.port).map_err(|e| e.to_string())?;
+    sftp::trust_host_key(&session, host, request.port, &request.fingerprint)
 }
 
 #[tauri::command]
@@ -814,7 +881,7 @@ fn cancel_upload(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reset_upload_state(runtime: State<'_, Mutex<UploadRuntime>>) -> Result<(), String> {
     // 置取消位 + 中断在途 IO，取出 worker 句柄后释放锁再 join：
     // worker 结束时会回锁 runtime 设 is_running=false，若持锁 join 会死锁。
@@ -899,8 +966,7 @@ fn start_upload(
             && cp.host == request.host
             && cp.port == request.port
             && cp.username == request.username
-            && trusted > 0
-            && trusted < cp.file_size
+            && can_resume_from(trusted, cp.file_size, cp.failure_reason.as_deref())
             && matches!(cp.status, CheckpointStatus::InProgress | CheckpointStatus::Failed)
     });
 
@@ -995,6 +1061,8 @@ fn start_upload(
     let port_for_history = request.port;
 
     let worker = thread::spawn(move || {
+        activity::info(activity::Category::Transfer, format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path));
+        let milestones = Arc::new(ProgressMilestones::new("上传"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_uploaded_bytes));
         let stall_timeout = Duration::from_secs(UPLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = UPLOAD_STALL_TIMEOUT_SECS;
@@ -1018,9 +1086,13 @@ fn start_upload(
                             uploaded_bytes: stalled_bytes,
                             total_bytes: total,
                             status: "stalled".into(),
-                            message: format!(
-                                "传输超过 {stall_secs} 秒无响应，正在中断并重连..."
-                            ),
+                            message: {
+                                activity::warn(
+                                    activity::Category::Network,
+                                    format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                );
+                                format!("传输超过 {stall_secs} 秒无响应，正在中断并重连...")
+                            },
                             retry_count,
                             verify_summary: None,
                         },
@@ -1043,8 +1115,10 @@ fn start_upload(
                 on_progress: Box::new({
                     let app = app.clone();
                     let heartbeat = heartbeat.clone();
+                    let milestones = milestones.clone();
                     move |uploaded, total, status, retry_count| {
                         sync_transfer_heartbeat(&heartbeat, uploaded, status);
+                        milestones.observe(uploaded, total, status);
                         let retry_hint = if retry_count > 0 {
                             format!(" · 重试 {retry_count} 次")
                         } else {
@@ -1077,6 +1151,7 @@ fn start_upload(
                             let _ = save_checkpoint(&cp);
                         }
                         let retry_message = format!("{message}（第 {retry_count} 次重试）");
+                        activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(
                             "upload-retry",
                             UploadRetryEvent {
@@ -1121,6 +1196,14 @@ fn start_upload(
                         String::new()
                     };
                     let message = format!("上传完成{retry_hint}");
+                    activity::success(
+                        activity::Category::Verify,
+                        completed_verify_summary(strict_chunk_verify_summary.load(Ordering::Relaxed)),
+                    );
+                    activity::success(
+                        activity::Category::Transfer,
+                        format!("{message} · {}", activity::format_bytes(cp.file_size)),
+                    );
                     record_upload_result(
                         &cp.local_path,
                         &cp.remote_path,
@@ -1154,6 +1237,14 @@ fn start_upload(
                     let message = format!(
                         "上传已取消，可稍后继续（已重试 {} 次）",
                         cp.retry_count
+                    );
+                    activity::info(
+                        activity::Category::Transfer,
+                        format!(
+                            "上传已取消，断点保存在 {} / {}",
+                            activity::format_bytes(cp.verified_bytes),
+                            activity::format_bytes(cp.file_size)
+                        ),
                     );
                     record_upload_result(
                         &cp.local_path,
@@ -1191,6 +1282,7 @@ fn start_upload(
                     } else {
                         format_upload_failure(&err, &cp.remote_path, cp.retry_count)
                     };
+                    activity::error(activity::classify_failure(&message), message.clone());
                     record_upload_result(
                         &cp.local_path,
                         &cp.remote_path,
@@ -1270,7 +1362,7 @@ fn cancel_download(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reset_download_state(runtime: State<'_, Mutex<DownloadRuntime>>) -> Result<(), String> {
     // 见 reset_upload_state：取出 worker 句柄后释放锁再 join，避免死锁并杜绝并发写断点。
     let worker = {
@@ -1298,14 +1390,15 @@ fn reset_download_state(runtime: State<'_, Mutex<DownloadRuntime>>) -> Result<()
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_download(
     app: AppHandle,
     runtime: State<'_, Mutex<DownloadRuntime>>,
     request: StartDownloadRequest,
 ) -> Result<(), String> {
-    let mut state = runtime.lock().map_err(|e| e.to_string())?;
-    if state.is_running {
+    // 先快速检查、立即放锁：续传前要连服务器核对远端文件（弱网下可能几十秒），
+    // 若全程持锁，关窗检查、取消等需要同一把锁的命令都会被卡住。
+    if runtime.lock().map_err(|e| e.to_string())?.is_running {
         return Err("已有下载任务在进行中".into());
     }
 
@@ -1350,8 +1443,7 @@ fn start_download(
             && cp.host == request.host
             && cp.port == request.port
             && cp.username == request.username
-            && trusted > 0
-            && trusted < cp.file_size
+            && can_resume_from(trusted, cp.file_size, cp.failure_reason.as_deref())
             && matches!(cp.status, CheckpointStatus::InProgress | CheckpointStatus::Failed)
     });
 
@@ -1443,6 +1535,13 @@ fn start_download(
         status: CheckpointStatus::InProgress,
     }));
 
+    // 联网核对期间锁是放开的，写断点、登记 worker 前必须重新持锁并复查，
+    // 防止两次并发的开始请求覆盖彼此的断点文件。
+    let mut state = runtime.lock().map_err(|e| e.to_string())?;
+    if state.is_running {
+        return Err("已有下载任务在进行中".into());
+    }
+
     save_download_checkpoint(&*checkpoint.lock().map_err(|e| e.to_string())?)?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1469,6 +1568,8 @@ fn start_download(
     let port_for_history = request.port;
 
     let worker = thread::spawn(move || {
+        activity::info(activity::Category::Transfer, format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string));
+        let milestones = Arc::new(ProgressMilestones::new("下载"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_downloaded_bytes));
         let stall_timeout = Duration::from_secs(DOWNLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = DOWNLOAD_STALL_TIMEOUT_SECS;
@@ -1492,9 +1593,13 @@ fn start_download(
                             downloaded_bytes: stalled_bytes,
                             total_bytes: total,
                             status: "stalled".into(),
-                            message: format!(
-                                "传输超过 {stall_secs} 秒无响应，正在中断并重连..."
-                            ),
+                            message: {
+                                activity::warn(
+                                    activity::Category::Network,
+                                    format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                );
+                                format!("传输超过 {stall_secs} 秒无响应，正在中断并重连...")
+                            },
                             retry_count,
                             verify_summary: None,
                         },
@@ -1517,8 +1622,10 @@ fn start_download(
                 on_progress: Box::new({
                     let app = app.clone();
                     let heartbeat = heartbeat.clone();
+                    let milestones = milestones.clone();
                     move |downloaded, total, status, retry_count| {
                         sync_transfer_heartbeat(&heartbeat, downloaded, status);
+                        milestones.observe(downloaded, total, status);
                         let retry_hint = if retry_count > 0 {
                             format!(" · 重试 {retry_count} 次")
                         } else {
@@ -1551,6 +1658,7 @@ fn start_download(
                             let _ = save_download_checkpoint(&cp);
                         }
                         let retry_message = format!("{message}（第 {retry_count} 次重试）");
+                        activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(
                             "download-retry",
                             DownloadRetryEvent {
@@ -1595,6 +1703,14 @@ fn start_download(
                         String::new()
                     };
                     let message = format!("下载完成{retry_hint}");
+                    activity::success(
+                        activity::Category::Verify,
+                        completed_verify_summary(strict_chunk_verify_summary.load(Ordering::Relaxed)),
+                    );
+                    activity::success(
+                        activity::Category::Transfer,
+                        format!("{message} · {}", activity::format_bytes(cp.file_size)),
+                    );
                     record_download_result(
                         &cp.local_path,
                         &cp.remote_path,
@@ -1628,6 +1744,14 @@ fn start_download(
                     let message = format!(
                         "下载已取消，可稍后继续（已重试 {} 次）",
                         cp.retry_count
+                    );
+                    activity::info(
+                        activity::Category::Transfer,
+                        format!(
+                            "下载已取消，断点保存在 {} / {}",
+                            activity::format_bytes(cp.verified_bytes),
+                            activity::format_bytes(cp.file_size)
+                        ),
                     );
                     record_download_result(
                         &cp.local_path,
@@ -1665,6 +1789,7 @@ fn start_download(
                     } else {
                         format_download_failure(&err, &cp.remote_path, cp.retry_count)
                     };
+                    activity::error(activity::classify_failure(&message), message.clone());
                     record_download_result(
                         &cp.local_path,
                         &cp.remote_path,
@@ -1708,8 +1833,85 @@ fn start_download(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 把进度折算成里程碑写进活动日志：每 10% 一条，不逐块刷屏；
+/// 首个进度（续传起点）只作为基准，不会一口气补记之前已完成的里程碑。
+struct ProgressMilestones {
+    verb: &'static str,
+    last_decile: AtomicU64,
+    verifying_logged: AtomicBool,
+}
+
+/// 尚未收到首个进度时的哨兵值。
+const MILESTONE_UNSET: u64 = u64::MAX;
+const MILESTONE_STEPS: u64 = 10;
+
+impl ProgressMilestones {
+    fn new(verb: &'static str) -> Self {
+        Self {
+            verb,
+            last_decile: AtomicU64::new(MILESTONE_UNSET),
+            verifying_logged: AtomicBool::new(false),
+        }
+    }
+
+    fn observe(&self, transferred: u64, total: u64, status: &str) {
+        if status == "verifying" {
+            if !self.verifying_logged.swap(true, Ordering::Relaxed) {
+                activity::info(
+                    activity::Category::Verify,
+                    "数据已全部传完，开始全文件 SHA-256 校验",
+                );
+            }
+            return;
+        }
+        if total == 0 {
+            return;
+        }
+        let decile = transferred.saturating_mul(MILESTONE_STEPS) / total;
+        let prev = self.last_decile.load(Ordering::Relaxed);
+        if prev == MILESTONE_UNSET {
+            self.last_decile.store(decile, Ordering::Relaxed);
+            return;
+        }
+        if decile > prev && decile < MILESTONE_STEPS {
+            self.last_decile.store(decile, Ordering::Relaxed);
+            activity::info(
+                activity::Category::Transfer,
+                format!(
+                    "已{} {}%（{} / {}）",
+                    self.verb,
+                    decile * MILESTONE_STEPS,
+                    activity::format_bytes(transferred),
+                    activity::format_bytes(total)
+                ),
+            );
+        }
+    }
+}
+
+/// 单个日志文件上限与保留份数：弱网长时间重试会持续写日志，必须有界，
+/// 又要保留足够历史让用户事后能把一次失败的完整重试过程发出来排查。
+const LOG_MAX_FILE_BYTES: u128 = 5 * 1024 * 1024;
+const LOG_KEEP_FILES: usize = 3;
+
+/// 不注册 logger 时 `log::` 宏全部是空操作——哈希不一致、卡住检测、重试原因都会丢失。
+/// 日志写到 ~/Library/Logs/com.resiliss.desktop/，开发时同时输出到终端。
+fn log_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri_plugin_log::Builder::new()
+        .level(log::LevelFilter::Info)
+        .max_file_size(LOG_MAX_FILE_BYTES)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(LOG_KEEP_FILES))
+        .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+        .build()
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(log_plugin())
+        .setup(|app| {
+            activity::init(app.handle().clone());
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Mutex::new(UploadRuntime::default()))
@@ -1734,6 +1936,9 @@ pub fn run() {
             get_saved_download_checkpoint,
             clear_saved_download_checkpoint,
             list_saved_profiles,
+            get_profile_secrets,
+            list_activity_log,
+            clear_activity_log,
             save_connection_profile,
             delete_connection_profile,
             list_upload_history,
@@ -1742,6 +1947,8 @@ pub fn run() {
             list_remote_dir,
             create_remote_dir,
             test_connection,
+            check_host_key,
+            trust_host_key,
             start_upload,
             start_download,
             reset_upload_state,
@@ -1753,4 +1960,20 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_read_failure_at_full_size_resumes_instead_of_restarting() {
+        const SIZE: u64 = 10 * 1024 * 1024;
+        assert!(can_resume_from(SIZE, SIZE, Some(FAILURE_VERIFY_READ)));
+        assert!(can_resume_from(SIZE / 2, SIZE, None));
+        // 全部传完但失败原因不是校验读取失败（如哈希不一致）不能续传，应从头重传。
+        assert!(!can_resume_from(SIZE, SIZE, Some("hash_mismatch")));
+        assert!(!can_resume_from(SIZE, SIZE, None));
+        assert!(!can_resume_from(0, SIZE, None));
+    }
 }

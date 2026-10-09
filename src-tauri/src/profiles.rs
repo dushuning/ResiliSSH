@@ -1,4 +1,5 @@
 use crate::checkpoint::AuthKind;
+use crate::secrets::{delete_secret, load_secret, store_secret, SecretKind};
 use crate::storage::{new_id, read_json_file, write_json_file};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,8 @@ pub struct ConnectionProfile {
     pub username: String,
     pub auth_kind: AuthKind,
     pub key_path: Option<String>,
+    /// 磁盘上恒为 None（真实值在钥匙串，按需通过 `profile_secrets` 读取）。
+    /// 保留 `serde(default)` 以便读取旧版本写入的明文字段并迁移。
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]
@@ -34,10 +37,69 @@ impl Default for ProfileStore {
 }
 
 fn load_store() -> Result<ProfileStore, String> {
-    match read_json_file(PROFILES_FILE) {
-        Ok(store) => Ok(store),
-        Err(err) if err.contains("not found") => Ok(ProfileStore::default()),
-        Err(err) => Err(err),
+    let mut store: ProfileStore = match read_json_file(PROFILES_FILE) {
+        Ok(store) => store,
+        Err(err) if err.contains("not found") => return Ok(ProfileStore::default()),
+        Err(err) => return Err(err),
+    };
+    if migrate_plaintext_secrets(&mut store) {
+        save_store(&store)?;
+    }
+    Ok(store)
+}
+
+/// v1.0.0 把密码明文写在 profiles.json 里；加载时把残留明文搬进钥匙串并从文件抹掉。
+/// 单条迁移失败时保留该明文，宁可暂不迁移也不能让用户丢失已保存的密码。
+/// 返回是否有字段被迁移（需要回写文件）。
+fn migrate_plaintext_secrets(store: &mut ProfileStore) -> bool {
+    let mut migrated = false;
+    for profile in &mut store.profiles {
+        for (kind, slot) in [
+            (SecretKind::Password, &mut profile.password),
+            (SecretKind::KeyPassphrase, &mut profile.key_passphrase),
+        ] {
+            let Some(value) = slot.as_deref().filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            match store_secret(&profile.id, kind, value) {
+                Ok(()) => {
+                    log::info!("migrated plaintext {kind:?} to keychain: profile={}", profile.id);
+                    *slot = None;
+                    migrated = true;
+                }
+                Err(err) => log::warn!(
+                    "keep plaintext {kind:?} (keychain migration failed): profile={} err={err}",
+                    profile.id
+                ),
+            }
+        }
+    }
+    migrated
+}
+
+/// 只在用户真正选中某个服务器时读取它的密钥，而不是列出列表时读全部：
+/// 每读一个钥匙串条目 macOS 都可能弹一次授权框，批量读取会连续弹出一串。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileSecrets {
+    pub password: Option<String>,
+    pub key_passphrase: Option<String>,
+}
+
+pub fn profile_secrets(id: &str) -> ProfileSecrets {
+    ProfileSecrets {
+        password: load_secret(id, SecretKind::Password),
+        key_passphrase: load_secret(id, SecretKind::KeyPassphrase),
+    }
+}
+
+/// 把密钥写进钥匙串；值为空则删除旧条目，避免改用私钥后旧密码仍残留在钥匙串里。
+fn persist_secret(profile_id: &str, kind: SecretKind, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(v) => store_secret(profile_id, kind, v),
+        None => {
+            delete_secret(profile_id, kind);
+            Ok(())
+        }
     }
 }
 
@@ -122,16 +184,17 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         .map(|p| p.id.clone())
         .unwrap_or_else(new_id);
 
+    // 表单留空表示「沿用已保存的值」，所以回退到该连接现有的钥匙串条目。
     let password = non_empty(request.password).or_else(|| {
         existing
             .as_ref()
-            .and_then(|p| p.password.clone())
+            .and_then(|p| load_secret(&p.id, SecretKind::Password))
             .filter(|p| !p.is_empty())
     });
     let key_passphrase = non_empty(request.key_passphrase).or_else(|| {
         existing
             .as_ref()
-            .and_then(|p| p.key_passphrase.clone())
+            .and_then(|p| load_secret(&p.id, SecretKind::KeyPassphrase))
             .filter(|p| !p.is_empty())
     });
 
@@ -146,6 +209,10 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
             .unwrap_or(0)
     });
 
+    // 先写钥匙串再写 JSON：钥匙串失败时整个保存失败，绝不退回明文落盘。
+    persist_secret(&profile_id, SecretKind::Password, password.as_deref())?;
+    persist_secret(&profile_id, SecretKind::KeyPassphrase, key_passphrase.as_deref())?;
+
     let profile = ConnectionProfile {
         id: profile_id,
         name: name.to_string(),
@@ -154,15 +221,19 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         username: username.to_string(),
         auth_kind,
         key_path: request.key_path.filter(|p| !p.trim().is_empty()),
-        password,
-        key_passphrase,
+        password: None,
+        key_passphrase: None,
         created_at,
     };
 
     store.profiles.retain(|p| p.name != profile.name);
     store.profiles.push(profile.clone());
     save_store(&store)?;
-    Ok(profile)
+    Ok(ConnectionProfile {
+        password,
+        key_passphrase,
+        ..profile
+    })
 }
 
 pub fn delete_profile(id: String) -> Result<(), String> {
@@ -172,5 +243,8 @@ pub fn delete_profile(id: String) -> Result<(), String> {
     if store.profiles.len() == before {
         return Err("连接配置不存在".into());
     }
-    save_store(&store)
+    save_store(&store)?;
+    delete_secret(&id, SecretKind::Password);
+    delete_secret(&id, SecretKind::KeyPassphrase);
+    Ok(())
 }

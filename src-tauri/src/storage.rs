@@ -50,7 +50,8 @@ pub fn write_json_file<T: serde::Serialize>(filename: &str, value: &T) -> Result
     let dir = ensure_app_data_dir()?;
     let path = dir.join(filename);
     let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    // 连接配置、历史同样是用户状态，走原子写避免半截 JSON 导致整份数据读不出来。
+    atomic_write(&path, json.as_bytes())
 }
 
 pub fn new_id() -> String {

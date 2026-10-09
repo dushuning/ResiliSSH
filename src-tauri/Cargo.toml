@@ -23,6 +23,8 @@ ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 thiserror = "2"
 log = "0.4"
 dirs = "6"
+keyring = { version = "3", features = ["apple-native"] }
+tauri-plugin-log = "2"
 
 [profile.release]
 panic = "abort"

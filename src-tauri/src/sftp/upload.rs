@@ -1,4 +1,5 @@
-use super::client::{connect_session, ConnectError, ConnectionConfig};
+use super::errors::is_permanent_sftp_error;
+use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};
@@ -242,6 +243,10 @@ pub fn upload_with_resume(
                     if cancel_flag.load(Ordering::Relaxed) {
                         return Err(UploadError::Cancelled);
                     }
+                    if err.is_permanent() {
+                        log::error!("connect failed permanently, stop retrying: {err}");
+                        return Err(UploadError::Connect(err));
+                    }
                     let retry_count = increment_retry_count(&checkpoint)?;
                     let uploaded_bytes = checkpoint
                         .lock()
@@ -345,11 +350,7 @@ pub fn upload_with_resume(
                 }
 
                 let detail = transfer_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-                let uploaded_bytes = checkpoint
-                    .lock()
-                    .map(|cp| cp.uploaded_bytes)
-                    .unwrap_or(0);
-                if is_permanent_sftp_error(&detail, uploaded_bytes) {
+                if is_permanent_sftp_error(&detail) {
                     checkpoint
                         .lock()
                         .map_err(|e| UploadError::Sftp(e.to_string()))?
@@ -382,7 +383,7 @@ fn verify_upload_integrity(
 ) -> Result<u32, UploadError> {
     ensure_not_cancelled(cancel_flag, checkpoint)?;
 
-    let local_hash = sha256_local_file(local_path, cancel_flag, checkpoint)?;
+    let local_hash = sha256_local_file(session, local_path, cancel_flag, checkpoint)?;
     let sftp = session.sftp().map_err(|e| UploadError::Sftp(e.to_string()))?;
     let remote_hash = match sha256_remote_file(
         &sftp,
@@ -428,7 +429,10 @@ fn verify_upload_integrity(
     Ok(current_retry_count(checkpoint))
 }
 
+/// 哈希大文件可能要几十秒，期间 SSH 连接上没有任何流量；顺带发 keepalive，
+/// 防止 NAT/防火墙或服务器 ClientAlive 把空闲连接掐掉，导致随后读远端时又得重连。
 fn sha256_local_file(
+    session: &Session,
     path: &Path,
     cancel_flag: &Arc<AtomicBool>,
     checkpoint: &Arc<Mutex<UploadCheckpoint>>,
@@ -438,6 +442,10 @@ fn sha256_local_file(
     let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
     loop {
         ensure_not_cancelled(cancel_flag, checkpoint)?;
+        // keepalive_send 内部按 set_keepalive 的间隔节流，每轮调用并不会真的每次发包。
+        if let Err(e) = session.keepalive_send() {
+            log::debug!("keepalive during local hash failed: {e}");
+        }
         let read_bytes = file
             .read(&mut buffer)
             .map_err(|e| UploadError::LocalIo(e.to_string()))?;
@@ -546,34 +554,7 @@ fn safe_resume_offset(trusted: u64, remote_size: u64) -> u64 {
     }
 }
 
-fn strip_sftp_wrapper(message: &str) -> &str {
-    if let Some(pos) = message.find('」') {
-        if message.starts_with("远端路径「") {
-            let rest = message[pos + '」'.len_utf8()..].trim_start();
-            return rest.strip_prefix("操作失败：").unwrap_or(rest);
-        }
-    }
-    message
-}
 
-fn is_permanent_sftp_error(message: &str, _uploaded_bytes: u64) -> bool {
-    let raw = strip_sftp_wrapper(message);
-    let lower = raw.to_ascii_lowercase();
-    [
-        "permission denied",
-        "no such file",
-        "not a directory",
-        "is a directory",
-        "cannot create",
-        "access denied",
-        "auth",
-        "续传边界校验失败",
-        "sha-256",
-        "远端路径错误",
-    ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
-}
 
 fn sleep_backoff(cancel_flag: &Arc<AtomicBool>, backoff_ms: u64) -> Result<(), UploadError> {
     let step_ms = 200_u64;
@@ -820,6 +801,19 @@ fn resolve_resume_offset(
     prepare_resume_offset(sftp, remote_path, remote_stat_size, force_overwrite)
 }
 
+/// 每次（重）连接后记录从哪里开始：用户能在日志里看到断点续传确实生效、没有从头再来。
+pub(super) fn log_resume_point(offset: u64, total: u64) {
+    use crate::activity::{format_bytes, info, Category};
+    if offset > 0 {
+        info(
+            Category::Transfer,
+            format!("从 {} 处续传（共 {}）", format_bytes(offset), format_bytes(total)),
+        );
+    } else {
+        info(Category::Transfer, format!("从头开始传输，共 {}", format_bytes(total)));
+    }
+}
+
 fn write_remote_chunk<F: FnMut(u64)>(
     sftp: &Sftp,
     remote_path: &str,
@@ -895,9 +889,15 @@ fn transfer_chunks(
 
     ensure_remote_parent_directories(&sftp, &actual_remote_path)?;
 
+    // 只有「不存在」才视为 0 字节；其他 stat 失败交给重试循环重连，
+    // 否则一次超时就会让 resolve_resume_offset 把断点归零并截断远端文件。
     let remote_stat_size = match sftp.stat(Path::new(&actual_remote_path)) {
         Ok(stat) => stat.size.unwrap_or(0),
-        Err(_) => 0,
+        Err(e) if is_sftp_not_found(&e) => 0,
+        Err(e) => {
+            log::warn!("stat remote failed (will retry): path={actual_remote_path} err={e}");
+            return Err(UploadError::Sftp(e.to_string()));
+        }
     };
 
     if remote_stat_size > local_size && !force_overwrite.load(Ordering::Relaxed) {
@@ -923,6 +923,7 @@ fn transfer_chunks(
     if offset > 0 {
         verify_resume_boundary(&sftp, local_path, &actual_remote_path, offset)?;
     }
+    log_resume_point(offset, local_size);
 
     {
         let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
@@ -1033,8 +1034,8 @@ mod tests {
     #[test]
     fn socket_timeout_after_progress_is_retryable() {
         let wrapped = format_remote_sftp_error("Timed out waiting on socket", "/tmp/a.jar");
-        assert!(!is_permanent_sftp_error(&wrapped, 19_922_944));
-        assert!(!is_permanent_sftp_error("Timed out waiting on socket", 19_922_944));
+        assert!(!is_permanent_sftp_error(&wrapped));
+        assert!(!is_permanent_sftp_error("Timed out waiting on socket"));
     }
 
     // 回归：远端字节 < 断点可信位置时必须夹紧到远端块对齐位置，

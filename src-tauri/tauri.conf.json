@@ -14,11 +14,13 @@
     "windows": [
       {
         "title": "ResiliSSH",
-        "width": 720,
-        "height": 665,
-        "minWidth": 520,
-        "minHeight": 460,
-        "resizable": true
+        "width": 920,
+        "height": 640,
+        "minWidth": 780,
+        "minHeight": 580,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

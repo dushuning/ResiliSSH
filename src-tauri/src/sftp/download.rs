@@ -1,4 +1,5 @@
-use super::client::{connect_session, ConnectError, ConnectionConfig};
+use super::errors::is_permanent_sftp_error;
+use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use crate::checkpoint::CheckpointStatus;
 use crate::download_checkpoint::{save_download_checkpoint, DownloadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
@@ -106,6 +107,10 @@ pub fn download_with_resume(
                     if cancel_flag.load(Ordering::Relaxed) {
                         return Err(DownloadError::Cancelled);
                     }
+                    if err.is_permanent() {
+                        log::error!("connect failed permanently, stop retrying: {err}");
+                        return Err(DownloadError::Connect(err));
+                    }
                     let retry_count = increment_retry_count(&checkpoint)?;
                     let message = format!("连接失败，{backoff_ms}ms 后重试: {err}");
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
@@ -204,11 +209,7 @@ pub fn download_with_resume(
                     return Err(DownloadError::Cancelled);
                 }
                 let detail = transfer_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-                let downloaded_bytes = checkpoint
-                    .lock()
-                    .map(|cp| cp.downloaded_bytes)
-                    .unwrap_or(0);
-                if is_permanent_sftp_error(&detail, downloaded_bytes) {
+                if is_permanent_sftp_error(&detail) {
                     checkpoint
                         .lock()
                         .map_err(|e| DownloadError::Sftp(e.to_string()))?
@@ -268,9 +269,12 @@ fn transfer_chunks(
         save_download_checkpoint(&cp).map_err(|e| DownloadError::Sftp(e))?;
     }
 
-    let local_stat_size = fs::metadata(&resolved_local_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // 与上传侧对称：只有文件不存在才算 0 字节，其他读元数据失败不能被当成「从头下载」。
+    let local_stat_size = match fs::metadata(&resolved_local_path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(DownloadError::LocalIo(e.to_string())),
+    };
 
     if local_stat_size > remote_size && !force_overwrite.load(Ordering::Relaxed) {
         return Err(DownloadError::LocalLargerThanRemote {
@@ -300,6 +304,7 @@ fn transfer_chunks(
             offset,
         )?;
     }
+    super::upload::log_resume_point(offset, remote_size);
 
     {
         let mut cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
@@ -393,9 +398,14 @@ fn resolve_remote_file(sftp: &Sftp, remote_path: &str) -> Result<String, Downloa
             "请填写远端文件路径，不支持下载整个目录".into(),
         )),
         Ok(_) => Ok(trimmed.to_string()),
-        Err(_) => Err(DownloadError::InvalidRemotePath(format!(
+        Err(e) if is_sftp_not_found(&e) => Err(DownloadError::InvalidRemotePath(format!(
             "远端文件不存在: {trimmed}"
         ))),
+        // InvalidRemotePath 是永久错误；超时等抖动必须走可重试的 Sftp 分支，不能直接放弃下载。
+        Err(e) => {
+            log::warn!("stat remote failed (will retry): path={trimmed} err={e}");
+            Err(DownloadError::Sftp(e.to_string()))
+        }
     }
 }
 
@@ -481,7 +491,7 @@ fn verify_download_integrity(
     checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
 ) -> Result<u32, DownloadError> {
     ensure_not_cancelled(cancel_flag, checkpoint)?;
-    let local_hash = sha256_local_file(local_path, cancel_flag, checkpoint)?;
+    let local_hash = sha256_local_file(session, local_path, cancel_flag, checkpoint)?;
     let sftp = session.sftp().map_err(|e| DownloadError::Sftp(e.to_string()))?;
     let remote_hash = match sha256_remote_file(&sftp, remote_path, remote_size, cancel_flag, checkpoint) {
         Ok(hash) => hash,
@@ -669,7 +679,10 @@ fn should_skip_full_file_hash(
     Ok(cp.verified_bytes == file_size && cp.downloaded_bytes >= file_size)
 }
 
+/// 哈希大文件可能要几十秒，期间 SSH 连接上没有任何流量；顺带发 keepalive，
+/// 防止 NAT/防火墙或服务器 ClientAlive 把空闲连接掐掉，导致随后读远端时又得重连。
 fn sha256_local_file(
+    session: &Session,
     path: &Path,
     cancel_flag: &Arc<AtomicBool>,
     checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
@@ -679,6 +692,10 @@ fn sha256_local_file(
     let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
     loop {
         ensure_not_cancelled(cancel_flag, checkpoint)?;
+        // keepalive_send 内部按 set_keepalive 的间隔节流，每轮调用并不会真的每次发包。
+        if let Err(e) = session.keepalive_send() {
+            log::debug!("keepalive during local hash failed: {e}");
+        }
         let read_bytes = file.read(&mut buffer).map_err(|e| DownloadError::LocalIo(e.to_string()))?;
         if read_bytes == 0 {
             break;
@@ -768,35 +785,7 @@ fn safe_resume_offset(trusted: u64, local_size: u64, remote_size: u64) -> u64 {
     safe
 }
 
-fn strip_sftp_wrapper(message: &str) -> &str {
-    if let Some(pos) = message.find('」') {
-        if message.starts_with("远端路径「") {
-            let rest = message[pos + '」'.len_utf8()..].trim_start();
-            return rest.strip_prefix("操作失败：").unwrap_or(rest);
-        }
-    }
-    message
-}
 
-fn is_permanent_sftp_error(message: &str, _downloaded_bytes: u64) -> bool {
-    let raw = strip_sftp_wrapper(message);
-    let lower = raw.to_ascii_lowercase();
-    [
-        "permission denied",
-        "no such file",
-        "not a directory",
-        "is a directory",
-        "cannot create",
-        "access denied",
-        "auth",
-        "续传边界校验失败",
-        "sha-256",
-        "远端路径错误",
-        "远端不是文件",
-    ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
-}
 
 fn sleep_backoff(cancel_flag: &Arc<AtomicBool>, backoff_ms: u64) -> Result<(), DownloadError> {
     let step_ms = 200_u64;

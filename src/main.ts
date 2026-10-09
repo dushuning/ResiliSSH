@@ -2,9 +2,14 @@ import "./theme.css";
 import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { ActivityLogView, copyText, type ActivityEntry, type LogFilter } from "./ui/activityLog";
+import { BlockMap, type BlockMapPhase } from "./ui/blockMap";
+import { icons } from "./ui/icons";
+import { appTemplate } from "./ui/template";
 
 interface SshHostEntry {
   alias: string;
@@ -27,6 +32,11 @@ interface ConnectionProfile {
   created_at: number;
 }
 
+interface ProfileSecrets {
+  password: string | null;
+  key_passphrase: string | null;
+}
+
 interface UploadHistoryEntry {
   id: string;
   local_path: string;
@@ -40,6 +50,12 @@ interface UploadHistoryEntry {
   finished_at: number;
   message: string | null;
   direction?: string;
+}
+
+interface HostKeyInfo {
+  status: "trusted" | "unknown" | "changed";
+  fingerprint: string;
+  key_type: string;
 }
 
 interface UploadCheckpoint {
@@ -143,12 +159,21 @@ type TransferDirection = "upload" | "download";
 const THEME_STORAGE_KEY = "resiliss-theme";
 type ThemePreference = "system" | "light" | "dark";
 
-(function initThemeEarly() {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY) as ThemePreference | null;
-  if (saved === "light" || saved === "dark") {
-    document.documentElement.dataset.theme = saved;
-  }
-})();
+const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+function readThemePreference(): ThemePreference {
+  const saved = localStorage.getItem(THEME_STORAGE_KEY);
+  return saved === "light" || saved === "dark" ? saved : "system";
+}
+
+/** 「跟随系统」在这里解析成实际明暗写到 data-theme，CSS 只需维护一份深色变量。 */
+function resolveTheme(mode: ThemePreference): "light" | "dark" {
+  if (mode !== "system") return mode;
+  return systemDarkQuery.matches ? "dark" : "light";
+}
+
+// 在渲染前同步应用主题，避免启动时先闪一下浅色。
+document.documentElement.dataset.theme = resolveTheme(readThemePreference());
 
 const APP_NAME = "ResiliSSH";
 
@@ -164,267 +189,13 @@ interface TransferStateView {
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
-app.innerHTML = `
-  <div class="main-scroll">
-    <div class="card" id="connectionCard">
-      <button class="collapsible-header" id="connectionToggle" type="button">
-        <h2>连接设置</h2>
-        <span class="connection-summary" id="connectionSummary">点击展开配置</span>
-        <span class="chevron">▼</span>
-      </button>
-      <div id="connectionBody" class="collapsible-body collapsed">
-        <div class="connection-body-inner">
-          <section class="connection-section">
-            <label for="profileSelect">快速连接</label>
-            <select id="profileSelect">
-              <option value="">选择已保存连接</option>
-            </select>
-            <div id="connectionStatus" class="connection-status"></div>
-            <div class="save-name-row">
-              <input id="profileName" placeholder="连接名称，如 甘肃服务器" />
-              <button class="secondary small" id="saveProfileBtn" type="button">保存</button>
-              <button class="ghost danger-text small" id="deleteProfileBtn" type="button">删除</button>
-            </div>
-            <p class="hint auth-hint" id="authHint">密码随已保存连接一并存储，选好连接后自动填入</p>
-          </section>
-
-          <div class="connection-divider" aria-hidden="true"><span>或手动配置</span></div>
-
-          <section class="connection-section">
-            <label for="hostSelect">从 SSH Config 导入 <span class="label-hint">~/.ssh/config</span></label>
-            <select id="hostSelect">
-              <option value="">不使用，手动填写下方信息</option>
-            </select>
-
-            <div class="row">
-              <div>
-                <label for="host">主机</label>
-                <input id="host" placeholder="192.168.1.10" />
-              </div>
-              <div>
-                <label for="port">端口</label>
-                <input id="port" type="number" value="22" />
-              </div>
-            </div>
-
-            <label for="username">用户名</label>
-            <input id="username" placeholder="root" />
-
-            <label for="authType">认证方式</label>
-            <select id="authType">
-              <option value="key">私钥</option>
-              <option value="password">密码</option>
-            </select>
-
-            <div id="keyFields">
-              <label for="keyPath">私钥路径</label>
-              <div class="file-row">
-                <input id="keyPath" placeholder="~/.ssh/id_rsa" />
-                <button class="secondary" id="pickKeyBtn" type="button">选择</button>
-              </div>
-              <label for="keyPassphrase">私钥口令（可选）</label>
-              <input id="keyPassphrase" type="password" />
-            </div>
-
-            <div id="passwordFields" class="hidden">
-              <label for="password">密码</label>
-              <input id="password" type="password" placeholder="密码登录时填写" />
-            </div>
-
-            <div class="connection-actions">
-              <button class="secondary small" id="testConnBtn" type="button">测试连接</button>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
-
-    <div class="card" id="fileCard">
-      <div class="card-brand-row">
-        <div class="app-brand-group">
-          <img class="app-logo" src="/app-logo.png" alt="" width="32" height="32" />
-          <span class="app-brand">${APP_NAME}</span>
-        </div>
-        <div class="transfer-direction compact">
-          <div class="mode-toggle direction-toggle">
-            <label class="radio-pill direction-pill">
-              <input type="radio" name="transferDirection" value="upload" checked />
-              <span>上传</span>
-            </label>
-            <label class="radio-pill direction-pill">
-              <input type="radio" name="transferDirection" value="download" />
-              <span>下载</span>
-            </label>
-          </div>
-        </div>
-      </div>
-
-      <div id="transferStatePanel" class="state-panel hidden">
-        <div class="state-panel-main">
-          <div class="state-panel-title" id="statePanelTitle"></div>
-          <div class="state-panel-detail" id="statePanelDetail"></div>
-          <div class="state-panel-hint" id="statePanelHint"></div>
-        </div>
-        <button class="ghost-link hidden" id="clearCheckpointBtn" type="button">清除断点</button>
-      </div>
-
-      <label for="localPath" id="localPathLabel">本地文件</label>
-      <div id="fileChip" class="file-chip hidden">
-        <div class="file-chip-icon">📄</div>
-        <div class="file-chip-body">
-          <div class="file-chip-name" id="fileChipName"></div>
-          <div class="file-chip-path" id="fileChipPath"></div>
-        </div>
-        <button class="secondary small" id="changeFileBtn" type="button">更换</button>
-      </div>
-      <div class="drop-zone" id="dropZone">
-        <div class="drop-icon">📄</div>
-        <div class="file-row">
-          <input id="localPath" placeholder="选择或拖拽文件到此处" />
-          <button class="secondary" id="pickFileBtn" type="button">选择</button>
-        </div>
-        <p class="drop-hint" id="dropHint">支持将文件拖拽到此处</p>
-      </div>
-
-      <label for="remotePath" id="remotePathLabel">远端路径</label>
-      <div class="file-row remote-path-row">
-        <input id="remotePath" placeholder="/home/user/dir/ 或 /home/user/file.jar" />
-        <button class="secondary" id="browseRemoteBtn" type="button">浏览</button>
-      </div>
-      <p id="resolvedPathHint" class="resolved-path hidden"></p>
-      <p class="hint path-hint" id="pathHint">填目录时以 / 结尾；若远端已是同名目录，也会自动拼接文件名</p>
-
-      <div class="transfer-settings-card">
-        <button class="collapsible-header" id="transferSettingsToggle" type="button">
-          <span class="transfer-settings-title">传输选项</span>
-          <span class="transfer-settings-summary" id="transferSettingsSummary">弱网可靠</span>
-          <span class="chevron">▼</span>
-        </button>
-        <div id="transferSettingsBody" class="collapsible-body collapsed">
-          <div class="transfer-settings-inner">
-            <div class="transfer-settings-head">
-              <span class="transfer-settings-label">传输模式</span>
-              <div class="mode-toggle mode-toggle-subtle">
-                <label class="radio-pill mode-pill">
-                  <input type="radio" name="transferMode" value="reliable" checked />
-                  <span>弱网可靠</span>
-                </label>
-                <label class="radio-pill mode-pill">
-                  <input type="radio" name="transferMode" value="fast" />
-                  <span>快速传输</span>
-                </label>
-              </div>
-            </div>
-            <p class="hint mode-hint" id="modeHint">弱网下自动逐块校验，速度略慢但更可靠</p>
-            <label class="checkbox-row">
-              <input type="checkbox" id="forceOverwrite" />
-              <span id="forceOverwriteLabel">强制从头覆盖（忽略断点与远端已有数据）</span>
-            </label>
-            <div class="transfer-settings-head theme-settings-head">
-              <span class="transfer-settings-label">外观</span>
-              <div class="mode-toggle mode-toggle-subtle">
-                <label class="radio-pill mode-pill">
-                  <input type="radio" name="themeMode" value="system" checked />
-                  <span>系统</span>
-                </label>
-                <label class="radio-pill mode-pill">
-                  <input type="radio" name="themeMode" value="light" />
-                  <span>浅色</span>
-                </label>
-                <label class="radio-pill mode-pill">
-                  <input type="radio" name="themeMode" value="dark" />
-                  <span>深色</span>
-                </label>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="transfer-actions">
-        <button class="primary" id="transferBtn" type="button">开始上传</button>
-      </div>
-
-      <div class="progress-wrap" id="progressWrap">
-        <div class="progress-toolbar" id="progressToolbar">
-          <span id="progressBadge" class="badge">等待开始</span>
-          <button class="cancel-btn hidden" id="cancelBtn" type="button">取消</button>
-        </div>
-        <progress id="progressBar" value="0" max="100"></progress>
-        <div class="progress-stats hidden" id="progressStats">
-          <div class="progress-detail hidden" id="progressDetail"></div>
-          <div class="progress-speed-line hidden" id="progressSpeed"></div>
-        </div>
-        <div class="verify-summary hidden" id="verifySummary"></div>
-        <div class="ambient-panel hidden" id="transferActivity" aria-hidden="true">
-          <div class="data-flow mood-steady" id="transferScene" aria-hidden="true">
-            <div class="data-flow-pipe">
-              <div class="data-flow-pipe-track"></div>
-              <span class="data-flow-node data-flow-local" aria-hidden="true"></span>
-              <span class="data-flow-node data-flow-remote" aria-hidden="true"></span>
-              <div class="data-flow-particles" aria-hidden="true">
-                <span class="data-packet"></span>
-                <span class="data-packet"></span>
-                <span class="data-packet"></span>
-                <span class="data-packet"></span>
-                <span class="data-packet"></span>
-              </div>
-              <!-- 传输小信使：随网速切换表情（🚀快 / ✈️正常 / 🐌慢 / 😴等待），给等待的用户解闷 -->
-              <span class="data-flow-courier" aria-hidden="true"></span>
-            </div>
-          </div>
-        </div>
-        <div class="status" id="statusText">填写连接信息和文件后开始传输</div>
-        <div class="history-peek hidden" id="historyPeek"></div>
-      </div>
-    </div>
-  </div>
-
-  <div id="confirmOverlay" class="modal-overlay hidden">
-    <div class="modal" role="dialog" aria-modal="true">
-      <div class="modal-title" id="confirmTitle">确认</div>
-      <div class="modal-body" id="confirmBody"></div>
-      <div class="modal-actions">
-        <button class="secondary" id="confirmCancel" type="button">取消</button>
-        <button class="primary" id="confirmOk" type="button">确定</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="remoteBrowseOverlay" class="modal-overlay hidden">
-    <div class="modal modal-browse" role="dialog" aria-modal="true" aria-labelledby="remoteBrowseTitle">
-      <div class="modal-title" id="remoteBrowseTitle">浏览远端目录</div>
-      <div class="remote-browse-path-row">
-        <input id="remoteBrowsePath" type="text" spellcheck="false" />
-        <button class="secondary small" id="remoteBrowseGoBtn" type="button">前往</button>
-      </div>
-      <div class="remote-browse-status" id="remoteBrowseStatus"></div>
-      <p class="hint remote-browse-hint" id="remoteBrowseHint">双击文件夹进入；双击文件可选中</p>
-      <div class="remote-browse-list" id="remoteBrowseList"></div>
-      <div class="remote-browse-new-dir hidden" id="remoteBrowseNewDirRow">
-        <input id="remoteBrowseNewDirName" type="text" placeholder="新目录名称" spellcheck="false" />
-        <button class="secondary small" id="remoteBrowseCreateDirBtn" type="button">创建</button>
-        <button class="ghost small" id="remoteBrowseCancelNewDirBtn" type="button">取消</button>
-      </div>
-      <div class="modal-actions remote-browse-actions">
-        <button class="secondary" id="remoteBrowseUpBtn" type="button">上级目录</button>
-        <button class="secondary" id="remoteBrowseNewDirBtn" type="button">新建目录</button>
-        <button class="secondary" id="remoteBrowseSelectDirBtn" type="button">选择此目录</button>
-        <button class="primary" id="remoteBrowseCloseBtn" type="button">关闭</button>
-      </div>
-    </div>
-  </div>
-`;
+app.innerHTML = appTemplate(APP_NAME);
 
 const profileSelect = document.querySelector<HTMLSelectElement>("#profileSelect")!;
 const profileNameInput = document.querySelector<HTMLInputElement>("#profileName")!;
-const connectionToggle = document.querySelector<HTMLButtonElement>("#connectionToggle")!;
-const connectionBody = document.querySelector<HTMLDivElement>("#connectionBody")!;
 const connectionSummary = document.querySelector<HTMLSpanElement>("#connectionSummary")!;
 const connectionStatus = document.querySelector<HTMLDivElement>("#connectionStatus")!;
 const authHint = document.querySelector<HTMLParagraphElement>("#authHint")!;
-const connectionCard = document.querySelector<HTMLDivElement>("#connectionCard")!;
-const fileCard = document.querySelector<HTMLDivElement>("#fileCard")!;
 const saveProfileBtn = document.querySelector<HTMLButtonElement>("#saveProfileBtn")!;
 const deleteProfileBtn = document.querySelector<HTMLButtonElement>("#deleteProfileBtn")!;
 const hostSelect = document.querySelector<HTMLSelectElement>("#hostSelect")!;
@@ -458,9 +229,6 @@ const resolvedPathHint = document.querySelector<HTMLParagraphElement>("#resolved
 const dropZone = document.querySelector<HTMLDivElement>("#dropZone")!;
 const forceOverwriteInput = document.querySelector<HTMLInputElement>("#forceOverwrite")!;
 const modeHint = document.querySelector<HTMLParagraphElement>("#modeHint")!;
-const transferSettingsToggle = document.querySelector<HTMLButtonElement>("#transferSettingsToggle")!;
-const transferSettingsBody = document.querySelector<HTMLDivElement>("#transferSettingsBody")!;
-const transferSettingsSummary = document.querySelector<HTMLSpanElement>("#transferSettingsSummary")!;
 const transferBtn = document.querySelector<HTMLButtonElement>("#transferBtn")!;
 const cancelBtn = document.querySelector<HTMLButtonElement>("#cancelBtn")!;
 const clearCheckpointBtn = document.querySelector<HTMLButtonElement>("#clearCheckpointBtn")!;
@@ -468,14 +236,45 @@ const progressWrap = document.querySelector<HTMLDivElement>("#progressWrap")!;
 const progressBadge = document.querySelector<HTMLSpanElement>("#progressBadge")!;
 const progressDetail = document.querySelector<HTMLDivElement>("#progressDetail")!;
 const progressSpeed = document.querySelector<HTMLDivElement>("#progressSpeed")!;
-const progressStats = document.querySelector<HTMLDivElement>("#progressStats")!;
 const verifySummary = document.querySelector<HTMLDivElement>("#verifySummary")!;
-const transferActivity = document.querySelector<HTMLDivElement>("#transferActivity")!;
-const transferScene = document.querySelector<HTMLDivElement>("#transferScene")!;
-const progressToolbar = document.querySelector<HTMLDivElement>("#progressToolbar")!;
-const progressBar = document.querySelector<HTMLProgressElement>("#progressBar")!;
 const statusText = document.querySelector<HTMLDivElement>("#statusText")!;
-const historyPeek = document.querySelector<HTMLDivElement>("#historyPeek")!;
+const progressPercent = document.querySelector<HTMLDivElement>("#progressPercent")!;
+const runSummary = document.querySelector<HTMLDivElement>("#runSummary")!;
+const mapCaption = document.querySelector<HTMLSpanElement>("#mapCaption")!;
+const composeView = document.querySelector<HTMLDivElement>("#composeView")!;
+const runView = document.querySelector<HTMLDivElement>("#runView")!;
+const resultView = document.querySelector<HTMLDivElement>("#resultView")!;
+const resultCard = document.querySelector<HTMLDivElement>("#resultCard")!;
+const resultIcon = document.querySelector<HTMLDivElement>("#resultIcon")!;
+const resultTitle = document.querySelector<HTMLDivElement>("#resultTitle")!;
+const resultSubtitle = document.querySelector<HTMLDivElement>("#resultSubtitle")!;
+const resultStats = document.querySelector<HTMLDListElement>("#resultStats")!;
+const resultBackBtn = document.querySelector<HTMLButtonElement>("#resultBackBtn")!;
+const editServerBtn = document.querySelector<HTMLButtonElement>("#editServerBtn")!;
+const newServerBtn = document.querySelector<HTMLButtonElement>("#newServerBtn")!;
+const serverList = document.querySelector<HTMLDivElement>("#serverList")!;
+const pendingSection = document.querySelector<HTMLElement>("#pendingSection")!;
+const pendingList = document.querySelector<HTMLDivElement>("#pendingList")!;
+const historyList = document.querySelector<HTMLDivElement>("#historyList")!;
+const navTransferLive = document.querySelector<HTMLSpanElement>("#navTransferLive")!;
+const navServerCount = document.querySelector<HTMLSpanElement>("#navServerCount")!;
+const navHistoryBadge = document.querySelector<HTMLSpanElement>("#navHistoryBadge")!;
+const miniTransfer = document.querySelector<HTMLButtonElement>("#miniTransfer")!;
+const miniTransferLabel = document.querySelector<HTMLSpanElement>("#miniTransferLabel")!;
+const miniTransferPct = document.querySelector<HTMLSpanElement>("#miniTransferPct")!;
+const miniTransferFill = document.querySelector<HTMLDivElement>("#miniTransferFill")!;
+const miniTransferSpeed = document.querySelector<HTMLDivElement>("#miniTransferSpeed")!;
+const appVersion = document.querySelector<HTMLSpanElement>("#appVersion")!;
+const viewLogBtn = document.querySelector<HTMLButtonElement>("#viewLogBtn")!;
+const legendResumed = document.querySelector<HTMLSpanElement>("#legendResumed")!;
+const legendRetry = document.querySelector<HTMLSpanElement>("#legendRetry")!;
+const mapLegend = document.querySelector<HTMLDivElement>("#mapLegend")!;
+const legendDoneLabel = document.querySelector<HTMLSpanElement>("#legendDoneLabel")!;
+const activityLog = new ActivityLogView(
+  document.querySelector<HTMLDivElement>("#logList")!,
+  document.querySelector<HTMLButtonElement>("#logJumpBtn")!,
+  document.querySelector<HTMLSpanElement>("#navLogBadge")!,
+);
 const confirmOverlay = document.querySelector<HTMLDivElement>("#confirmOverlay")!;
 const confirmTitle = document.querySelector<HTMLDivElement>("#confirmTitle")!;
 const confirmBody = document.querySelector<HTMLDivElement>("#confirmBody")!;
@@ -508,20 +307,13 @@ let isChunkVerifying = false;
 let isFullVerifying = false;
 let retryDelayMs = 0;
 let retryScheduledAt = 0;
-type RunnerMood = "fast" | "steady" | "struggle" | "waiting" | "connecting" | "verifying";
-let runnerMood: RunnerMood = "steady";
-let runnerMoodCandidate: RunnerMood = "steady";
-let runnerMoodCandidateSince = 0;
 let transferDirection: TransferDirection = "upload";
 let retryCount = 0;
-let connectionExpanded = false;
-let transferSettingsExpanded = false;
 let historyEntries: UploadHistoryEntry[] = [];
 let savedProfiles: ConnectionProfile[] = [];
 let activeUploadCheckpoint: UploadCheckpoint | null = null;
 let activeDownloadCheckpoint: DownloadCheckpoint | null = null;
 let lastProbe: RemoteUploadProbe | RemoteDownloadProbe | null = null;
-let lastProgressBarBytes = 0;
 let lastProgressEventAt = 0;
 let speedSamples: { t: number; bytes: number }[] = [];
 let speedDisplayTimer: number | null = null;
@@ -530,21 +322,29 @@ const UPLOAD_CHUNK_BYTES = 1024 * 1024;
 const SPEED_SAMPLE_WINDOW_MS = 3000;
 const SPEED_REFRESH_MS = 1000;
 const SPEED_STALE_MS = 8_000;
-/** 动画角色：≥512 KB/s 视为「快」 */
-const RUNNER_MOOD_FAST_BPS = 512 * 1024;
-/** 动画角色：<256 KB/s 视为「慢」 */
-const RUNNER_MOOD_SLOW_BPS = 256 * 1024;
-/** 切到「快/正常」前需稳定一段时间，避免网速抖动频繁变脸 */
-const RUNNER_MOOD_HOLD_MS = 3000;
 const UI_STALL_WARN_MS = 10_000;
 const CONFIRM_ANIM_MS = 200;
 /** 路径预检仅在失焦或程序化改路径时触发，避免每次按键都连 SSH */
 const PROBE_DEBOUNCE_MS = 400;
-const WINDOW_MIN_HEIGHT = 460;
-const WINDOW_MAX_HEIGHT = 820;
-const WINDOW_HEIGHT_PAD = 12;
 
-let fitWindowTimer: number | null = null;
+type PageId = "transfer" | "servers" | "history" | "logs" | "settings";
+type TransferView = "compose" | "run" | "result";
+const PAGE_ORDER: readonly PageId[] = ["transfer", "servers", "history", "logs", "settings"];
+let currentPage: PageId = "transfer";
+let currentView: TransferView = "compose";
+
+/** 当前这次传输的总字节与起止信息：结果页的耗时、平均速度、本次实传量都从这里算。 */
+let progressTotalBytes = 0;
+let progressTransferredBytes = 0;
+let runStartedAt = 0;
+let runStartBytes: number | null = null;
+/** 传输开始时锁定方向：取消、结果展示都以它为准，不受之后界面状态影响。 */
+let runDirection: TransferDirection = "upload";
+
+const blockMap = new BlockMap(
+  document.querySelector<HTMLCanvasElement>("#blockMap")!,
+  UPLOAD_CHUNK_BYTES,
+);
 
 const TRANSFER_LOCK_SELECTORS = [
   "#profileSelect",
@@ -568,57 +368,12 @@ const TRANSFER_LOCK_SELECTORS = [
   "#forceOverwrite",
   'input[name="transferDirection"]',
   'input[name="transferMode"]',
-  "#connectionToggle",
-  "#transferSettingsToggle",
+  "#newServerBtn",
+  ".server-item",
 ] as const;
 
 let probeDebounceTimer: number | null = null;
 let backgroundProbeGeneration = 0;
-
-function scheduleFitWindow() {
-  // 传输中布局已固定，避免 ResizeObserver / 进度刷新触发反复 setSize 卡顿
-  if (isTransferring) return;
-  if (fitWindowTimer !== null) {
-    window.clearTimeout(fitWindowTimer);
-  }
-  fitWindowTimer = window.setTimeout(() => {
-    fitWindowTimer = null;
-    void fitWindowToContent();
-  }, 80);
-}
-
-async function fitWindowToContent() {
-  try {
-    const win = getCurrentWindow();
-    const current = await win.innerSize();
-    const mainScroll = document.querySelector(".main-scroll");
-    const app = document.querySelector("#app");
-    if (!mainScroll || !app) return;
-
-    const appStyles = getComputedStyle(app);
-    const verticalPad =
-      parseFloat(appStyles.paddingTop) + parseFloat(appStyles.paddingBottom);
-    // 用内容区真实高度，避免窗口拉高后 scrollHeight 被视口撑满无法缩回
-    const contentHeight = Math.ceil(mainScroll.scrollHeight + verticalPad);
-
-    const target = Math.min(
-      Math.max(contentHeight + WINDOW_HEIGHT_PAD, WINDOW_MIN_HEIGHT),
-      WINDOW_MAX_HEIGHT,
-    );
-    if (Math.abs(current.height - target) > 6) {
-      await win.setSize(new LogicalSize(current.width, target));
-    }
-  } catch {
-    // 浏览器预览模式下忽略
-  }
-}
-
-function setupWindowAutoFit() {
-  const root = document.querySelector(".main-scroll");
-  if (!root) return;
-  const observer = new ResizeObserver(() => scheduleFitWindow());
-  observer.observe(root);
-}
 
 function isDownloadMode(): boolean {
   return transferDirection === "download";
@@ -634,17 +389,17 @@ function getTransferredBytes(cp: UploadCheckpoint | DownloadCheckpoint): number 
 }
 
 function setTransferFormLocked(locked: boolean) {
+  // 必须用 querySelectorAll：单选组有多个同名 input，只锁第一个会让用户在传输中
+  // 切换上传/下载方向，之后「取消」会发给错误方向的任务。
   for (const selector of TRANSFER_LOCK_SELECTORS) {
-    const el = document.querySelector<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>(
-      selector,
-    );
-    if (el) el.disabled = locked;
+    document
+      .querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>(selector)
+      .forEach((el) => {
+        el.disabled = locked;
+      });
   }
   localPathInput.readOnly = locked;
   remotePathInput.readOnly = locked;
-  connectionCard.classList.toggle("transfer-locked", locked);
-  fileCard.classList.toggle("transfer-active", locked);
-  transferBtn.classList.toggle("hidden", locked);
 }
 
 function setTransferring(running: boolean) {
@@ -652,21 +407,19 @@ function setTransferring(running: boolean) {
   transferBtn.disabled = running;
   testConnBtn.disabled = running;
   setTransferFormLocked(running);
-  cancelBtn.classList.toggle("hidden", !running);
-  cancelBtn.textContent = "取消";
+  syncDirectionLock();
+  cancelBtn.textContent = "取消传输";
   cancelBtn.classList.remove("is-cancelling");
-  progressToolbar.classList.toggle("is-active", running);
-  progressWrap.classList.toggle("is-transferring", running);
-  transferActivity.classList.toggle("hidden", !running);
-  transferActivity.setAttribute("aria-hidden", running ? "false" : "true");
   if (running) {
     isConnecting = true;
+    runDirection = transferDirection;
     clearProbeDebounce();
     backgroundProbeGeneration++;
     lastProbe = null;
     hideVerifySummary();
-    historyPeek.classList.add("hidden");
-    statusText.classList.add("hidden");
+    statusText.textContent = "";
+    beginRunVisuals();
+    showTransferView("run");
     startProgressWatchdog();
   } else {
     cancelInFlight = false;
@@ -681,11 +434,84 @@ function setTransferring(running: boolean) {
     progressDetail.classList.add("hidden");
     hideProgressSpeed();
     statusText.classList.remove("hidden");
-    updateHistoryPeek();
   }
   updateTransferStatePanel();
-  scheduleFitWindow();
-  updateTransferActivityMood();
+  refreshLiveVisuals();
+}
+
+/** 传输页三种视图互斥：编辑 → 进行中 → 结果；页脚按钮随视图切换，主操作位置保持不变。 */
+function showTransferView(view: TransferView) {
+  currentView = view;
+  composeView.classList.toggle("hidden", view !== "compose");
+  runView.classList.toggle("hidden", view !== "run");
+  resultView.classList.toggle("hidden", view !== "result");
+  transferBtn.classList.toggle("hidden", view === "run");
+  cancelBtn.classList.toggle("hidden", view !== "run");
+  resultBackBtn.classList.toggle("hidden", view !== "result");
+  // 传输中和出结果后，用户最想知道「刚才到底发生了什么」，此时才露出日志入口。
+  viewLogBtn.classList.toggle("hidden", view === "compose");
+  syncDirectionLock();
+  updateTransferButtonLabel();
+}
+
+/** 方向只能在编辑视图里改：进行中/结果视图展示的是某个方向的具体任务，切换会让界面与任务对不上。 */
+function syncDirectionLock() {
+  document
+    .querySelectorAll<HTMLInputElement>('input[name="transferDirection"]')
+    .forEach((el) => {
+      el.disabled = currentView !== "compose";
+    });
+}
+
+function updateTransferButtonLabel() {
+  const verb = isDownloadMode() ? "下载" : "上传";
+  // 成功后唯一的下一步是「再传一个」，把它升级为主按钮；其他情况它只是次要的「返回修改」。
+  const successResult = currentView === "result" && resultCard.classList.contains("ok");
+  resultBackBtn.classList.toggle("btn-primary", successResult);
+  resultBackBtn.classList.toggle("btn-large", successResult);
+  resultBackBtn.classList.toggle("btn-secondary", !successResult);
+  if (successResult) {
+    transferBtn.classList.add("hidden");
+    resultBackBtn.textContent = `再${verb}一个`;
+    return;
+  }
+  resultBackBtn.textContent = "返回修改";
+  if (currentView === "result") {
+    transferBtn.innerHTML = resultCard.classList.contains("paused") ? "继续传输" : "重试";
+  } else {
+    transferBtn.innerHTML = `开始${verb} <kbd>⌘↩</kbd>`;
+  }
+}
+
+function fileNameOf(path: string): string {
+  return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+}
+
+/** 进入进行中视图前重置分块地图，并写好「谁 → 哪里」的摘要行。 */
+function beginRunVisuals() {
+  progressTotalBytes = 0;
+  progressTransferredBytes = 0;
+  runStartedAt = Date.now();
+  runStartBytes = null;
+  blockMap.reset();
+  blockMap.setVerifiedPerBlock(isReliableMode());
+  syncMapLegend();
+  mapCaption.textContent = "";
+  progressPercent.textContent = "0%";
+
+  const download = runDirection === "download";
+  const local = localPathInput.value.trim();
+  const remote = remotePathInput.value.trim();
+  const host = hostInput.value.trim();
+  const name = document.createElement("strong");
+  name.textContent = download ? fileNameOf(remote) : fileNameOf(local);
+  const target = document.createElement("span");
+  target.className = "run-target";
+  target.textContent = download ? local : `${host}:${remote}`;
+  target.title = target.textContent;
+  const arrow = document.createElement("span");
+  arrow.innerHTML = icons.arrowRight;
+  runSummary.replaceChildren(name, arrow, target);
 }
 
 function updateTransferDirectionUI() {
@@ -699,24 +525,21 @@ function updateTransferDirectionUI() {
     ? "/home/user/file.jar"
     : "/home/user/dir/ 或 /home/user/file.jar";
   pathHint.textContent = download
-    ? "保存路径填目录时会自动拼接远端文件名"
-    : "填目录时以 / 结尾；若远端已是同名目录，也会自动拼接文件名";
+    ? "保存路径填目录时自动拼接远端文件名"
+    : "以 / 结尾表示目录，会自动拼接文件名";
   dropHint.textContent = download
-    ? "下载模式下请用「选择」按钮指定保存目录"
-    : "支持将文件拖拽到此处";
+    ? "点「选择…」指定保存目录"
+    : "也可以直接把文件拖到窗口里";
   dropZone.classList.toggle("download-mode", download);
-  forceOverwriteLabel.textContent = download
-    ? "强制从头覆盖（忽略断点与本地已有文件）"
-    : "强制从头覆盖（忽略断点与远端已有数据）";
-  transferBtn.textContent = download ? "开始下载" : "开始上传";
-  browseRemoteBtn.textContent = download ? "浏览文件" : "浏览目录";
+  forceOverwriteLabel.textContent = "强制从头覆盖";
+  forceOverwriteInput.parentElement!.title = download
+    ? "忽略断点与本地已有文件，从头重新下载"
+    : "忽略断点与远端已有数据，从头重新上传";
+  updateTransferButtonLabel();
+  browseRemoteBtn.textContent = "浏览…";
   updateRemoteBrowseModeUi();
   updateResolvedPathHint();
   updateTransferStatePanel();
-}
-
-function setUploading(running: boolean) {
-  setTransferring(running);
 }
 
 function isReliableMode(): boolean {
@@ -727,26 +550,9 @@ function isReliableMode(): boolean {
 }
 
 function updateModeHint() {
-  if (isReliableMode()) {
-    modeHint.textContent = "弱网下自动逐块校验，速度略慢但更可靠";
-  } else {
-    modeHint.textContent = "仅传完后做完整性校验，速度更快";
-  }
-  updateTransferSettingsSummary();
-}
-
-function updateTransferSettingsSummary() {
-  let text = isReliableMode() ? "弱网可靠" : "快速传输";
-  if (forceOverwriteInput.checked) {
-    text += " · 强制覆盖";
-  }
-  transferSettingsSummary.textContent = text;
-}
-
-function setTransferSettingsExpanded(expanded: boolean) {
-  transferSettingsExpanded = expanded;
-  transferSettingsBody.classList.toggle("collapsed", !expanded);
-  transferSettingsToggle.classList.toggle("expanded", expanded);
+  modeHint.textContent = isReliableMode()
+    ? "每块写完读回比对，略慢但最稳"
+    : "只在传完后整体校验，速度更快";
 }
 
 interface ConnectionReadiness {
@@ -778,16 +584,16 @@ function getConnectionReadiness(): ConnectionReadiness {
   const missingPassword = needsPassword && !passwordInput.value;
   const missingKey = !needsPassword && !keyPathInput.value.trim();
 
-  if (missingPassword) issues.push("缺密码");
+  // 已保存的服务器密码在钥匙串里、连接时才读取，此时输入框为空不代表缺密码。
+  if (missingPassword && !profileSelected) issues.push("缺密码");
   if (missingKey) issues.push("缺私钥");
   if (!profileSelected && (missingPassword || missingKey)) {
     issues.unshift("未选连接");
   }
 
   if (issues.length === 0) {
-    const summary = profileLabel
-      ? `${profileLabel.split(" (")[0]} · ${endpoint}`
-      : endpoint;
+    // 选择器本身已显示服务器名称，摘要只补充地址；未保存的连接才需要在摘要里说明。
+    const summary = profileLabel ? endpoint : `${endpoint} · 未保存`;
     return { ready: true, summary };
   }
 
@@ -802,7 +608,7 @@ function updateConnectionSummary() {
   const state = getConnectionReadiness();
   let summaryText: string;
   if (state.summary === "未配置连接") {
-    summaryText = "未配置连接 · 点击展开";
+    summaryText = "还没有配置服务器，点「编辑」添加";
   } else if (state.detail) {
     summaryText = `${state.summary} · ${state.detail}`;
   } else {
@@ -812,22 +618,19 @@ function updateConnectionSummary() {
   connectionSummary.title = summaryText;
   connectionSummary.classList.toggle("ok", state.ready);
   connectionSummary.classList.toggle("warn", !state.ready);
-  connectionToggle.classList.toggle("connection-incomplete", !state.ready);
   updateAuthHintVisibility();
+  highlightSelectedServer();
 }
 
 function updateAuthHintVisibility() {
-  const profileSelected = profileSelect.value !== "";
-  const passwordReady =
-    authTypeSelect.value !== "password" || Boolean(passwordInput.value);
-  authHint.classList.toggle("hidden", profileSelected && passwordReady);
+  // 钥匙串说明只在需要填密码/口令时有意义；私钥免口令时不打扰用户。
+  const needsSecret = authTypeSelect.value === "password" || Boolean(keyPassphraseInput.value);
+  authHint.classList.toggle("hidden", !needsSecret);
 }
 
 function validateConnectionBeforeTransfer(): void {
   const state = getConnectionReadiness();
   if (state.ready) return;
-
-  setConnectionExpanded(true);
 
   const host = hostInput.value.trim();
   const user = usernameInput.value.trim();
@@ -835,33 +638,27 @@ function validateConnectionBeforeTransfer(): void {
 
   if (!host || !user) {
     throw new Error(
-      "连接信息不完整。请展开连接设置，从「快速连接」选择已保存连接，或填写主机与用户名",
+      "还没有选择服务器。请在上方选择已保存的服务器，或到「服务器」页添加",
     );
   }
 
   if (authTypeSelect.value === "password" && !passwordInput.value) {
     throw new Error(
       profileSelected
-        ? "所选连接未保存密码。请展开连接设置填写密码后点「保存」，或直接输入密码再传输"
-        : "未选择已保存连接，且密码为空。请在「快速连接」中选择连接，或展开连接设置填写密码",
+        ? "所选服务器没有保存密码。请到「服务器」页填写密码并保存"
+        : "密码为空。请到「服务器」页填写密码",
     );
   }
 
   if (authTypeSelect.value === "key" && !keyPathInput.value.trim()) {
-    throw new Error("请展开连接设置，选择私钥文件");
+    throw new Error("请到「服务器」页选择私钥文件");
   }
 
   throw new Error(
     state.detail
-      ? `连接未就绪（${state.detail}）。请展开连接设置检查`
-      : "连接未就绪，请展开连接设置检查",
+      ? `连接未就绪（${state.detail}）。请到「服务器」页检查`
+      : "连接未就绪，请到「服务器」页检查",
   );
-}
-
-function setConnectionExpanded(expanded: boolean) {
-  connectionExpanded = expanded;
-  connectionBody.classList.toggle("collapsed", !expanded);
-  connectionToggle.classList.toggle("expanded", expanded);
 }
 
 function analyzeCheckpointState(
@@ -993,10 +790,10 @@ function renderTransferStatePanel(view: TransferStateView) {
 function hideTransferStatePanel() {
   transferStatePanel.classList.add("hidden");
   clearCheckpointBtn.classList.add("hidden");
-  scheduleFitWindow();
 }
 
 function updateTransferStatePanel() {
+  renderPendingTransfers();
   if (isTransferring) {
     hideTransferStatePanel();
     return;
@@ -1005,13 +802,11 @@ function updateTransferStatePanel() {
   const cp = getActiveCheckpoint();
   if (cp && cp.status !== "completed") {
     renderTransferStatePanel(analyzeCheckpointState(cp, isDownloadMode()));
-    scheduleFitWindow();
     return;
   }
 
   if (lastProbe) {
     renderTransferStatePanel(analyzeProbeState(lastProbe, isDownloadMode()));
-    scheduleFitWindow();
     return;
   }
 
@@ -1170,7 +965,8 @@ function renderRemoteBrowseListing(listing: RemoteDirListing) {
 
     const icon = document.createElement("span");
     icon.className = "remote-browse-icon";
-    icon.textContent = entry.is_dir ? "📁" : "📄";
+    // 图标是本地静态 SVG 常量，不含远端数据，可安全用 innerHTML。
+    icon.innerHTML = entry.is_dir ? icons.folder : icons.file;
 
     const name = document.createElement("span");
     name.className = "remote-browse-name";
@@ -1233,7 +1029,7 @@ async function createRemoteBrowseDir() {
   setRemoteBrowseStatus("正在创建…");
 
   try {
-    validateConnectionBeforeTransfer();
+    await prepareConnection();
     const listing = await invoke<RemoteDirListing>("create_remote_dir", {
       request: {
         ...connectionPayload(),
@@ -1245,7 +1041,7 @@ async function createRemoteBrowseDir() {
     renderRemoteBrowseListing(listing);
     setRemoteBrowseStatus(`已创建「${dirName}」`);
   } catch (error) {
-    setRemoteBrowseStatus(String(error), "error");
+    setRemoteBrowseStatus(describeError(error), "error");
   } finally {
     remoteBrowseCreateDirBtn.disabled = false;
   }
@@ -1260,7 +1056,7 @@ async function loadRemoteBrowseDir(path?: string) {
   setRemoteBrowseStatus("正在加载…");
 
   try {
-    validateConnectionBeforeTransfer();
+    await prepareConnection();
     const listing = await invoke<RemoteDirListing>("list_remote_dir", {
       request: {
         ...connectionPayload(),
@@ -1270,7 +1066,7 @@ async function loadRemoteBrowseDir(path?: string) {
     renderRemoteBrowseListing(listing);
     setRemoteBrowseStatus(`${listing.entries.length} 项`);
   } catch (error) {
-    setRemoteBrowseStatus(String(error), "error");
+    setRemoteBrowseStatus(describeError(error), "error");
   } finally {
     remoteBrowseLoading = false;
     browseRemoteBtn.disabled = isTransferring;
@@ -1298,10 +1094,10 @@ async function openRemoteBrowseDialog() {
   if (isTransferring) return;
 
   try {
+    await ensureCredentialsLoaded();
     validateConnectionBeforeTransfer();
   } catch (error) {
-    setStatus(String(error), "error");
-    setConnectionExpanded(true);
+    setStatus(describeError(error), "error");
     return;
   }
 
@@ -1386,7 +1182,7 @@ async function invokeStartDownload(forceOverwrite: boolean) {
       request: downloadPayload(forceOverwrite),
     });
   } catch (error) {
-    const message = String(error);
+    const message = describeError(error);
     if (!isTransferring && message.includes("已有下载任务在进行中")) {
       await invoke("reset_download_state");
       await invoke("start_download", {
@@ -1399,6 +1195,7 @@ async function invokeStartDownload(forceOverwrite: boolean) {
 }
 
 async function startDownloadFlow() {
+  await prepareConnection();
   const probe = await probeRemoteDownload();
   const confirmed = await confirmDownloadAction(probe);
   if (!confirmed) return;
@@ -1470,7 +1267,7 @@ async function invokeStartUpload(forceOverwrite: boolean) {
       request: uploadPayload(forceOverwrite),
     });
   } catch (error) {
-    const message = String(error);
+    const message = describeError(error);
     if (!isTransferring && message.includes("已有上传任务在进行中")) {
       await invoke("reset_upload_state");
       await invoke("start_upload", {
@@ -1483,6 +1280,7 @@ async function invokeStartUpload(forceOverwrite: boolean) {
 }
 
 async function startUploadFlow() {
+  await prepareConnection();
   const probe = await probeRemoteUpload();
   const confirmed = await confirmUploadAction(probe);
   if (!confirmed) return;
@@ -1490,7 +1288,7 @@ async function startUploadFlow() {
   const forceOverwrite =
     probe.action === "full_reupload" || forceOverwriteInput.checked;
 
-  setUploading(true);
+  setTransferring(true);
   retryCount = 0;
   resetSpeedTracker();
   isConnecting = true;
@@ -1526,6 +1324,39 @@ function formatTime(ts: number): string {
   });
 }
 
+/** 本次运行中已确认可信的 host:port，避免每次浏览目录/预检都多一次握手（弱网下很贵）。 */
+const trustedHostsThisSession = new Set<string>();
+
+/**
+ * 任何会发送凭据的连接前调用：未知主机先展示指纹让用户确认，再写入应用 known_hosts。
+ * 后端 connect_session 仍会强制校验，这里只是把「拒绝连接」变成可操作的确认流程。
+ */
+async function ensureHostTrusted(): Promise<void> {
+  const { host, port } = connectionPayload();
+  const hostId = `${host}:${port}`;
+  if (trustedHostsThisSession.has(hostId)) return;
+
+  const info = await invoke<HostKeyInfo>("check_host_key", { request: { host, port } });
+  if (info.status === "changed") {
+    throw new Error(
+      `服务器 ${hostId} 的指纹与已记录的不一致（当前 ${info.fingerprint}），可能遭遇中间人攻击，已拒绝连接。\n` +
+        "如确认服务器重装过系统，请从 ~/.ssh/known_hosts 或 ~/Library/Application Support/sshutil/known_hosts 中删除旧记录后重试。",
+    );
+  }
+  if (info.status === "unknown") {
+    const trusted = await showConfirm(
+      "首次连接该服务器",
+      `${hostId}\n${info.key_type}\n${info.fingerprint}\n\n` +
+        "请与服务器管理员核对上面的指纹（服务器上可运行 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub）。确认信任后将记住该服务器。",
+    );
+    if (!trusted) throw new Error("未信任该服务器，已取消连接");
+    await invoke("trust_host_key", {
+      request: { host, port, fingerprint: info.fingerprint },
+    });
+  }
+  trustedHostsThisSession.add(hostId);
+}
+
 function connectionPayload() {
   return {
     host: hostInput.value.trim(),
@@ -1547,19 +1378,24 @@ function setBadge(
   if (kind !== "idle") progressBadge.classList.add(kind);
 }
 
+/** 只取错误信息本身：直接 String(new Error(x)) 会在界面上带出英文 "Error: " 前缀。 */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function clarifyTransferError(message: string): string {
   if (message.includes("远端路径错误") || message.includes("远端路径「")) {
     return message;
   }
   if (message.includes("请填写密码")) {
-    return "未填写密码。请展开连接设置，从「快速连接」选择已保存连接，或手动填写密码";
+    return "未填写密码。请到「服务器」页填写密码";
   }
   if (
     /认证失败|服务器拒绝了提供的凭据/i.test(message) &&
     authTypeSelect.value === "password" &&
     !passwordInput.value
   ) {
-    return "未填写密码。请展开连接设置，从「快速连接」选择已保存连接，或手动填写密码";
+    return "未填写密码。请到「服务器」页填写密码";
   }
   if (/认证失败|服务器拒绝了提供的凭据/i.test(message)) {
     return `SSH 认证失败，密码或私钥可能不正确。\n${message}`;
@@ -1611,47 +1447,10 @@ function applyActiveTransferBadge(direction: TransferDirection) {
   setBadge(badgeActive, "uploading");
 }
 
-/** 数据流动画流速随网速与传输阶段变化 */
-function updateTransferActivityMood() {
-  if (!isTransferring) {
-    runnerMood = "steady";
-    runnerMoodCandidate = "steady";
-    applyRunnerMood("steady");
-    return;
-  }
-
-  const target = resolveRunnerMood();
-  const now = Date.now();
-
-  if (target === "waiting" || target === "struggle" || target === "connecting" || target === "verifying") {
-    runnerMood = target;
-    runnerMoodCandidate = target;
-    runnerMoodCandidateSince = now;
-    applyRunnerMood(target);
-    return;
-  }
-
-  if (target !== runnerMoodCandidate) {
-    runnerMoodCandidate = target;
-    runnerMoodCandidateSince = now;
-  }
-
-  if (target !== runnerMood && now - runnerMoodCandidateSince >= RUNNER_MOOD_HOLD_MS) {
-    runnerMood = target;
-    applyRunnerMood(target);
-  }
-}
-
-function resolveRunnerMood(): RunnerMood {
-  if (isConnecting) {
-    return "connecting";
-  }
-  if (isFullVerifying) {
-    return "verifying";
-  }
-  if (isChunkVerifying) {
-    return "steady";
-  }
+/** 当前传输所处阶段，驱动分块地图的动效与侧边栏迷你进度的配色。 */
+function resolveMapPhase(): BlockMapPhase {
+  if (isConnecting) return "connecting";
+  if (isFullVerifying) return "verifying";
   if (
     isReconnecting ||
     progressWrap.classList.contains("stalled") ||
@@ -1659,20 +1458,31 @@ function resolveRunnerMood(): RunnerMood {
   ) {
     return "waiting";
   }
-
-  const speed = estimateTransferSpeedBps();
-  if (speed === null) return "steady";
-  if (speed >= RUNNER_MOOD_FAST_BPS) return "fast";
-  if (speed < RUNNER_MOOD_SLOW_BPS) return "struggle";
-  return "steady";
+  return "transferring";
 }
 
-function applyRunnerMood(mood: RunnerMood) {
-  transferScene.classList.remove("mood-fast", "mood-steady", "mood-struggle", "mood-waiting");
-  // connecting/verifying 无独立粒子样式，复用 steady 表现
-  const visual =
-    mood === "connecting" || mood === "verifying" ? "steady" : mood;
-  transferScene.classList.add(`mood-${visual}`);
+/**
+ * 同步所有「活的」指示：分块地图阶段、侧边栏迷你进度、导航上的进行中圆点。
+ * 侧边栏迷你进度让用户切到其他页面时仍能看到传输状态，不必守在传输页。
+ */
+function refreshLiveVisuals() {
+  const phase = isTransferring ? resolveMapPhase() : null;
+  if (phase) blockMap.setPhase(phase);
+
+  const waiting = phase === "waiting" || phase === "connecting";
+  navTransferLive.classList.toggle("hidden", !isTransferring);
+  navTransferLive.classList.toggle("is-waiting", waiting);
+  miniTransfer.classList.toggle("hidden", !isTransferring || currentPage === "transfer");
+  miniTransfer.classList.toggle("is-waiting", waiting);
+  if (!isTransferring) return;
+
+  const verb = runDirection === "download" ? "下载" : "上传";
+  miniTransferLabel.textContent =
+    phase === "connecting" ? "连接中" : phase === "verifying" ? "校验中" : waiting ? "重连中" : `${verb}中`;
+  const pct = progressTotalBytes > 0 ? (progressTransferredBytes / progressTotalBytes) * 100 : 0;
+  miniTransferPct.textContent = `${Math.floor(pct)}%`;
+  miniTransferFill.style.width = `${pct}%`;
+  miniTransferSpeed.textContent = progressSpeed.textContent ?? "";
 }
 
 function estimateTransferSpeedBps(): number | null {
@@ -1694,39 +1504,35 @@ function hideVerifySummary() {
 function showVerifySummary(text: string) {
   verifySummary.textContent = text;
   verifySummary.classList.remove("hidden");
-  scheduleFitWindow();
 }
 
 function applyThemePreference(mode: ThemePreference) {
-  const root = document.documentElement;
-  if (mode === "system") {
-    root.removeAttribute("data-theme");
-  } else {
-    root.dataset.theme = mode;
-  }
+  document.documentElement.dataset.theme = resolveTheme(mode);
   localStorage.setItem(THEME_STORAGE_KEY, mode);
 }
 
 function initThemePreference() {
-  const saved = (localStorage.getItem(THEME_STORAGE_KEY) as ThemePreference | null) ?? "system";
+  const saved = readThemePreference();
   const radio = document.querySelector<HTMLInputElement>(
     `input[name="themeMode"][value="${saved}"]`,
   );
   if (radio) radio.checked = true;
   applyThemePreference(saved);
+  // 跟随系统时，系统切换明暗需要实时生效。
+  systemDarkQuery.addEventListener("change", () => {
+    if (readThemePreference() === "system") applyThemePreference("system");
+  });
 }
 
 function formatProgressDetail(transferred: number, total: number, retries: number): string {
-  const pct = formatProgressPercent(transferred, total);
+  // 百分比已经用大号数字单独展示，这里只给字节数与重连次数。
   const size = `${formatBytes(transferred)} / ${formatBytes(total)}`;
-  const base = pct ? `${pct} · ${size}` : size;
-  return retries > 0 ? `${base} · 重试 ${retries} 次` : base;
+  return retries > 0 ? `${size} · 已自动重连 ${retries} 次` : size;
 }
 
 function syncProgressStatsRow() {
-  const showDetail = !progressDetail.classList.contains("hidden") && progressDetail.textContent;
-  const showSpeed = !progressSpeed.classList.contains("hidden") && progressSpeed.textContent;
-  progressStats.classList.toggle("hidden", !showDetail && !showSpeed);
+  // 进行中视图的统计行固定显示（避免布局跳动），这里只同步侧边栏迷你进度的速度文字。
+  miniTransferSpeed.textContent = progressSpeed.textContent ?? "";
 }
 
 function showProgressSpeed(text: string, stale = false) {
@@ -1776,7 +1582,7 @@ function hideProgressSpeed() {
 }
 
 function updateProgressDetail(transferred: number, total: number, retries = retryCount) {
-  if (transferred > 0 && total > 0 && isTransferring) {
+  if (total > 0 && isTransferring) {
     progressDetail.textContent = formatProgressDetail(transferred, total, retries);
     progressDetail.classList.remove("hidden");
   } else if (!isTransferring) {
@@ -1788,14 +1594,12 @@ function updateProgressDetail(transferred: number, total: number, retries = retr
 function showTransferStatus(message: string, kind: "normal" | "error" | "retry" = "normal") {
   statusText.classList.remove("hidden");
   setStatus(message, kind);
-  scheduleFitWindow();
 }
 
 function hideTransferStatus() {
   if (isTransferring) {
     statusText.classList.add("hidden");
     statusText.textContent = "";
-    scheduleFitWindow();
   }
 }
 
@@ -1835,12 +1639,7 @@ async function runBackgroundProbe() {
   }
 }
 
-function restoreCredentialsFromProfile(
-  host: string,
-  port: number,
-  username: string,
-  authKind: "password" | "private_key",
-) {
+function restoreCredentialsFromProfile(host: string, port: number, username: string) {
   const profile = savedProfiles.find(
     (p) => p.host === host && p.port === port && p.username === username,
   );
@@ -1849,14 +1648,10 @@ function restoreCredentialsFromProfile(
   profileSelect.value = profile.id;
   profileNameInput.value = profile.name;
 
-  if (authKind === "password" && profile.password && !passwordInput.value) {
-    passwordInput.value = profile.password;
-  }
-  if (authKind === "private_key" && profile.key_passphrase && !keyPassphraseInput.value) {
-    keyPassphraseInput.value = profile.key_passphrase;
-  }
+  // 这里由启动时自动恢复断点触发，不主动读钥匙串（会弹授权框）；
+  // 真正连接前由 ensureCredentialsLoaded 按需补齐密码。
 
-  setConnectionStatus(`已匹配已保存连接「${profile.name}」`, "ok");
+  setConnectionStatus(`已匹配服务器「${profile.name}」`, "ok");
   updateConnectionSummary();
 }
 
@@ -1873,28 +1668,40 @@ function formatProgressPercent(transferred: number, total: number): string {
   return `${pct}%`;
 }
 
+/**
+ * 分块地图需要块内的细粒度进度（部分填充 + 当前块呼吸），所以每个进度事件都刷新；
+ * 实际绘制由 BlockMap 按帧合并，事件再频繁也不会过度重绘。
+ */
 function updateProgress(transferred: number, total: number) {
-  const percent = total > 0 ? Math.round((transferred / total) * 100) : 0;
-  progressBar.value = percent;
-  progressBar.max = 100;
-  progressBar.dataset.totalBytes = String(total);
-  progressWrap.classList.toggle("has-progress", transferred > 0 && percent < 100);
+  // 只在传输进行中驱动地图：空闲时恢复断点也会调用这里，不能把断点进度当成本次起点。
+  if (!isTransferring) return;
+  progressTotalBytes = total;
+  progressTransferredBytes = transferred;
+  if (runStartBytes === null) runStartBytes = transferred;
+  progressPercent.textContent = formatProgressPercent(transferred, total) || "0%";
+  blockMap.update(transferred, total);
+  const perCell = blockMap.blocksPerCell;
+  mapCaption.textContent =
+    perCell > 1
+      ? `${blockMap.blockCount.toLocaleString()} 块 · 每格 ${perCell} MB`
+      : `${blockMap.blockCount.toLocaleString()} 块 · 每块 1 MB`;
+  syncMapLegend();
   updateProgressDetail(transferred, total);
+  refreshLiveVisuals();
 }
 
-function updateProgressBarIfNeeded(uploaded: number, total: number, force = false) {
-  const crossedChunk =
-    Math.floor(uploaded / UPLOAD_CHUNK_BYTES) >
-    Math.floor(lastProgressBarBytes / UPLOAD_CHUNK_BYTES);
-  if (force || crossedChunk || uploaded >= total) {
-    updateProgress(uploaded, total);
-    lastProgressBarBytes = uploaded;
-  }
+/** 图例只列出地图上真实出现的状态：全新上传没有「之前已续传」，没断过线就不提「重连处」。 */
+function syncMapLegend() {
+  const perBlock = blockMap.verifiesPerBlock;
+  mapLegend.classList.toggle("per-block", perBlock);
+  legendDoneLabel.textContent = perBlock ? "本次已传并校验" : "本次已传（待最终校验）";
+  legendResumed.classList.toggle("hidden", !blockMap.hasResumedPart);
+  legendRetry.classList.toggle("hidden", blockMap.retryCount === 0);
 }
+
 
 function resetSpeedTracker() {
   lastProgressEventAt = 0;
-  lastProgressBarBytes = 0;
   speedSamples = [];
   isReconnecting = false;
   isConnecting = false;
@@ -1921,7 +1728,7 @@ function markProgressActivity() {
   isReconnecting = false;
   if (isTransferring && (wasStalled || wasReconnecting)) {
     applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
   }
 }
 
@@ -1953,19 +1760,19 @@ function refreshSpeedDisplay() {
 
   if (speed <= 0) {
     showProgressSpeed("0 B/s");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
   let speedText = `${formatBytes(speed)}/s`;
   const transferred = speedSamples[speedSamples.length - 1]?.bytes ?? 0;
-  const total = Number(progressBar.dataset.totalBytes ?? 0);
+  const total = progressTotalBytes;
   if (total > transferred && speed > 0) {
     const eta = formatEtaSeconds((total - transferred) / speed);
     if (eta) speedText += ` · 约 ${eta}`;
   }
   showProgressSpeed(speedText);
-  updateTransferActivityMood();
+  refreshLiveVisuals();
 }
 
 function refreshStallUi() {
@@ -1974,7 +1781,7 @@ function refreshStallUi() {
   if (isConnecting) {
     applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
     showProgressSpeed("正在建立 SSH 连接…");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
@@ -1987,7 +1794,7 @@ function refreshStallUi() {
 
   if (elapsed >= SPEED_STALE_MS) {
     showWaitingSpeedText(elapsed);
-    updateTransferActivityMood();
+    refreshLiveVisuals();
   }
 
   if (elapsed >= UI_STALL_WARN_MS) {
@@ -2077,20 +1884,195 @@ function updateResolvedPathHint() {
   }
 }
 
-function updateHistoryPeek() {
-  const host = hostInput.value.trim();
-  const recent = historyEntries.find((e) => e.host === host);
-  if (!recent || isTransferring) {
-    historyPeek.classList.add("hidden");
+const HISTORY_STATUS_LABEL: Record<string, string> = {
+  completed: "完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function entryIcon(direction: TransferDirection): HTMLSpanElement {
+  const el = document.createElement("span");
+  el.className = `entry-icon${direction === "download" ? " is-download" : ""}`;
+  el.innerHTML = direction === "download" ? icons.download : icons.upload;
+  return el;
+}
+
+function entryMain(title: string, meta: string): HTMLDivElement {
+  const main = document.createElement("div");
+  main.className = "entry-main";
+  const t = document.createElement("div");
+  t.className = "entry-title";
+  t.textContent = title;
+  t.title = title;
+  const m = document.createElement("div");
+  m.className = "entry-meta";
+  m.textContent = meta;
+  m.title = meta;
+  main.append(t, m);
+  return main;
+}
+
+function makeButton(label: string, className: string, onClick: () => void): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.textContent = label;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+/**
+ * 未完成的传输单独列在历史页顶部：断点以前只藏在传输页的提示条里，
+ * 用户关掉应用再打开时很难发现「还能接着传」。
+ */
+function renderPendingTransfers() {
+  const items: { direction: TransferDirection; cp: UploadCheckpoint | DownloadCheckpoint }[] = [];
+  // 正在传的那个方向不算「未完成」：它的断点就是当前任务本身，列出来只会让人以为有遗留任务。
+  const running = isTransferring ? runDirection : null;
+  if (activeUploadCheckpoint && running !== "upload") {
+    items.push({ direction: "upload", cp: activeUploadCheckpoint });
+  }
+  if (activeDownloadCheckpoint && running !== "download") {
+    items.push({ direction: "download", cp: activeDownloadCheckpoint });
+  }
+
+  navHistoryBadge.textContent = String(items.length);
+  navHistoryBadge.classList.toggle("hidden", items.length === 0);
+  pendingSection.classList.toggle("hidden", items.length === 0);
+
+  pendingList.replaceChildren(
+    ...items.map(({ direction, cp }) => {
+      const row = document.createElement("div");
+      row.className = "pending-item";
+      const transferred = getTransferredBytes(cp);
+      const name = fileNameOf(direction === "download" ? cp.remote_path : cp.local_path);
+      const target = direction === "download" ? cp.local_path : `${cp.host}:${cp.remote_path}`;
+
+      const progress = document.createElement("div");
+      progress.className = "pending-progress";
+      const track = document.createElement("div");
+      track.className = "pending-track";
+      const fill = document.createElement("div");
+      fill.className = "pending-fill";
+      fill.style.width = `${cp.file_size > 0 ? (transferred / cp.file_size) * 100 : 0}%`;
+      track.append(fill);
+      const label = document.createElement("span");
+      label.textContent = `${formatBytes(transferred)} / ${formatBytes(cp.file_size)}`;
+      progress.append(track, label);
+
+      const actions = document.createElement("div");
+      actions.className = "pending-actions";
+      actions.append(
+        makeButton("清除", "btn btn-plain btn-small", () => void clearCheckpointFor(direction)),
+        makeButton("继续", "btn btn-primary btn-small", () => void resumePendingTransfer(direction)),
+      );
+
+      row.append(entryIcon(direction), entryMain(name, target), actions, progress);
+      return row;
+    }),
+  );
+}
+
+function renderHistory() {
+  if (historyEntries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "list-empty";
+    empty.textContent = "还没有传输记录";
+    historyList.replaceChildren(empty);
     return;
   }
-  const dir = recent.direction === "download" ? "下载" : "上传";
-  const status =
-    recent.status === "completed" ? "完成" : recent.status === "cancelled" ? "取消" : "失败";
-  const name = recent.local_path.split("/").pop() ?? recent.local_path;
-  historyPeek.textContent = `本机最近：${dir} ${name} · ${status} · ${formatTime(recent.finished_at)}`;
-  historyPeek.classList.remove("hidden");
-  scheduleFitWindow();
+  historyList.replaceChildren(
+    ...historyEntries.map((entry) => {
+      const direction: TransferDirection = entry.direction === "download" ? "download" : "upload";
+      const row = document.createElement("div");
+      row.className = "history-row";
+      const name = fileNameOf(direction === "download" ? entry.remote_path : entry.local_path);
+      const retries = entry.retry_count > 0 ? ` · 重连 ${entry.retry_count} 次` : "";
+      const meta = `${entry.username}@${entry.host} · ${formatBytes(entry.file_size)} · ${formatTime(entry.finished_at)}${retries}`;
+      const chip = document.createElement("span");
+      chip.className = `status-chip ${entry.status}`;
+      chip.textContent = HISTORY_STATUS_LABEL[entry.status] ?? entry.status;
+      if (entry.message) chip.title = entry.message;
+      row.append(
+        entryIcon(direction),
+        entryMain(name, meta),
+        chip,
+        makeButton("复用", "btn btn-secondary btn-small", () => void reuseHistoryEntry(entry)),
+      );
+      return row;
+    }),
+  );
+}
+
+/** 按 host/port/user 找到已保存的服务器，用于带出凭据；找不到时只回填地址。 */
+function findProfileFor(host: string, port: number, username: string): ConnectionProfile | undefined {
+  return savedProfiles.find((p) => p.host === host && p.port === port && p.username === username);
+}
+
+function setTransferDirection(direction: TransferDirection) {
+  if (transferDirection === direction) return;
+  transferDirection = direction;
+  const radio = document.querySelector<HTMLInputElement>(
+    `input[name="transferDirection"][value="${direction}"]`,
+  );
+  if (radio) radio.checked = true;
+  updateTransferDirectionUI();
+}
+
+async function reuseHistoryEntry(entry: UploadHistoryEntry) {
+  if (isTransferring) return;
+  setTransferDirection(entry.direction === "download" ? "download" : "upload");
+  const profile = findProfileFor(entry.host, entry.port, entry.username);
+  if (profile) {
+    profileSelect.value = profile.id;
+    await applyProfile(profile);
+  } else {
+    hostInput.value = entry.host;
+    portInput.value = String(entry.port);
+    usernameInput.value = entry.username;
+    profileSelect.value = "";
+    updateConnectionSummary();
+  }
+  localPathInput.value = entry.local_path;
+  remotePathInput.value = entry.remote_path;
+  updateDropZoneState();
+  updateResolvedPathHint();
+  clearProbeResult();
+  showTransferView("compose");
+  showPage("transfer");
+  scheduleBackgroundProbe();
+}
+
+async function resumePendingTransfer(direction: TransferDirection) {
+  if (isTransferring) return;
+  setTransferDirection(direction);
+  showTransferView("compose");
+  showPage("transfer");
+  // restore* 会把断点里的路径和服务器回填到表单，用户确认后点开始即可续传。
+  if (direction === "download") await restoreDownloadCheckpoint();
+  else await restoreUploadCheckpoint();
+  transferBtn.focus();
+}
+
+async function clearCheckpointFor(direction: TransferDirection) {
+  const download = direction === "download";
+  const confirmed = await showConfirm(
+    "清除断点",
+    download
+      ? "确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。"
+      : "确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。",
+  );
+  if (!confirmed) return;
+
+  if (download) {
+    await invoke("clear_saved_download_checkpoint");
+    activeDownloadCheckpoint = null;
+  } else {
+    await invoke("clear_saved_checkpoint");
+    activeUploadCheckpoint = null;
+  }
+  updateTransferStatePanel();
+  setStatus("断点记录已清除");
 }
 
 function defaultProfileName(): string {
@@ -2120,29 +2102,66 @@ async function applyProfile(profile: ConnectionProfile) {
     keyPathInput.value = "";
   }
 
-  passwordInput.value = profile.password ?? "";
-  keyPassphraseInput.value = profile.key_passphrase ?? "";
-
+  passwordInput.value = "";
+  keyPassphraseInput.value = "";
   profileNameInput.value = profile.name;
   updateAuthFields();
   updateConnectionSummary();
-  setConnectionExpanded(false);
+
+  // 用户主动选择服务器时才读钥匙串：此时弹出系统授权框是可预期的。
+  const secrets = await loadProfileSecrets(profile.id);
+  if (profileSelect.value !== profile.id) return; // 读取期间用户已切到别的服务器
+  passwordInput.value = secrets.password ?? "";
+  keyPassphraseInput.value = secrets.key_passphrase ?? "";
+  updateConnectionSummary();
+  updateAuthHintVisibility();
 
   if (profile.auth_kind === "password") {
     setConnectionStatus(
-      profile.password
+      secrets.password
         ? `已加载「${profile.name}」，密码已自动填入`
         : `已加载「${profile.name}」，请填写密码后点保存`,
-      profile.password ? "ok" : "normal",
+      secrets.password ? "ok" : "normal",
     );
   } else {
     setConnectionStatus(`已加载「${profile.name}」`, "ok");
   }
 }
 
+async function loadProfileSecrets(id: string): Promise<ProfileSecrets> {
+  try {
+    return await invoke<ProfileSecrets>("get_profile_secrets", { id });
+  } catch {
+    return { password: null, key_passphrase: null };
+  }
+}
+
+/**
+ * 连接前按需补齐所选服务器的密码/口令：启动时恢复断点不读钥匙串，
+ * 拖到用户真正发起连接时才读，避免一打开应用就弹系统授权框。
+ */
+async function ensureCredentialsLoaded() {
+  const id = profileSelect.value;
+  if (!id) return;
+  const needsPassword = authTypeSelect.value === "password" && !passwordInput.value;
+  const needsPassphrase = authTypeSelect.value === "key" && !keyPassphraseInput.value;
+  if (!needsPassword && !needsPassphrase) return;
+  const secrets = await loadProfileSecrets(id);
+  if (needsPassword && secrets.password) passwordInput.value = secrets.password;
+  if (needsPassphrase && secrets.key_passphrase) keyPassphraseInput.value = secrets.key_passphrase;
+  updateConnectionSummary();
+}
+
+/** 所有会发起 SSH 连接的入口统一走这里：补凭据 → 校验表单 → 确认主机指纹。 */
+async function prepareConnection() {
+  await ensureCredentialsLoaded();
+  validateConnectionBeforeTransfer();
+  await ensureHostTrusted();
+}
+
 async function loadHistory() {
   historyEntries = await invoke<UploadHistoryEntry[]>("list_upload_history");
-  updateHistoryPeek();
+  renderHistory();
 }
 
 async function loadProfiles() {
@@ -2150,15 +2169,76 @@ async function loadProfiles() {
   profileSelect.replaceChildren();
   const defaultOption = document.createElement("option");
   defaultOption.value = "";
-  defaultOption.textContent = "选择已保存连接";
+  defaultOption.textContent = "未保存的服务器";
   profileSelect.appendChild(defaultOption);
 
   for (const profile of savedProfiles) {
     const option = document.createElement("option");
     option.value = profile.id;
-    option.textContent = `${profile.name} (${profile.username}@${profile.host})`;
+    option.textContent = profile.name;
     profileSelect.appendChild(option);
   }
+  renderServerList();
+}
+
+/** 服务器页左侧列表；选中项即「当前使用的服务器」，与传输页顶部的选择器保持一致。 */
+function renderServerList() {
+  navServerCount.textContent = String(savedProfiles.length);
+  navServerCount.classList.toggle("hidden", savedProfiles.length === 0);
+  if (savedProfiles.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "list-empty";
+    empty.textContent = "还没有保存的服务器\n在右侧填写后点「保存」";
+    serverList.replaceChildren(empty);
+    return;
+  }
+  serverList.replaceChildren(
+    ...savedProfiles.map((profile) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "server-item";
+      item.dataset.id = profile.id;
+      item.setAttribute("role", "option");
+      const name = document.createElement("span");
+      name.className = "server-item-name";
+      name.textContent = profile.name;
+      const meta = document.createElement("span");
+      meta.className = "server-item-meta";
+      meta.textContent = `${profile.username}@${profile.host}${profile.port === 22 ? "" : `:${profile.port}`}`;
+      item.append(name, meta);
+      item.disabled = isTransferring;
+      item.addEventListener("click", () => {
+        profileSelect.value = profile.id;
+        void applyProfile(profile);
+      });
+      return item;
+    }),
+  );
+  highlightSelectedServer();
+}
+
+function highlightSelectedServer() {
+  serverList.querySelectorAll<HTMLButtonElement>(".server-item").forEach((item) => {
+    const selected = item.dataset.id === profileSelect.value;
+    item.classList.toggle("selected", selected);
+    item.setAttribute("aria-selected", String(selected));
+  });
+}
+
+/** 新建：清空编辑表单并取消选中，避免用户在已有服务器上改着改着覆盖了它。 */
+function startNewServer() {
+  profileSelect.value = "";
+  profileNameInput.value = "";
+  hostSelect.value = "";
+  hostInput.value = "";
+  portInput.value = "22";
+  usernameInput.value = "";
+  passwordInput.value = "";
+  keyPassphraseInput.value = "";
+  setConnectionStatus("");
+  updateAuthFields();
+  updateConnectionSummary();
+  profileNameInput.focus();
 }
 
 async function loadHosts() {
@@ -2186,7 +2266,6 @@ async function applyHostSelection(alias: string) {
   }
   profileNameInput.value = alias;
   updateConnectionSummary();
-  setConnectionExpanded(false);
 }
 
 async function refreshCheckpointFromDisk() {
@@ -2225,55 +2304,15 @@ async function restoreUploadCheckpoint(options?: { keepStatus?: boolean }) {
   authTypeSelect.value = checkpoint.auth_kind === "private_key" ? "key" : "password";
   if (checkpoint.key_path) keyPathInput.value = checkpoint.key_path;
   updateAuthFields();
-  restoreCredentialsFromProfile(
-    checkpoint.host,
-    checkpoint.port,
-    checkpoint.username,
-    checkpoint.auth_kind,
-  );
+  restoreCredentialsFromProfile(checkpoint.host, checkpoint.port, checkpoint.username);
   updateDropZoneState();
   updateResolvedPathHint();
   updateConnectionSummary();
-  setConnectionExpanded(false);
 
-  updateProgress(checkpoint.uploaded_bytes, checkpoint.file_size);
   setProgressState("idle");
 
-  const transferred = getTransferredBytes(checkpoint);
-  const verifyReadFailed = checkpoint.failure_reason === "verify_read_failed";
-  const needsFullReupload =
-    checkpoint.failure_reason === "hash_mismatch" ||
-    (checkpoint.status === "failed" &&
-      transferred >= checkpoint.file_size &&
-      !verifyReadFailed);
-
-  if (!options?.keepStatus) {
-    if (verifyReadFailed) {
-      setBadge("待校验", "retrying");
-      setStatus(
-        "各数据块已校验通过，仅最终校验时网络中断。直接点「开始上传」即可重试，无需从头重传。",
-        "retry",
-      );
-    } else if (needsFullReupload) {
-      setBadge("需重传", "error");
-      progressBar.value = 0;
-      setStatus(
-        "上次校验未通过，远端文件可能已损坏。请勾选强制覆盖或清除断点后重新上传。",
-        "error",
-      );
-    } else if (transferred > 0) {
-      setBadge("可续传", "uploading");
-      setStatus(
-        `已恢复断点：${formatBytes(transferred)} / ${formatBytes(checkpoint.file_size)}`,
-      );
-    } else {
-      setBadge("待重试", "retrying");
-      setStatus(
-        "上次传输未完成且无有效进度，点击「开始上传」将重新传输",
-        "retry",
-      );
-    }
-  }
+  // 断点状态由传输页顶部的状态面板统一呈现，页脚不再重复一遍。
+  if (!options?.keepStatus) statusText.textContent = "";
   updateTransferStatePanel();
 }
 
@@ -2301,53 +2340,14 @@ async function restoreDownloadCheckpoint() {
   authTypeSelect.value = checkpoint.auth_kind === "private_key" ? "key" : "password";
   if (checkpoint.key_path) keyPathInput.value = checkpoint.key_path;
   updateAuthFields();
-  restoreCredentialsFromProfile(
-    checkpoint.host,
-    checkpoint.port,
-    checkpoint.username,
-    checkpoint.auth_kind,
-  );
+  restoreCredentialsFromProfile(checkpoint.host, checkpoint.port, checkpoint.username);
   updateDropZoneState();
   updateResolvedPathHint();
   updateConnectionSummary();
-  setConnectionExpanded(false);
 
-  updateProgress(checkpoint.downloaded_bytes, checkpoint.file_size);
   setProgressState("idle");
 
-  const transferred = getTransferredBytes(checkpoint);
-  const verifyReadFailed = checkpoint.failure_reason === "verify_read_failed";
-  const needsFullRedownload =
-    checkpoint.failure_reason === "hash_mismatch" ||
-    (checkpoint.status === "failed" &&
-      transferred >= checkpoint.file_size &&
-      !verifyReadFailed);
-
-  if (verifyReadFailed) {
-    setBadge("待校验", "retrying");
-    setStatus(
-      "各数据块已校验通过，仅最终校验时网络中断。直接点「开始下载」即可重试，无需从头重下。",
-      "retry",
-    );
-  } else if (needsFullRedownload) {
-    setBadge("需重下", "error");
-    progressBar.value = 0;
-    setStatus(
-      "上次校验未通过，本地文件可能已损坏。请勾选强制覆盖或清除断点后重新下载。",
-      "error",
-    );
-  } else if (transferred > 0) {
-    setBadge("可续传", "uploading");
-    setStatus(
-      `已恢复断点：${formatBytes(transferred)} / ${formatBytes(checkpoint.file_size)}`,
-    );
-  } else {
-    setBadge("待重试", "retrying");
-    setStatus(
-      "上次传输未完成且无有效进度，点击「开始下载」将重新传输",
-      "retry",
-    );
-  }
+  statusText.textContent = "";
   updateTransferStatePanel();
 }
 
@@ -2358,7 +2358,8 @@ async function restoreActiveCheckpoint() {
 
 function setupDragDrop() {
   void getCurrentWebview().onDragDropEvent((event) => {
-    if (isDownloadMode()) return;
+    // 拖入文件是整个窗口范围的：在别的页面拖进来也直接带到传输页，但传输中不打断。
+    if (isDownloadMode() || isTransferring) return;
     if (event.payload.type === "over") {
       dropZone.classList.add("drag-over");
     } else if (event.payload.type === "leave") {
@@ -2367,6 +2368,8 @@ function setupDragDrop() {
       dropZone.classList.remove("drag-over");
       const path = event.payload.paths[0];
       if (path) {
+        if (currentView !== "compose") showTransferView("compose");
+        showPage("transfer");
         localPathInput.value = path;
         updateDropZoneState();
         updateResolvedPathHint();
@@ -2384,8 +2387,7 @@ profileSelect.addEventListener("change", async () => {
     updateConnectionSummary();
     return;
   }
-  const profiles = await invoke<ConnectionProfile[]>("list_saved_profiles");
-  const profile = profiles.find((p) => p.id === id);
+  const profile = savedProfiles.find((p) => p.id === id);
   if (profile) await applyProfile(profile);
 });
 
@@ -2421,7 +2423,7 @@ saveProfileBtn.addEventListener("click", async () => {
           : "";
     setConnectionStatus(`已保存为「${saved.name}」${stored}`, "ok");
   } catch (error) {
-    setConnectionStatus(String(error), "error");
+    setConnectionStatus(describeError(error), "error");
   }
 });
 
@@ -2444,7 +2446,7 @@ deleteProfileBtn.addEventListener("click", async () => {
     await loadProfiles();
     setConnectionStatus("连接配置已删除", "ok");
   } catch (error) {
-    setConnectionStatus(String(error), "error");
+    setConnectionStatus(describeError(error), "error");
   }
 });
 
@@ -2466,14 +2468,6 @@ hostSelect.addEventListener("change", () => {
     updateConnectionSummary();
     updateAuthHintVisibility();
   });
-});
-
-connectionToggle.addEventListener("click", () => {
-  setConnectionExpanded(!connectionExpanded);
-});
-
-transferSettingsToggle.addEventListener("click", () => {
-  setTransferSettingsExpanded(!transferSettingsExpanded);
 });
 
 document.querySelectorAll('input[name="transferDirection"]').forEach((input) => {
@@ -2572,19 +2566,15 @@ remoteBrowseNewDirName.addEventListener("keydown", (event) => {
 
 testConnBtn.addEventListener("click", async () => {
   try {
-    validateConnectionBeforeTransfer();
     testConnBtn.disabled = true;
-    setBadge("测试中");
-    setStatus("正在测试连接...");
+    setConnectionStatus("正在测试连接…");
+    await prepareConnection();
     const message = await invoke<string>("test_connection", {
       request: connectionPayload(),
     });
-    setBadge("连接正常", "uploading");
     setConnectionStatus(message, "ok");
-    setStatus(message);
   } catch (error) {
-    setBadge("连接失败", "error");
-    setConnectionStatus(String(error), "error");
+    setConnectionStatus(clarifyTransferError(describeError(error)), "error");
   } finally {
     if (!isTransferring) testConnBtn.disabled = false;
   }
@@ -2633,7 +2623,6 @@ changeFileBtn.addEventListener("click", async () => {
 });
 
 forceOverwriteInput.addEventListener("change", () => {
-  updateTransferSettingsSummary();
   if (lastProbe) updateTransferStatePanel();
 });
 
@@ -2642,10 +2631,6 @@ document.querySelectorAll<HTMLInputElement>('input[name="themeMode"]').forEach((
     if (!radio.checked) return;
     applyThemePreference(radio.value as ThemePreference);
   });
-});
-
-[hostInput].forEach((input) => {
-  input.addEventListener("input", updateHistoryPeek);
 });
 
 localPathInput.addEventListener("input", () => {
@@ -2667,7 +2652,13 @@ remotePathInput.addEventListener("blur", () => {
   if (!isTransferring) void runBackgroundProbe();
 });
 
+/** 开始流程里有预检、确认框等多个 await，期间按钮仍可点；不加闸门的话双击会并发出第二个流程。 */
+let startInFlight = false;
+
 transferBtn.addEventListener("click", async () => {
+  if (startInFlight || isTransferring) return;
+  startInFlight = true;
+  transferBtn.disabled = true;
   try {
     if (isDownloadMode()) {
       await startDownloadFlow();
@@ -2676,11 +2667,105 @@ transferBtn.addEventListener("click", async () => {
     }
   } catch (error) {
     setTransferring(false);
-    setBadge("失败", "error");
-    setStatus(String(error), "error");
+    // 后端拒绝启动时已经切到了进行中视图，退回编辑视图让用户看到错误并修改。
+    if (currentView === "run") showTransferView("compose");
+    setStatus(describeError(error), "error");
+  } finally {
+    startInFlight = false;
+    // 用户在确认框里取消时流程正常返回、没有进入传输态，需要把按钮还回去。
+    if (!isTransferring) transferBtn.disabled = false;
   }
 });
 
+
+resultBackBtn.addEventListener("click", () => {
+  // 成功后「再传一个」：保留服务器和目标目录，只清掉上一个文件，方便连续传多个文件。
+  if (resultCard.classList.contains("ok")) {
+    if (isDownloadMode()) remotePathInput.value = remotePathInput.value.replace(/[^/]*$/, "");
+    else localPathInput.value = "";
+    updateDropZoneState();
+    updateResolvedPathHint();
+    clearProbeResult();
+  }
+  statusText.textContent = "";
+  showTransferView("compose");
+});
+
+editServerBtn.addEventListener("click", () => showPage("servers"));
+viewLogBtn.addEventListener("click", () => showPage("logs"));
+
+document.querySelectorAll<HTMLInputElement>('input[name="logFilter"]').forEach((radio) => {
+  radio.addEventListener("change", () => {
+    if (radio.checked) activityLog.setFilter(radio.value as LogFilter);
+  });
+});
+
+const copyLogBtn = document.querySelector<HTMLButtonElement>("#copyLogBtn")!;
+copyLogBtn.addEventListener("click", async () => {
+  await copyText(activityLog.toText());
+  const label = copyLogBtn.lastChild;
+  if (label) label.textContent = "已复制";
+  window.setTimeout(() => {
+    if (label) label.textContent = "复制";
+  }, COPY_FEEDBACK_MS);
+});
+
+document.querySelector<HTMLButtonElement>("#clearLogBtn")!.addEventListener("click", () => {
+  activityLog.clear();
+  void invoke("clear_activity_log").catch(() => {});
+});
+
+// 先监听再补拉：补拉期间到达的实时日志由 ActivityLogView 按 id 去重。
+void listen<ActivityEntry>("activity-log", (event) => activityLog.append(event.payload));
+void invoke<ActivityEntry[]>("list_activity_log")
+  .then((entries) => activityLog.load(entries))
+  .catch(() => {
+    // 浏览器预览模式下没有后端，日志页保持空状态。
+  });
+newServerBtn.addEventListener("click", startNewServer);
+miniTransfer.addEventListener("click", () => showPage("transfer"));
+
+document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((item) => {
+  item.addEventListener("click", () => showPage(item.dataset.page as PageId));
+});
+
+/** 页面切换只改显隐，不重建 DOM：传输进行中切走再切回，进度与地图状态都保持原样。 */
+function showPage(page: PageId) {
+  currentPage = page;
+  document.querySelectorAll<HTMLElement>(".page").forEach((el) => {
+    el.classList.toggle("hidden", el.dataset.page !== page);
+  });
+  document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((el) => {
+    const active = el.dataset.page === page;
+    el.classList.toggle("active", active);
+    if (active) el.setAttribute("aria-current", "page");
+    else el.removeAttribute("aria-current");
+  });
+  activityLog.setVisible(page === "logs");
+  // 迷你进度只在离开传输页时有意义；在传输页上它与大进度重复。
+  miniTransfer.classList.toggle("hidden", !isTransferring || page === "transfer");
+}
+
+/** ⌘1–4 切页、⌘↩ 开始、⌘O 选文件：常用操作不必离开键盘。 */
+document.addEventListener("keydown", (event) => {
+  if (!event.metaKey || event.altKey || event.ctrlKey) return;
+  if (confirmOverlay.classList.contains("is-visible") || remoteBrowseOverlay.classList.contains("is-visible")) return;
+  const pageIndex = Number(event.key) - 1;
+  if (Number.isInteger(pageIndex) && pageIndex >= 0 && pageIndex < PAGE_ORDER.length) {
+    event.preventDefault();
+    showPage(PAGE_ORDER[pageIndex]);
+    return;
+  }
+  if (event.key === "Enter" && currentPage === "transfer" && currentView !== "run") {
+    event.preventDefault();
+    transferBtn.click();
+    return;
+  }
+  if (event.key.toLowerCase() === "o" && currentPage === "transfer" && currentView === "compose") {
+    event.preventDefault();
+    document.querySelector<HTMLButtonElement>("#pickFileBtn")!.click();
+  }
+});
 
 cancelBtn.addEventListener("click", () => {
   if (cancelInFlight || !isTransferring) return;
@@ -2690,47 +2775,86 @@ cancelBtn.addEventListener("click", () => {
   cancelBtn.textContent = "取消中…";
   cancelBtn.classList.add("is-cancelling");
   setBadge("取消中", "retrying");
-  setStatus("正在取消...");
+  setStatus("正在取消…");
 
-  const cmd = isDownloadMode() ? "cancel_download" : "cancel_upload";
+  const cmd = runDirection === "download" ? "cancel_download" : "cancel_upload";
   void invoke(cmd).catch((error) => {
     cancelInFlight = false;
     if (isTransferring) {
       cancelBtn.disabled = false;
-      cancelBtn.textContent = "取消";
+      cancelBtn.textContent = "取消传输";
       cancelBtn.classList.remove("is-cancelling");
     }
-    setStatus(String(error), "error");
+    setStatus(describeError(error), "error");
   });
 });
 
-clearCheckpointBtn.addEventListener("click", async () => {
-  const download = isDownloadMode();
-  const confirmed = await showConfirm(
-    "清除断点",
-    download
-      ? "确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。"
-      : "确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。",
-  );
-  if (!confirmed) return;
-
-  if (download) {
-    await invoke("clear_saved_download_checkpoint");
-    activeDownloadCheckpoint = null;
-  } else {
-    await invoke("clear_saved_checkpoint");
-    activeUploadCheckpoint = null;
-  }
-  clearCheckpointBtn.classList.add("hidden");
-  progressBar.value = 0;
-  progressWrap.classList.remove("has-progress");
-  updateTransferStatePanel();
-  setBadge("等待开始");
-  setStatus("断点记录已清除");
-  progressDetail.classList.add("hidden");
-  syncProgressStatsRow();
+clearCheckpointBtn.addEventListener("click", () => {
+  void clearCheckpointFor(transferDirection);
 });
 
+
+/** 「已复制」反馈停留时长。 */
+const COPY_FEEDBACK_MS = 1500;
+
+/** 完成后留给分块地图播放绿色波纹的时间，略长于 BlockMap 的波纹时长。 */
+const COMPLETE_REVEAL_MS = 1100;
+
+type ResultKind = "ok" | "error" | "paused";
+
+interface RunStats {
+  elapsedMs: number;
+  movedBytes: number;
+  retries: number;
+}
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+/** 必须在 setTransferring(false) / resetSpeedTracker 之前取，之后计数会被清零。 */
+function collectRunStats(): RunStats {
+  return {
+    elapsedMs: runStartedAt > 0 ? Date.now() - runStartedAt : 0,
+    movedBytes: Math.max(0, progressTransferredBytes - (runStartBytes ?? progressTransferredBytes)),
+    retries: Math.max(retryCount, blockMap.retryCount),
+  };
+}
+
+function formatDuration(ms: number): string {
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs} 秒`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} 分 ${secs % 60} 秒`;
+  return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
+}
+
+function showResult(kind: ResultKind, title: string, subtitle: string, stats: RunStats) {
+  resultCard.className = `result-card ${kind}`;
+  resultIcon.innerHTML = kind === "ok" ? icons.check : kind === "error" ? icons.alert : icons.pause;
+  resultTitle.textContent = title;
+  resultSubtitle.textContent = subtitle;
+  if (kind !== "ok") hideVerifySummary();
+
+  const avg = stats.elapsedMs > 0 ? stats.movedBytes / (stats.elapsedMs / 1000) : 0;
+  const rows: [string, string][] = [
+    ["用时", formatDuration(stats.elapsedMs)],
+    ["本次传输", formatBytes(stats.movedBytes)],
+    [stats.retries > 0 ? "自动重连" : "平均速度", stats.retries > 0 ? `${stats.retries} 次` : `${formatBytes(avg)}/s`],
+  ];
+  resultStats.replaceChildren(
+    ...rows.map(([label, value]) => {
+      const item = document.createElement("div");
+      const dt = document.createElement("dt");
+      dt.textContent = label;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      item.append(dt, dd);
+      return item;
+    }),
+  );
+  showTransferView("result");
+}
 
 function handleProgressUpdate(
   transferred: number,
@@ -2763,18 +2887,20 @@ function handleProgressUpdate(
     );
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(message, "retry");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
   if (status === "completed") {
-    updateProgressBarIfNeeded(transferred, total, true);
+    updateProgress(transferred, total);
+    const stats = collectRunStats();
     setTransferring(false);
     setProgressState("idle");
-    progressWrap.classList.remove("has-progress");
     resetSpeedTracker();
-    setBadge("已完成", "uploading");
-    setStatus(message);
+    setBadge("已完成", "verifying");
+    statusText.textContent = "";
+    cancelBtn.classList.add("hidden");
+    blockMap.setPhase("completed");
     showVerifySummary(
       verify_summary ??
         (isReliableMode()
@@ -2785,16 +2911,28 @@ function handleProgressUpdate(
     else activeDownloadCheckpoint = null;
     updateTransferStatePanel();
     void loadHistory();
+    // 先让地图播完「全部变绿」的波纹再切结果页：这一刻是整个等待的回报，值得被看到。
+    window.setTimeout(() => {
+      if (isTransferring) return;
+      showResult("ok", uploading ? "上传完成" : "下载完成", message, stats);
+    }, prefersReducedMotion() ? 0 : COMPLETE_REVEAL_MS);
     return;
   }
 
   if (status === "cancelled") {
+    const stats = collectRunStats();
     setTransferring(false);
     setProgressState("idle");
     resetSpeedTracker();
     hideVerifySummary();
-    setBadge("已取消", "retrying");
-    setStatus(message);
+    blockMap.setPhase("cancelled");
+    statusText.textContent = "";
+    showResult(
+      "paused",
+      "已暂停",
+      "已传输的部分保存为断点，随时可以从这里继续。",
+      stats,
+    );
     void restoreActiveCheckpoint();
     void loadHistory();
     return;
@@ -2811,12 +2949,14 @@ function handleProgressUpdate(
   }
 
   if (status === "failed") {
+    const stats = collectRunStats();
     setTransferring(false);
     setProgressState("idle");
     resetSpeedTracker();
     hideVerifySummary();
-    setBadge("失败", "error");
-    setStatus(message, "error");
+    blockMap.setPhase("failed");
+    statusText.textContent = "";
+    showResult("error", uploading ? "上传失败" : "下载失败", clarifyTransferError(message), stats);
     void refreshCheckpointFromDisk();
     void loadHistory();
     return;
@@ -2828,11 +2968,11 @@ function handleProgressUpdate(
     markProgressActivity();
     setProgressState("verifying");
     setBadge("校验中", "verifying");
-    updateProgressBarIfNeeded(transferred, total, true);
+    updateProgress(transferred, total);
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus("正在校验文件完整性，请稍候…");
     showProgressSpeed("校验中");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
@@ -2841,10 +2981,10 @@ function handleProgressUpdate(
     isChunkVerifying = true;
     markProgressActivity();
     applyActiveTransferBadge(direction);
-    updateProgressBarIfNeeded(transferred, total);
+    updateProgress(transferred, total);
     updateProgressDetail(transferred, total, retry_count);
     hideTransferStatus();
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
@@ -2858,17 +2998,17 @@ function handleProgressUpdate(
     showReconnectingSpeedText();
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(message, "retry");
-    updateTransferActivityMood();
+    refreshLiveVisuals();
     return;
   }
 
   applyActiveTransferBadge(direction);
   recordSpeedSample(transferred);
-  updateProgressBarIfNeeded(transferred, total);
+  updateProgress(transferred, total);
   updateProgressDetail(transferred, total, retry_count);
   refreshSpeedDisplay();
   hideTransferStatus();
-  updateTransferActivityMood();
+  refreshLiveVisuals();
 }
 
 void listen("transfer-close-requested", async () => {
@@ -2895,6 +3035,9 @@ async function syncTransferStateOnStartup() {
       if (radio) radio.checked = true;
       updateTransferDirectionUI();
       setTransferring(true);
+      // 重新接上已在进行的传输：真实起点未知，不能把此刻的进度画成「之前已续传」。
+      blockMap.reset(0, 0);
+      syncMapLegend();
       setProgressState("uploading");
       setBadge(state.download_running ? "下载中" : "上传中", "uploading");
       setStatus("检测到进行中的传输任务…");
@@ -2936,11 +3079,14 @@ void listen<UploadRetryEvent>("upload-retry", (event) => {
   retryScheduledAt = Date.now();
   isReconnecting = true;
   isConnecting = false;
+  blockMap.markRetry();
+  syncMapLegend();
+  updateProgressDetail(progressTransferredBytes, progressTotalBytes, retryCount);
   setProgressState("retrying");
   setBadge("重试中", "retrying");
   showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
-  updateTransferActivityMood();
+  refreshLiveVisuals();
 });
 
 void listen<DownloadRetryEvent>("download-retry", (event) => {
@@ -2949,28 +3095,36 @@ void listen<DownloadRetryEvent>("download-retry", (event) => {
   retryScheduledAt = Date.now();
   isReconnecting = true;
   isConnecting = false;
+  blockMap.markRetry();
+  syncMapLegend();
+  updateProgressDetail(progressTransferredBytes, progressTotalBytes, retryCount);
   setProgressState("retrying");
   setBadge("重试中", "retrying");
   showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
-  updateTransferActivityMood();
+  refreshLiveVisuals();
 });
 
 setupDragDrop();
-setupWindowAutoFit();
 initThemePreference();
+showTransferView("compose");
 updateConnectionSummary();
 updateModeHint();
 updateTransferDirectionUI();
-setConnectionExpanded(!hostInput.value.trim());
 void loadProfiles();
 void loadHosts();
-void restoreActiveCheckpoint().then(() => scheduleFitWindow());
+void restoreActiveCheckpoint();
 void loadHistory();
-void syncTransferStateOnStartup().then(() => scheduleFitWindow());
+void syncTransferStateOnStartup();
+void getVersion()
+  .then((version) => {
+    appVersion.textContent = `v${version}`;
+  })
+  .catch(() => {
+    // 浏览器预览模式下拿不到版本号，留空即可。
+  });
 updateAuthFields();
 updateDropZoneState();
 updateResolvedPathHint();
 updateAuthHintVisibility();
 updateRemoteBrowseModeUi();
-scheduleFitWindow();
