@@ -15,9 +15,9 @@
       {
         "title": "ResiliSSH",
         "width": 920,
-        "height": 640,
+        "height": 680,
         "minWidth": 780,
-        "minHeight": 580,
+        "minHeight": 630,
         "resizable": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true

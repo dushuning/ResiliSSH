@@ -39,7 +39,8 @@ export class Popover {
     return this.open;
   }
 
-  show(sections: PopoverSection[], emptyText: string) {
+  /** footer 用于放说明性文字（如可用变量），始终显示在列表下方。 */
+  show(sections: PopoverSection[], emptyText: string, footer?: HTMLElement) {
     const nonEmpty = sections.filter((s) => s.items.length > 0);
     if (nonEmpty.length === 0) {
       const empty = document.createElement("div");
@@ -48,6 +49,10 @@ export class Popover {
       this.panel.replaceChildren(empty);
     } else {
       this.panel.replaceChildren(...nonEmpty.map((section) => this.renderSection(section)));
+    }
+    if (footer) {
+      footer.classList.add("popover-footer");
+      this.panel.append(footer);
     }
     this.panel.classList.remove("hidden");
     this.open = true;

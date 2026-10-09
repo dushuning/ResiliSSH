@@ -35,6 +35,21 @@ interface ConnectionProfile {
   post_commands: string[];
 }
 
+interface CommandOutcome {
+  command: string;
+  exit_code: number | null;
+  cancelled: boolean;
+  timed_out: boolean;
+  output_tail: string[];
+}
+
+interface CommandContext {
+  remote_dir: string;
+  file_name: string;
+  remote_path: string;
+  files: string[];
+}
+
 interface ProfileSecrets {
   password: string | null;
   key_passphrase: string | null;
@@ -273,8 +288,21 @@ const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmarkBtn")!;
 const pathMenuBtn = document.querySelector<HTMLButtonElement>("#pathMenuBtn")!;
 const pathMenu = new Popover(
   document.querySelector<HTMLDivElement>("#pathMenu")!,
-  document.querySelector<HTMLDivElement>(".path-field")!,
+  document.querySelector<HTMLInputElement>("#remotePath")!.closest<HTMLElement>(".path-field")!,
 );
+const postCommandInput = document.querySelector<HTMLInputElement>("#postCommand")!;
+const saveCommandBtn = document.querySelector<HTMLButtonElement>("#saveCommandBtn")!;
+const commandMenuBtn = document.querySelector<HTMLButtonElement>("#commandMenuBtn")!;
+const commandMenu = new Popover(
+  document.querySelector<HTMLDivElement>("#commandMenu")!,
+  document.querySelector<HTMLDivElement>("#commandField")!,
+);
+const commandConsole = document.querySelector<HTMLDivElement>("#commandConsole")!;
+const commandConsoleCmd = document.querySelector<HTMLSpanElement>("#commandConsoleCmd")!;
+const commandOutput = document.querySelector<HTMLPreElement>("#commandOutput")!;
+const resultCommand = document.querySelector<HTMLDivElement>("#resultCommand")!;
+const resultCommandLine = document.querySelector<HTMLDivElement>("#resultCommandLine")!;
+const resultCommandOutput = document.querySelector<HTMLPreElement>("#resultCommandOutput")!;
 const legendResumed = document.querySelector<HTMLSpanElement>("#legendResumed")!;
 const legendRetry = document.querySelector<HTMLSpanElement>("#legendRetry")!;
 const mapLegend = document.querySelector<HTMLDivElement>("#mapLegend")!;
@@ -349,6 +377,12 @@ let runStartedAt = 0;
 let runStartBytes: number | null = null;
 /** 传输开始时锁定方向：取消、结果展示都以它为准，不受之后界面状态影响。 */
 let runDirection: TransferDirection = "upload";
+/** 本次传输的远端完整路径（预检解析后的结果），传完后命令的变量从这里取。 */
+let runRemotePath = "";
+/** 传输开始时锁定的「传完后执行」命令：传输中输入框已锁定，这里只是避免读到之后的改动。 */
+let runPostCommandTemplate = "";
+/** 传完后命令执行中：此时传输已结束（isTransferring=false），但界面仍停留在进行中视图。 */
+let commandRunning = false;
 
 const blockMap = new BlockMap(
   document.querySelector<HTMLCanvasElement>("#blockMap")!,
@@ -381,6 +415,9 @@ const TRANSFER_LOCK_SELECTORS = [
   ".server-item",
   "#bookmarkBtn",
   "#pathMenuBtn",
+  "#postCommand",
+  "#saveCommandBtn",
+  "#commandMenuBtn",
 ] as const;
 
 let probeDebounceTimer: number | null = null;
@@ -477,7 +514,10 @@ function syncDirectionLock() {
 function updateTransferButtonLabel() {
   const verb = isDownloadMode() ? "下载" : "上传";
   // 成功后唯一的下一步是「再传一个」，把它升级为主按钮；其他情况它只是次要的「返回修改」。
-  const successResult = currentView === "result" && resultCard.classList.contains("ok");
+  // 「传完但命令失败」也算传输成功：下一步同样是「再传一个」，重试传输没有意义。
+  const successResult =
+    currentView === "result" &&
+    (resultCard.classList.contains("ok") || resultCard.classList.contains("warn"));
   resultBackBtn.classList.toggle("btn-primary", successResult);
   resultBackBtn.classList.toggle("btn-large", successResult);
   resultBackBtn.classList.toggle("btn-secondary", !successResult);
@@ -1214,6 +1254,8 @@ async function startDownloadFlow() {
 
   const forceOverwrite =
     probe.action === "full_redownload" || forceOverwriteInput.checked;
+  runRemotePath = probe.resolved_remote_path;
+  runPostCommandTemplate = postCommandInput.value.trim();
 
   setTransferring(true);
   retryCount = 0;
@@ -1299,6 +1341,8 @@ async function startUploadFlow() {
 
   const forceOverwrite =
     probe.action === "full_reupload" || forceOverwriteInput.checked;
+  runRemotePath = probe.resolved_remote_path;
+  runPostCommandTemplate = postCommandInput.value.trim();
 
   setTransferring(true);
   retryCount = 0;
@@ -1775,6 +1819,7 @@ function restoreCredentialsFromProfile(host: string, port: number, username: str
   // 这里由启动时自动恢复断点触发，不主动读钥匙串（会弹授权框）；
   // 真正连接前由 ensureCredentialsLoaded 按需补齐密码。
 
+  restorePostCommand();
   setConnectionStatus(`已匹配服务器「${profile.name}」`, "ok");
   updateConnectionSummary();
 }
@@ -2234,6 +2279,7 @@ async function applyProfile(profile: ConnectionProfile) {
   updateAuthFields();
   updateConnectionSummary();
 
+  restorePostCommand();
   // 用户主动选择服务器时才读钥匙串：此时弹出系统授权框是可预期的。
   const secrets = await loadProfileSecrets(profile.id);
   if (profileSelect.value !== profile.id) return; // 读取期间用户已切到别的服务器
@@ -2770,6 +2816,18 @@ localPathInput.addEventListener("blur", () => {
 });
 
 bookmarkBtn.addEventListener("click", () => void toggleBookmark());
+saveCommandBtn.addEventListener("click", () => void toggleSavedCommand());
+commandMenuBtn.addEventListener("click", () => {
+  if (commandMenu.isOpen) commandMenu.close();
+  else openCommandMenu();
+});
+postCommandInput.addEventListener("input", () => {
+  localStorage.setItem(commandStorageKey(), postCommandInput.value);
+  updateSaveCommandButton();
+});
+void listen<{ line: string }>("command-output", (event) => {
+  if (commandRunning) appendConsoleLine(event.payload.line);
+});
 pathMenuBtn.addEventListener("click", () => {
   if (pathMenu.isOpen) pathMenu.close();
   else openPathMenu();
@@ -2812,7 +2870,7 @@ transferBtn.addEventListener("click", async () => {
 
 resultBackBtn.addEventListener("click", () => {
   // 成功后「再传一个」：保留服务器和目标目录，只清掉上一个文件，方便连续传多个文件。
-  if (resultCard.classList.contains("ok")) {
+  if (resultCard.classList.contains("ok") || resultCard.classList.contains("warn")) {
     if (isDownloadMode()) remotePathInput.value = remotePathInput.value.replace(/[^/]*$/, "");
     else localPathInput.value = "";
     updateDropZoneState();
@@ -2900,6 +2958,12 @@ document.addEventListener("keydown", (event) => {
 });
 
 cancelBtn.addEventListener("click", () => {
+  if (commandRunning) {
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = "停止中…";
+    void invoke("cancel_remote_command").catch(() => {});
+    return;
+  }
   if (cancelInFlight || !isTransferring) return;
 
   cancelInFlight = true;
@@ -2932,7 +2996,7 @@ const COPY_FEEDBACK_MS = 1500;
 /** 完成后留给分块地图播放绿色波纹的时间，略长于 BlockMap 的波纹时长。 */
 const COMPLETE_REVEAL_MS = 1100;
 
-type ResultKind = "ok" | "error" | "paused";
+type ResultKind = "ok" | "warn" | "error" | "paused";
 
 interface RunStats {
   elapsedMs: number;
@@ -2961,12 +3025,181 @@ function formatDuration(ms: number): string {
   return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
 }
 
+/** 控制台只保留最近若干行，长时间输出的命令也不会让 DOM 无限增长。 */
+const CONSOLE_MAX_LINES = 200;
+const COMMAND_STORAGE_PREFIX = "resiliss-post-command:";
+const COMMAND_VARIABLES_HINT = "{remote_dir} {file_name} {remote_path} {files}";
+
+/** 按服务器记住上次填写的命令：不同服务器的部署命令通常不同。 */
+function commandStorageKey(): string {
+  return COMMAND_STORAGE_PREFIX + (profileSelect.value || `${hostInput.value.trim()}:${portInput.value}`);
+}
+
+function restorePostCommand() {
+  postCommandInput.value = localStorage.getItem(commandStorageKey()) ?? "";
+  updateSaveCommandButton();
+}
+
+function updateSaveCommandButton() {
+  const profile = currentProfile();
+  const command = postCommandInput.value.trim();
+  const saved = Boolean(profile && command && profile.post_commands.includes(command));
+  saveCommandBtn.disabled = !profile || !command || isTransferring;
+  saveCommandBtn.classList.toggle("is-active", saved);
+  saveCommandBtn.innerHTML = saved ? icons.starFilled : icons.star;
+  saveCommandBtn.title = !profile
+    ? "保存服务器后才能保存常用命令"
+    : saved
+      ? "从常用命令中移除"
+      : "保存为常用命令";
+}
+
+async function toggleSavedCommand() {
+  const profile = currentProfile();
+  const command = postCommandInput.value.trim();
+  if (!profile || !command) return;
+  const commands = profile.post_commands.includes(command)
+    ? profile.post_commands.filter((c) => c !== command)
+    : [command, ...profile.post_commands];
+  try {
+    await saveProfileExtras(profile, { post_commands: commands });
+    updateSaveCommandButton();
+  } catch (error) {
+    setStatus(describeError(error), "error");
+  }
+}
+
+function openCommandMenu() {
+  const profile = currentProfile();
+  const commands = profile?.post_commands ?? [];
+  const footer = document.createElement("div");
+  footer.append("可用变量（自动加引号）：");
+  const vars = document.createElement("code");
+  vars.textContent = COMMAND_VARIABLES_HINT;
+  footer.append(vars);
+  commandMenu.show(
+    [
+      {
+        items: commands.map((command) => ({
+          label: command,
+          onSelect: () => {
+            postCommandInput.value = command;
+            postCommandInput.dispatchEvent(new Event("input"));
+          },
+          onRemove: () => {
+            if (!profile) return;
+            void saveProfileExtras(profile, {
+              post_commands: commands.filter((c) => c !== command),
+            }).then(() => {
+              updateSaveCommandButton();
+              openCommandMenu();
+            });
+          },
+        })),
+      },
+    ],
+    profile ? "还没有常用命令\n填好命令后点输入框里的 ☆ 保存" : "保存服务器后即可保存常用命令",
+    footer,
+  );
+}
+
+function commandContextFor(remotePaths: string[]): CommandContext {
+  const last = remotePaths[remotePaths.length - 1] ?? "";
+  return {
+    remote_dir: remoteDirOf(last),
+    file_name: fileNameOf(last),
+    remote_path: last,
+    files: remotePaths.map(fileNameOf),
+  };
+}
+
+function appendConsoleLine(line: string) {
+  commandOutput.append(`${line}\n`);
+  while (commandOutput.childNodes.length > CONSOLE_MAX_LINES) commandOutput.firstChild?.remove();
+  commandOutput.scrollTop = commandOutput.scrollHeight;
+}
+
+/**
+ * 传输全部成功后执行命令。期间留在进行中视图：地图保持完成态，下方控制台实时显示输出，
+ * 「取消」按钮改为停止命令。返回 null 表示命令根本没跑起来（连接失败等），错误文本放在 error 里。
+ */
+async function runPostCommand(
+  template: string,
+  context: CommandContext,
+): Promise<{ outcome: CommandOutcome | null; error?: string }> {
+  commandRunning = true;
+  commandOutput.textContent = "";
+  commandConsoleCmd.textContent = template;
+  commandConsole.classList.remove("hidden");
+  setBadge("执行命令中", "verifying");
+  cancelBtn.textContent = "停止命令";
+  cancelBtn.disabled = false;
+  cancelBtn.classList.remove("hidden", "is-cancelling");
+  navTransferLive.classList.remove("hidden");
+  try {
+    const outcome = await invoke<CommandOutcome>("run_remote_command", {
+      request: { connection: connectionPayload(), template, context },
+    });
+    return { outcome };
+  } catch (error) {
+    return { outcome: null, error: describeError(error) };
+  } finally {
+    commandRunning = false;
+    commandConsole.classList.add("hidden");
+    cancelBtn.classList.add("hidden");
+    navTransferLive.classList.add("hidden");
+  }
+}
+
+/** 结果页的命令区：成功也展示末尾输出，方便确认服务确实起来了。 */
+function showCommandResult(outcome: CommandOutcome | null, error?: string) {
+  if (!outcome && !error) {
+    resultCommand.classList.add("hidden");
+    return;
+  }
+  resultCommand.classList.remove("hidden");
+  resultCommandLine.textContent = `$ ${outcome?.command ?? runPostCommandTemplate}`;
+  const output = outcome ? outcome.output_tail.join("\n") : (error ?? "");
+  resultCommandOutput.textContent = output || "（没有输出）";
+}
+
+function describeCommandFailure(outcome: CommandOutcome | null, error?: string): string {
+  if (!outcome) return `命令没能执行：${error ?? "未知错误"}`;
+  if (outcome.cancelled) return "命令已被停止（远端进程可能仍在运行）";
+  if (outcome.timed_out) return "命令超过 10 分钟没有任何输出，已停止等待";
+  return `命令执行失败，退出码 ${outcome.exit_code ?? "未知"}`;
+}
+
+/** 传输成功后的收尾：有命令就先执行命令，再按命令结果决定结果页是「完成」还是「警告」。 */
+async function finishSuccessfulRun(
+  title: string,
+  message: string,
+  stats: RunStats,
+  remotePaths: string[],
+) {
+  if (!runPostCommandTemplate) {
+    showCommandResult(null);
+    showResult("ok", title, message, stats);
+    return;
+  }
+  const { outcome, error } = await runPostCommand(runPostCommandTemplate, commandContextFor(remotePaths));
+  showCommandResult(outcome, error);
+  if (outcome?.exit_code === 0 && !outcome.cancelled && !outcome.timed_out) {
+    showResult("ok", title, `${message}\n已执行命令，退出码 0`, stats);
+  } else {
+    showResult("warn", `${title}，但命令未成功`, describeCommandFailure(outcome, error), stats);
+  }
+}
+
 function showResult(kind: ResultKind, title: string, subtitle: string, stats: RunStats) {
   resultCard.className = `result-card ${kind}`;
-  resultIcon.innerHTML = kind === "ok" ? icons.check : kind === "error" ? icons.alert : icons.pause;
+  resultIcon.innerHTML =
+    kind === "ok" ? icons.check : kind === "paused" ? icons.pause : icons.alert;
   resultTitle.textContent = title;
   resultSubtitle.textContent = subtitle;
-  if (kind !== "ok") hideVerifySummary();
+  // 「传完但命令失败」时文件本身已校验通过，校验结论仍然有效，要保留。
+  if (kind !== "ok" && kind !== "warn") hideVerifySummary();
+  if (kind === "error" || kind === "paused") resultCommand.classList.add("hidden");
 
   const avg = stats.elapsedMs > 0 ? stats.movedBytes / (stats.elapsedMs / 1000) : 0;
   const rows: [string, string][] = [
@@ -3046,7 +3279,7 @@ function handleProgressUpdate(
     // 先让地图播完「全部变绿」的波纹再切结果页：这一刻是整个等待的回报，值得被看到。
     window.setTimeout(() => {
       if (isTransferring) return;
-      showResult("ok", uploading ? "上传完成" : "下载完成", message, stats);
+      void finishSuccessfulRun(uploading ? "上传完成" : "下载完成", message, stats, [runRemotePath]);
     }, prefersReducedMotion() ? 0 : COMPLETE_REVEAL_MS);
     return;
   }

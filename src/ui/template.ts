@@ -127,6 +127,18 @@ export function appTemplate(appName: string): string {
                 <span id="forceOverwriteLabel">强制从头覆盖</span>
               </label>
             </div>
+
+            <div class="path-field" id="commandField">
+              <div class="input-row">
+                <label class="command-label" for="postCommand">${icons.terminal}传完后执行</label>
+                <div class="path-input-wrap">
+                  <input id="postCommand" placeholder="可选，如 sudo systemctl restart app" spellcheck="false" autocomplete="off" />
+                  <button class="path-star" id="saveCommandBtn" type="button" title="保存为常用命令">${icons.star}</button>
+                </div>
+                <button class="btn btn-secondary" id="commandMenuBtn" type="button" aria-haspopup="menu">常用${icons.chevronDown}</button>
+              </div>
+              <div class="popover popover-up hidden" id="commandMenu" role="menu" aria-label="常用命令"></div>
+            </div>
           </div>
 
           <!-- 进行中视图：分块地图 + 实时状态 -->
@@ -147,6 +159,12 @@ export function appTemplate(appName: string): string {
                 <span class="hidden" id="legendRetry"><i class="swatch swatch-retry"></i>断线重连处</span>
                 <span class="map-caption" id="mapCaption"></span>
               </div>
+              <div class="command-console hidden" id="commandConsole">
+                <div class="command-console-head">
+                  ${icons.terminal}<span class="command-console-cmd" id="commandConsoleCmd"></span>
+                </div>
+                <pre class="command-console-output" id="commandOutput"></pre>
+              </div>
               <div class="run-stats" id="progressStats">
                 <div class="run-percent" id="progressPercent">0%</div>
                 <div class="run-stats-side">
@@ -165,6 +183,10 @@ export function appTemplate(appName: string): string {
               <div class="result-subtitle" id="resultSubtitle"></div>
               <div class="verify-summary hidden" id="verifySummary"></div>
               <dl class="result-stats" id="resultStats"></dl>
+              <div class="result-command hidden" id="resultCommand">
+                <div class="result-command-line" id="resultCommandLine"></div>
+                <pre class="result-command-output" id="resultCommandOutput"></pre>
+              </div>
             </div>
           </div>
         </div>

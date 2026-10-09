@@ -11,7 +11,8 @@ export type LogCategory =
   | "network"
   | "permission"
   | "transfer"
-  | "verify";
+  | "verify"
+  | "command";
 export type LogFilter = "all" | "warn" | "error";
 
 export interface ActivityEntry {
@@ -30,6 +31,7 @@ const CATEGORY_LABEL: Record<LogCategory, string> = {
   permission: "权限",
   transfer: "传输",
   verify: "校验",
+  command: "命令",
 };
 
 const LEVEL_LABEL: Record<LogLevel, string> = {

@@ -33,6 +33,7 @@ pub enum Category {
     Permission,
     Transfer,
     Verify,
+    Command,
 }
 
 #[derive(Debug, Clone, Serialize)]

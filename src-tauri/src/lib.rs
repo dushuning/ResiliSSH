@@ -27,7 +27,8 @@ use sftp::{
     format_remote_sftp_error, inspect_host_key, list_remote_directory, open_handshake, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
-    DownloadCallbacks, DownloadError, HostKeyInfo, RemoteDirListing, UploadCallbacks, UploadError,
+    run_remote_command as run_sftp_remote_command, CommandContext, CommandOutcome, DownloadCallbacks,
+    DownloadError, HostKeyInfo, RemoteDirListing, UploadCallbacks, UploadError,
 };
 
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,26 @@ struct CloseGate(AtomicBool);
 struct TransferRunningState {
     upload_running: bool,
     download_running: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunCommandRequest {
+    connection: ConnectionRequest,
+    template: String,
+    context: CommandContext,
+}
+
+/// 传完后命令的运行状态：与上传/下载分开管理，命令执行期间可单独取消，
+/// 关窗时也要能打断（远端进程不受影响，但本地不该卡着连接）。
+#[derive(Default)]
+struct CommandRuntime {
+    cancel_flag: Option<Arc<AtomicBool>>,
+    abort_socket: Option<Arc<Mutex<Option<TcpStream>>>>,
+}
+
+#[derive(Clone, Serialize)]
+struct CommandOutputEvent {
+    line: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,8 +496,10 @@ fn prepare_app_close(
     gate: State<'_, CloseGate>,
     upload_runtime: State<'_, Mutex<UploadRuntime>>,
     download_runtime: State<'_, Mutex<DownloadRuntime>>,
+    command_runtime: State<'_, Mutex<CommandRuntime>>,
 ) -> Result<(), String> {
     gate.0.store(true, Ordering::Relaxed);
+    let _ = cancel_remote_command(command_runtime);
 
     let upload_running = upload_runtime
         .lock()
@@ -551,6 +574,62 @@ fn update_connection_profile_extras(
     request: UpdateProfileExtrasRequest,
 ) -> Result<ConnectionProfile, String> {
     update_profile_extras(request)
+}
+
+#[tauri::command(async)]
+fn run_remote_command(
+    app: AppHandle,
+    runtime: State<'_, Mutex<CommandRuntime>>,
+    request: RunCommandRequest,
+) -> Result<CommandOutcome, String> {
+    if request.template.trim().is_empty() {
+        return Err("命令为空".into());
+    }
+    let config = build_connection_config(&request.connection)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let abort_socket = Arc::new(Mutex::new(None));
+    {
+        let mut state = runtime.lock().map_err(|e| e.to_string())?;
+        if state.cancel_flag.is_some() {
+            return Err("已有命令在执行".into());
+        }
+        state.cancel_flag = Some(cancel.clone());
+        state.abort_socket = Some(abort_socket.clone());
+    }
+    let result = run_sftp_remote_command(
+        &config,
+        &request.template,
+        &request.context,
+        &cancel,
+        &abort_socket,
+        |line| {
+            let _ = app.emit("command-output", CommandOutputEvent { line: line.to_string() });
+        },
+    );
+    if let Err(err) = &result {
+        activity::error(activity::Category::Command, format!("命令未能执行：{err}"));
+    }
+    if let Ok(mut state) = runtime.lock() {
+        *state = CommandRuntime::default();
+    }
+    result
+}
+
+#[tauri::command]
+fn cancel_remote_command(runtime: State<'_, Mutex<CommandRuntime>>) -> Result<(), String> {
+    let state = runtime.lock().map_err(|e| e.to_string())?;
+    if let Some(flag) = &state.cancel_flag {
+        flag.store(true, Ordering::Relaxed);
+    }
+    // 关掉 socket 才能让阻塞中的 read 立刻返回，否则要等到下一段输出或超时。
+    if let Some(holder) = &state.abort_socket {
+        if let Ok(guard) = holder.lock() {
+            if let Some(socket) = guard.as_ref() {
+                abort_socket(socket);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1924,6 +2003,7 @@ pub fn run() {
         .manage(Mutex::new(UploadRuntime::default()))
         .manage(Mutex::new(DownloadRuntime::default()))
         .manage(CloseGate::default())
+        .manage(Mutex::new(CommandRuntime::default()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let gate = window.state::<CloseGate>();
@@ -1947,6 +2027,8 @@ pub fn run() {
             list_activity_log,
             clear_activity_log,
             update_connection_profile_extras,
+            run_remote_command,
+            cancel_remote_command,
             save_connection_profile,
             delete_connection_profile,
             list_upload_history,
