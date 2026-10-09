@@ -145,6 +145,7 @@ export function appTemplate(appName: string): string {
           <div class="view hidden" id="runView">
             <div class="progress-wrap" id="progressWrap">
               <div class="run-head" id="progressToolbar">
+                <span class="queue-chip hidden" id="queueChip"></span>
                 <div class="run-summary" id="runSummary"></div>
                 <span id="progressBadge" class="badge">等待开始</span>
               </div>
@@ -183,6 +184,7 @@ export function appTemplate(appName: string): string {
               <div class="result-subtitle" id="resultSubtitle"></div>
               <div class="verify-summary hidden" id="verifySummary"></div>
               <dl class="result-stats" id="resultStats"></dl>
+              <ul class="result-files hidden" id="resultFiles"></ul>
               <div class="result-command hidden" id="resultCommand">
                 <div class="result-command-line" id="resultCommandLine"></div>
                 <pre class="result-command-output" id="resultCommandOutput"></pre>

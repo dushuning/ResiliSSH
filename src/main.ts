@@ -290,6 +290,8 @@ const pathMenu = new Popover(
   document.querySelector<HTMLDivElement>("#pathMenu")!,
   document.querySelector<HTMLInputElement>("#remotePath")!.closest<HTMLElement>(".path-field")!,
 );
+const queueChip = document.querySelector<HTMLSpanElement>("#queueChip")!;
+const resultFiles = document.querySelector<HTMLUListElement>("#resultFiles")!;
 const postCommandInput = document.querySelector<HTMLInputElement>("#postCommand")!;
 const saveCommandBtn = document.querySelector<HTMLButtonElement>("#saveCommandBtn")!;
 const commandMenuBtn = document.querySelector<HTMLButtonElement>("#commandMenuBtn")!;
@@ -383,6 +385,33 @@ let runRemotePath = "";
 let runPostCommandTemplate = "";
 /** 传完后命令执行中：此时传输已结束（isTransferring=false），但界面仍停留在进行中视图。 */
 let commandRunning = false;
+
+/**
+ * 待上传的本地文件。单文件时与 localPathInput 一致；多选/多拖入时其余文件也在这里。
+ * localPathInput 始终保存第一个文件，原有的单文件逻辑（预检、路径预览）无需感知队列。
+ */
+let selectedUploads: string[] = [];
+
+type QueueItemStatus = "pending" | "running" | "done" | "failed" | "skipped" | "cancelled";
+
+interface QueueItem {
+  local: string;
+  remote: string;
+  status: QueueItemStatus;
+  message?: string;
+  stats?: RunStats;
+}
+
+/** 单个文件传输的终态，由 handleProgressUpdate 交回给队列调度。 */
+interface RunStepResult {
+  status: "completed" | "failed" | "cancelled";
+  message: string;
+  stats: RunStats;
+}
+
+/** 队列执行中的状态；为 null 表示当前是普通单文件传输。 */
+let activeQueue: { items: QueueItem[]; index: number } | null = null;
+let resolveQueueStep: ((result: RunStepResult) => void) | null = null;
 
 const blockMap = new BlockMap(
   document.querySelector<HTMLCanvasElement>("#blockMap")!,
@@ -515,9 +544,7 @@ function updateTransferButtonLabel() {
   const verb = isDownloadMode() ? "下载" : "上传";
   // 成功后唯一的下一步是「再传一个」，把它升级为主按钮；其他情况它只是次要的「返回修改」。
   // 「传完但命令失败」也算传输成功：下一步同样是「再传一个」，重试传输没有意义。
-  const successResult =
-    currentView === "result" &&
-    (resultCard.classList.contains("ok") || resultCard.classList.contains("warn"));
+  const successResult = currentView === "result" && resultCard.dataset.transferOk === "1";
   resultBackBtn.classList.toggle("btn-primary", successResult);
   resultBackBtn.classList.toggle("btn-large", successResult);
   resultBackBtn.classList.toggle("btn-secondary", !successResult);
@@ -528,7 +555,8 @@ function updateTransferButtonLabel() {
   }
   resultBackBtn.textContent = "返回修改";
   if (currentView === "result") {
-    transferBtn.innerHTML = resultCard.classList.contains("paused") ? "继续传输" : "重试";
+    const retryLabel = isQueueSelection() ? `重试 ${selectedUploads.length} 个文件` : "重试";
+    transferBtn.innerHTML = resultCard.classList.contains("paused") ? "继续传输" : retryLabel;
   } else {
     transferBtn.innerHTML = `开始${verb} <kbd>⌘↩</kbd>`;
   }
@@ -546,6 +574,13 @@ function beginRunVisuals() {
   runStartBytes = null;
   blockMap.reset();
   blockMap.setVerifiedPerBlock(isReliableMode());
+  if (activeQueue) {
+    queueChip.textContent = `第 ${activeQueue.index + 1} / ${activeQueue.items.length} 个`;
+    queueChip.classList.remove("hidden");
+  } else {
+    queueChip.classList.add("hidden");
+    renderQueueResultFiles(null);
+  }
   syncMapLegend();
   mapCaption.textContent = "";
   progressPercent.textContent = "0%";
@@ -1333,11 +1368,33 @@ async function invokeStartUpload(forceOverwrite: boolean) {
   }
 }
 
+function isQueueSelection(): boolean {
+  return !isDownloadMode() && selectedUploads.length > 1;
+}
+
+function setSelectedUploads(paths: string[]) {
+  selectedUploads = paths.filter(Boolean);
+  localPathInput.value = selectedUploads[0] ?? "";
+  updateDropZoneState();
+  updateResolvedPathHint();
+  clearProbeResult();
+  // 多文件时只预检第一个会产生误导，等开始时逐个预检。
+  if (selectedUploads.length === 1) scheduleBackgroundProbe();
+}
+
 async function startUploadFlow() {
   await prepareConnection();
+  await startOneUpload();
+}
+
+/**
+ * 预检、确认、启动一个上传。返回 false 表示用户在确认框里放弃了这个文件。
+ * 单文件与队列共用：队列只是对每个文件依次调用它，续传、校验等行为完全一致。
+ */
+async function startOneUpload(): Promise<boolean> {
   const probe = await probeRemoteUpload();
   const confirmed = await confirmUploadAction(probe);
-  if (!confirmed) return;
+  if (!confirmed) return false;
 
   const forceOverwrite =
     probe.action === "full_reupload" || forceOverwriteInput.checked;
@@ -1353,6 +1410,164 @@ async function startUploadFlow() {
   showProgressSpeed("正在建立 SSH 连接…");
 
   await invokeStartUpload(forceOverwrite);
+  return true;
+}
+
+/**
+ * 多文件上传：逐个走单文件流程。某个文件失败不影响后面的文件；用户取消则整个队列停止。
+ * 传完后命令只在队列结束后执行一次——部署场景下应当全部传完再重启服务。
+ */
+async function startQueueFlow() {
+  await prepareConnection();
+  // 多个文件必须传到目录里，否则会互相覆盖成同一个远端文件。
+  const remoteDir = remotePathInput.value.trim();
+  if (!remoteDir) throw new Error("请填写远端目录");
+  if (!remoteDir.endsWith("/")) remotePathInput.value = `${remoteDir}/`;
+
+  const queueStartedAt = Date.now();
+  const template = postCommandInput.value.trim();
+  const queue = {
+    items: selectedUploads.map<QueueItem>((local) => ({ local, remote: "", status: "pending" })),
+    index: 0,
+  };
+  activeQueue = queue;
+
+  try {
+    for (let i = 0; i < queue.items.length; i++) {
+      const item = queue.items[i];
+      queue.index = i;
+      localPathInput.value = item.local;
+      item.status = "running";
+      const step = new Promise<RunStepResult>((resolve) => {
+        resolveQueueStep = resolve;
+      });
+      let started: boolean;
+      try {
+        started = await startOneUpload();
+      } catch (error) {
+        resolveQueueStep = null;
+        setTransferring(false);
+        item.status = "failed";
+        item.message = clarifyTransferError(describeError(error));
+        continue;
+      }
+      if (!started) {
+        resolveQueueStep = null;
+        item.status = "skipped";
+        item.message = "已跳过";
+        continue;
+      }
+      item.remote = runRemotePath;
+      const result = await step;
+      item.stats = result.stats;
+      if (result.status === "completed") {
+        item.status = "done";
+      } else if (result.status === "failed") {
+        item.status = "failed";
+        item.message = clarifyTransferError(result.message);
+      } else {
+        item.status = "cancelled";
+        item.message = "已取消，断点已保留";
+        for (const rest of queue.items.slice(i + 1)) {
+          rest.status = "cancelled";
+          rest.message = "未开始";
+        }
+        break;
+      }
+    }
+  } finally {
+    resolveQueueStep = null;
+    activeQueue = null;
+    queueChip.classList.add("hidden");
+  }
+  await finishQueue(queue.items, template, queueStartedAt);
+}
+
+/** 汇总队列结果：全部成功才算「完成」，部分失败为「警告」，用户取消为「已暂停」。 */
+async function finishQueue(items: QueueItem[], template: string, startedAt: number) {
+  const done = items.filter((i) => i.status === "done");
+  const stats: RunStats = {
+    elapsedMs: Date.now() - startedAt,
+    movedBytes: items.reduce((sum, i) => sum + (i.stats?.movedBytes ?? 0), 0),
+    retries: items.reduce((sum, i) => sum + (i.stats?.retries ?? 0), 0),
+  };
+  const cancelled = items.some((i) => i.status === "cancelled");
+  const total = items.length;
+  renderQueueResultFiles(items);
+  // 选择只保留没成功的文件：之后点「重试 / 继续传输」不会把已完成的文件再传一遍。
+  const remaining = items.filter((i) => i.status !== "done").map((i) => i.local);
+  selectedUploads = remaining.length > 0 ? remaining : items.map((i) => i.local);
+  localPathInput.value = selectedUploads[0];
+  updateDropZoneState();
+  updateResolvedPathHint();
+
+  if (done.length === total) {
+    runPostCommandTemplate = template;
+    await finishSuccessfulRun(
+      `${total} 个文件全部上传完成`,
+      `已传到 ${hostInput.value.trim()}:${remoteDirOf(done[0].remote)}`,
+      stats,
+      done.map((i) => i.remote),
+    );
+    return;
+  }
+  // 部分失败时不执行命令：拿着不完整的文件去重启服务往往比不重启更糟。
+  showCommandResult(null);
+  // 校验徽章属于最后一个成功的文件，放在整体未成功的结果里会误导。
+  hideVerifySummary();
+  const failedCount = items.filter((i) => i.status === "failed").length;
+  const otherCount = total - done.length - failedCount;
+  const summary = [
+    `成功 ${done.length} 个`,
+    failedCount > 0 ? `失败 ${failedCount} 个` : "",
+    otherCount > 0 ? `未完成 ${otherCount} 个` : "",
+  ]
+    .filter(Boolean)
+    .join("，");
+  const commandNote = template ? "\n因有文件未成功，传完后命令没有执行" : "";
+  if (cancelled) {
+    showResult("paused", "批量上传已取消", `${summary}${commandNote}`, stats);
+  } else if (done.length === 0) {
+    showResult("error", "批量上传失败", `${summary}${commandNote}`, stats);
+  } else {
+    showResult("warn", "部分文件上传失败", `${summary}${commandNote}`, stats, false);
+  }
+}
+
+const QUEUE_STATUS_LABEL: Record<QueueItemStatus, string> = {
+  pending: "未开始",
+  running: "传输中",
+  done: "完成",
+  failed: "失败",
+  skipped: "已跳过",
+  cancelled: "已取消",
+};
+
+function renderQueueResultFiles(items: QueueItem[] | null) {
+  if (!items) {
+    resultFiles.classList.add("hidden");
+    resultFiles.replaceChildren();
+    return;
+  }
+  resultFiles.classList.remove("hidden");
+  resultFiles.replaceChildren(
+    ...items.map((item) => {
+      const li = document.createElement("li");
+      li.className = item.status;
+      const mark = document.createElement("span");
+      mark.className = "file-mark";
+      const name = document.createElement("span");
+      name.className = "file-name";
+      name.textContent = fileNameOf(item.local);
+      name.title = item.local;
+      const status = document.createElement("span");
+      status.className = "file-status";
+      status.textContent = item.message ?? QUEUE_STATUS_LABEL[item.status];
+      status.title = status.textContent;
+      li.append(mark, name, status);
+      return li;
+    }),
+  );
 }
 
 function updateAuthFields() {
@@ -1645,8 +1860,10 @@ function refreshLiveVisuals() {
   if (!isTransferring) return;
 
   const verb = runDirection === "download" ? "下载" : "上传";
+  const queuePart = activeQueue ? ` ${activeQueue.index + 1}/${activeQueue.items.length}` : "";
   miniTransferLabel.textContent =
-    phase === "connecting" ? "连接中" : phase === "verifying" ? "校验中" : waiting ? "重连中" : `${verb}中`;
+    (phase === "connecting" ? "连接中" : phase === "verifying" ? "校验中" : waiting ? "重连中" : `${verb}中`) +
+    queuePart;
   const pct = progressTotalBytes > 0 ? (progressTransferredBytes / progressTotalBytes) * 100 : 0;
   miniTransferPct.textContent = `${Math.floor(pct)}%`;
   miniTransferFill.style.width = `${pct}%`;
@@ -1788,7 +2005,7 @@ function scheduleBackgroundProbe() {
 }
 
 async function runBackgroundProbe() {
-  if (isTransferring) return;
+  if (isTransferring || isQueueSelection()) return;
   const localPath = localPathInput.value.trim();
   const remotePath = remotePathInput.value.trim();
   if (!localPath || !remotePath) return;
@@ -1992,15 +2209,22 @@ function stopProgressWatchdog() {
 
 function updateDropZoneState() {
   const path = localPathInput.value.trim();
+  // 路径被程序直接改写（复用历史、恢复断点、手动输入）时，退回单文件选择。
+  if (selectedUploads[0] !== path) selectedUploads = path ? [path] : [];
   const hasPath = path.length > 0;
   dropZone.classList.toggle("has-file", hasPath);
   fileChip.classList.toggle("hidden", !hasPath);
   dropZone.classList.toggle("hidden", hasPath);
+  if (!hasPath) return;
 
-  if (hasPath) {
-    const name = path.split("/").pop() || path.split("\\").pop() || path;
-    fileChipName.textContent = name;
+  if (isQueueSelection()) {
+    fileChipName.textContent = `${selectedUploads.length} 个文件`;
+    fileChipPath.textContent = selectedUploads.map(fileNameOf).join("、");
+    fileChipPath.title = selectedUploads.join("\n");
+  } else {
+    fileChipName.textContent = fileNameOf(path);
     fileChipPath.textContent = path;
+    fileChipPath.title = path;
   }
 }
 
@@ -2044,6 +2268,14 @@ function previewResolvedPath(): string | null {
 function updateResolvedPathHint() {
   // 所有改动远端路径的入口（浏览选择、复用历史、恢复断点）都会走到这里，顺带同步收藏星标。
   updateBookmarkButton();
+  if (isQueueSelection()) {
+    const dir = remotePathInput.value.trim();
+    resolvedPathHint.textContent = dir
+      ? `将依次上传 ${selectedUploads.length} 个文件到：${dir.endsWith("/") ? dir : `${dir}/`}`
+      : "";
+    resolvedPathHint.classList.toggle("hidden", !dir);
+    return;
+  }
   const resolved = previewResolvedPath();
   const remote = remotePathInput.value.trim();
   if (resolved && resolved !== remote && resolved !== localPathInput.value.trim()) {
@@ -2538,14 +2770,11 @@ function setupDragDrop() {
       dropZone.classList.remove("drag-over");
     } else if (event.payload.type === "drop") {
       dropZone.classList.remove("drag-over");
-      const path = event.payload.paths[0];
-      if (path) {
+      const paths = event.payload.paths;
+      if (paths.length > 0) {
         if (currentView !== "compose") showTransferView("compose");
         showPage("transfer");
-        localPathInput.value = path;
-        updateDropZoneState();
-        updateResolvedPathHint();
-        scheduleBackgroundProbe();
+        setSelectedUploads(paths);
       }
     }
   });
@@ -2759,40 +2988,21 @@ document.querySelector("#pickKeyBtn")!.addEventListener("click", async () => {
   }
 });
 
-document.querySelector("#pickFileBtn")!.addEventListener("click", async () => {
-  const selected = await open({
-    multiple: false,
-    directory: isDownloadMode(),
-  });
-  if (typeof selected === "string") {
-    localPathInput.value = isDownloadMode() && !selected.endsWith("/")
-      ? `${selected}/`
-      : selected;
-    updateDropZoneState();
-    updateResolvedPathHint();
-    clearProbeResult();
-    scheduleBackgroundProbe();
+/** 上传可多选（排队依次传）；下载选择的是本地保存目录，只能单选。 */
+async function pickLocalPaths() {
+  const download = isDownloadMode();
+  const selected = await open({ multiple: !download, directory: download });
+  if (selected === null) return;
+  if (download) {
+    const dir = selected as string;
+    setSelectedUploads([dir.endsWith("/") ? dir : `${dir}/`]);
+  } else {
+    setSelectedUploads(Array.isArray(selected) ? selected : [selected]);
   }
-});
+}
 
-changeFileBtn.addEventListener("click", async () => {
-  localPathInput.value = "";
-  updateDropZoneState();
-  updateResolvedPathHint();
-  clearProbeResult();
-  const selected = await open({
-    multiple: false,
-    directory: isDownloadMode(),
-  });
-  if (typeof selected === "string") {
-    localPathInput.value = isDownloadMode() && !selected.endsWith("/")
-      ? `${selected}/`
-      : selected;
-    updateDropZoneState();
-    updateResolvedPathHint();
-    scheduleBackgroundProbe();
-  }
-});
+document.querySelector("#pickFileBtn")!.addEventListener("click", () => void pickLocalPaths());
+changeFileBtn.addEventListener("click", () => void pickLocalPaths());
 
 forceOverwriteInput.addEventListener("change", () => {
   if (lastProbe) updateTransferStatePanel();
@@ -2852,6 +3062,8 @@ transferBtn.addEventListener("click", async () => {
   try {
     if (isDownloadMode()) {
       await startDownloadFlow();
+    } else if (isQueueSelection()) {
+      await startQueueFlow();
     } else {
       await startUploadFlow();
     }
@@ -2870,7 +3082,7 @@ transferBtn.addEventListener("click", async () => {
 
 resultBackBtn.addEventListener("click", () => {
   // 成功后「再传一个」：保留服务器和目标目录，只清掉上一个文件，方便连续传多个文件。
-  if (resultCard.classList.contains("ok") || resultCard.classList.contains("warn")) {
+  if (resultCard.dataset.transferOk === "1") {
     if (isDownloadMode()) remotePathInput.value = remotePathInput.value.replace(/[^/]*$/, "");
     else localPathInput.value = "";
     updateDropZoneState();
@@ -3191,8 +3403,19 @@ async function finishSuccessfulRun(
   }
 }
 
-function showResult(kind: ResultKind, title: string, subtitle: string, stats: RunStats) {
+/**
+ * transferOk：本次的文件是否全部传输成功。「传完但命令失败」仍为 true（下一步是再传一个），
+ * 「批量中部分文件失败」为 false（下一步是重试失败的文件）。两者都显示为警告，但后续操作不同。
+ */
+function showResult(
+  kind: ResultKind,
+  title: string,
+  subtitle: string,
+  stats: RunStats,
+  transferOk = kind === "ok" || kind === "warn",
+) {
   resultCard.className = `result-card ${kind}`;
+  resultCard.dataset.transferOk = transferOk ? "1" : "";
   resultIcon.innerHTML =
     kind === "ok" ? icons.check : kind === "paused" ? icons.pause : icons.alert;
   resultTitle.textContent = title;
@@ -3276,6 +3499,11 @@ function handleProgressUpdate(
     else activeDownloadCheckpoint = null;
     updateTransferStatePanel();
     void loadHistory();
+    // 队列中的单个文件完成：交回调度器继续下一个，不展示单文件结果页。
+    if (resolveQueueStep) {
+      resolveQueueStep({ status: "completed", message, stats });
+      return;
+    }
     // 先让地图播完「全部变绿」的波纹再切结果页：这一刻是整个等待的回报，值得被看到。
     window.setTimeout(() => {
       if (isTransferring) return;
@@ -3292,14 +3520,18 @@ function handleProgressUpdate(
     hideVerifySummary();
     blockMap.setPhase("cancelled");
     statusText.textContent = "";
+    void restoreActiveCheckpoint();
+    void loadHistory();
+    if (resolveQueueStep) {
+      resolveQueueStep({ status: "cancelled", message, stats });
+      return;
+    }
     showResult(
       "paused",
       "已暂停",
       "已传输的部分保存为断点，随时可以从这里继续。",
       stats,
     );
-    void restoreActiveCheckpoint();
-    void loadHistory();
     return;
   }
 
@@ -3321,9 +3553,13 @@ function handleProgressUpdate(
     hideVerifySummary();
     blockMap.setPhase("failed");
     statusText.textContent = "";
-    showResult("error", uploading ? "上传失败" : "下载失败", clarifyTransferError(message), stats);
     void refreshCheckpointFromDisk();
     void loadHistory();
+    if (resolveQueueStep) {
+      resolveQueueStep({ status: "failed", message, stats });
+      return;
+    }
+    showResult("error", uploading ? "上传失败" : "下载失败", clarifyTransferError(message), stats);
     return;
   }
 
