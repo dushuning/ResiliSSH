@@ -19,6 +19,7 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **Recovery:** offer to resume unfinished transfers on launch
 - **Privacy:** per-server "remember password in Keychain" option
 - **i18n:** English and Chinese UI
+- **Internals:** persistent remote file handle + adaptive write size (≈3× faster at 100 ms RTT), Content Security Policy, frontend split into modules, end-to-end tests against a real `sshd`
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
@@ -34,11 +35,8 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 | Item | Why |
 |---|---|
-| Integration tests against a Docker `sshd` in CI | The transfer core is correctness-critical and currently tested by hand |
+| Run the `sshd` end-to-end tests in CI | They exist (`scripts/e2e-sshd.sh`) but only run locally today |
 | Signed & notarized releases, Homebrew cask | Remove Gatekeeper and repeated Keychain prompts |
-| Persistent remote file handle across blocks | Cut ~5 round trips per MB on high-latency links |
-| Split `src/main.ts` into modules | Make the frontend approachable for contributors |
-| Content Security Policy | Defense in depth for the webview |
 
 ## Later / maybe
 

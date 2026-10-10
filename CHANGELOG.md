@@ -22,6 +22,9 @@
 ### Changed
 - Network errors are retried without limit; only errors that reconnecting cannot fix (permissions, paths, host keys, disk full) stop a transfer.
 - Long-running commands no longer block the UI thread; TCP connect has a 20 s timeout; SSH keepalive is sent while hashing large files.
+- Faster transfers on high-latency links: the remote file stays open across blocks, and write slices adapt to the measured speed (about 3× faster at 100 ms RTT).
+- The webview runs under a strict Content Security Policy.
+- Frontend split from a single `main.ts` into focused modules under `src/app/`.
 
 ### Fixed
 - A single failed `stat` could reset upload progress to zero or permanently fail a download.
