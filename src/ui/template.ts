@@ -359,14 +359,14 @@ export function appTemplate(appName: string): string {
           <section class="settings-group">
             <h2>${t("数据与安全")}</h2>
             <div class="settings-row"><span>${t("密码与口令")}</span><span class="settings-value">${t("macOS 钥匙串")}</span></div>
-            <div class="settings-row"><span>${t("已信任的服务器指纹")}</span><code class="settings-value">~/Library/Application Support/sshutil/known_hosts</code></div>
-            <div class="settings-row"><span>${t("断点与历史")}</span><code class="settings-value">~/Library/Application Support/sshutil/</code></div>
-            <div class="settings-row"><span>${t("诊断日志")}</span><code class="settings-value">~/Library/Logs/com.resiliss.desktop/</code></div>
+            <div class="settings-row is-link" data-reveal="known_hosts" role="button" tabindex="0" title="${t("在访达中显示")}"><span>${t("已信任的服务器指纹")}</span><code class="settings-value">~/Library/Application Support/sshutil/known_hosts</code></div>
+            <div class="settings-row is-link" data-reveal="data" role="button" tabindex="0" title="${t("在访达中显示")}"><span>${t("断点与历史")}</span><code class="settings-value">~/Library/Application Support/sshutil/</code></div>
+            <div class="settings-row is-link" data-reveal="logs" role="button" tabindex="0" title="${t("在访达中显示")}"><span>${t("诊断日志")}</span><code class="settings-value">~/Library/Logs/com.resiliss.desktop/</code></div>
           </section>
           <section class="settings-group">
             <h2>${t("关于")}</h2>
             <div class="settings-row"><span>${appName}</span><span class="settings-value" id="appVersion"></span></div>
-            <p class="hint">${t("弱网环境下的单文件 SFTP 传输：断了接着传，传完自动校验。")}</p>
+            <p class="hint">${t("把文件可靠地送到服务器，并确认送到了。")}</p>
           </section>
         </div>
       </section>

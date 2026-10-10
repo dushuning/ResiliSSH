@@ -19,6 +19,7 @@ export const HISTORY_STATUS_LABEL: Record<string, string> = {
   completed: t("完成"),
   failed: t("失败"),
   cancelled: t("已取消"),
+  partial: t("部分成功"),
 };
 
 
@@ -133,8 +134,10 @@ export function renderHistory() {
         : "";
       const meta = `${entry.username}@${entry.host} · ${count}${formatBytes(entry.file_size)} · ${formatTime(entry.finished_at)}${retries}`;
       const chip = document.createElement("span");
-      chip.className = `status-chip ${entry.status}`;
-      chip.textContent = HISTORY_STATUS_LABEL[entry.status] ?? entry.status;
+      const partial = Boolean(batch && entry.status === "failed" && batch.done_count > 0);
+      const status = partial ? "partial" : entry.status;
+      chip.className = `status-chip ${status}`;
+      chip.textContent = HISTORY_STATUS_LABEL[status] ?? entry.status;
       if (entry.message) chip.title = entry.message;
       row.append(
         entryIcon(direction),

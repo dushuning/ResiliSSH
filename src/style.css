@@ -1685,6 +1685,12 @@ input[type="radio"] {
   color: var(--danger-text);
 }
 
+/* 批量里部分文件成功：和全部失败区分开，一眼看出「大部分送到了」。 */
+.status-chip.partial {
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+
 .status-chip.cancelled {
   background: var(--btn-secondary-bg);
   color: var(--text-secondary);
@@ -1723,11 +1729,15 @@ input[type="radio"] {
 
 .log-row {
   display: grid;
-  /* 分类列按最长的英文分类（Permission）留宽，中文两个字也不会显得空 */
+  /* 分类列按最长的英文分类（Permission）留宽；中文分类都是两个字，单独收窄，免得留白挤压正文 */
   grid-template-columns: 62px 16px 78px 1fr;
   align-items: start;
   gap: 8px;
   padding: 3px 14px;
+}
+
+:lang(zh) .log-row {
+  grid-template-columns: 62px 16px 30px 1fr;
 }
 
 .log-row:hover {
@@ -1833,6 +1843,19 @@ input[type="radio"] {
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-top-width: 0;
+}
+
+/* 可点击在访达中打开的路径行 */
+.settings-row.is-link {
+  cursor: pointer;
+}
+
+.settings-row.is-link:hover {
+  background: var(--bg-hover);
+}
+
+.settings-row.is-link:hover .settings-value {
+  color: var(--accent);
 }
 
 .settings-group h2 + .settings-row {

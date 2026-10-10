@@ -41,6 +41,20 @@ rememberSecretsInput.addEventListener("change", updateAuthHintVisibility);
 
 jumpProfileSelect.addEventListener("change", () => updateConnectionSummary());
 copyReceiptBtn.addEventListener("click", () => void copyReceipt());
+// 设置页的路径行：点击（或回车/空格）在访达中显示，方便反馈问题时找到日志。
+document.querySelectorAll<HTMLElement>("[data-reveal]").forEach((row) => {
+  const reveal = () =>
+    invoke("reveal_app_location", { location: row.dataset.reveal }).catch((error) =>
+      console.warn("reveal failed", error),
+    );
+  row.addEventListener("click", reveal);
+  row.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      void reveal();
+    }
+  });
+});
 saveReceiptBtn.addEventListener("click", () => void saveReceipt());
 
 
@@ -565,7 +579,7 @@ async function offerResumeOnLaunch() {
   const more = pending.length > 1 ? t("\n\n另有 1 个未完成的传输，可在「历史」页查看。") : "";
   const resume = await showConfirm(
     t("有未完成的传输"),
-    t("「{name}」已{verb} {percent}%（{done} / {total}），要现在继续吗？", {
+    t("「{name}」已{verb} {percent}%（{done} / {total}）。\n要现在继续吗？", {
       name,
       verb: direction === "download" ? t("下载") : t("上传"),
       percent,

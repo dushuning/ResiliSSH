@@ -568,6 +568,27 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
 }
 
+/// 在访达中显示应用的数据位置（设置页里那几行路径），方便反馈问题时找到日志。
+/// 只接受固定的几种位置而不是任意路径：界面只需要打开这几处，不给网页层留下「打开任意文件」的入口。
+#[tauri::command]
+fn reveal_app_location(app: AppHandle, location: String) -> Result<(), String> {
+    let path = match location.as_str() {
+        "data" => storage::app_data_dir(),
+        "known_hosts" => sftp::app_known_hosts_path(),
+        "logs" => app.path().app_log_dir().map_err(|e| e.to_string())?,
+        other => return Err(format!("unknown location: {other}")),
+    };
+    // 还没生成过（如从未信任过服务器）时退到最近的已存在上级目录，而不是报错。
+    let target = path.ancestors().find(|p| p.exists()).unwrap_or(&path).to_path_buf();
+    let mut command = std::process::Command::new("open");
+    // 文件用 -R 在访达里选中它；目录直接打开。
+    if target.is_file() {
+        command.arg("-R");
+    }
+    command.arg(&target).status().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 批量传输结束时发一条汇总通知（批量中逐个文件不发，见 StartUploadRequest::in_batch）。
 #[tauri::command]
 fn notify_batch_result(app: AppHandle, title: String, body: String) {
@@ -2735,6 +2756,7 @@ pub fn run() {
             remote_paths_exist,
             record_batch_history,
             notify_batch_result,
+            reveal_app_location,
             local_paths_exist,
             local_file_digests,
             save_text_file,

@@ -14,6 +14,7 @@
 - Jump hosts (like `ssh -J`): pick another saved server under “Via” to reach internal servers through a bastion. Multi-hop chains (up to 3), `ProxyJump` from `~/.ssh/config` on import, host keys confirmed hop by hop, and the usual unlimited reconnect/resume. A jump host that forbids forwarding is reported instead of retried forever.
 
 ### Changed
+- UI polish: batches that partly succeeded show an amber “Partly done” in History instead of a red “Failed”; the paths on the Settings page open in Finder; the About text matches the current positioning; the Activity category column is narrower in Chinese; the resume prompt on launch no longer wraps awkwardly.
 - The remote browser hides dotfiles by default, with a remembered “Show hidden files” toggle and a count of what is hidden.
 - Batch transfers show overall progress — bytes done of the total and an estimate for the whole batch — next to “3 / 238”.
 - Batch transfers ask once before starting, with a count of new files and files that will replace existing ones, instead of asking for every existing file (re-uploading a `dist/` folder used to mean hundreds of prompts).

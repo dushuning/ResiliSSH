@@ -20,7 +20,7 @@ pub use client::{
     ConnectionConfig,
     MAX_JUMP_HOPS,
 };
-pub use host_key::{inspect_host_key, trust_host_key, HostKeyInfo};
+pub use host_key::{app_known_hosts_path, inspect_host_key, trust_host_key, HostKeyInfo};
 pub use preflight::{
     bytes_needed, local_free_bytes, local_sha256, remote_free_bytes, remote_sha256,
 };

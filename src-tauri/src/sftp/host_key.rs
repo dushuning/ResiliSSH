@@ -31,7 +31,7 @@ pub struct HostKeyInfo {
     pub key_type: String,
 }
 
-fn app_known_hosts_path() -> PathBuf {
+pub fn app_known_hosts_path() -> PathBuf {
     app_data_dir().join(APP_KNOWN_HOSTS_FILE)
 }
 
