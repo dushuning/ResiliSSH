@@ -1,118 +1,57 @@
-# ResiliSSH 迭代路线图
+# Roadmap
 
-> 产品定位：**弱网环境下，大文件 SFTP 上传/下载能稳定续传，传完能信得过。**  
-> 刻意不做：双栏文件管理器、SSH 终端、批量队列、和 FileZilla 正面竞争。
+> **Positioning:** get files to your server reliably — and know they arrived intact.
+>
+> Every feature should make transfers *more reliable*, *more trustworthy*, or *easier to get right*.
+> Anything that turns ResiliSSH into a file manager, a terminal or a deployment system is out of scope.
 
----
+## Shipped
 
-## 版本概览
+### v1.0.0 — 2026-07
+Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-256 verification, saved connections, history, dark mode.
 
-| 版本 | 说明 | 状态 |
-|------|------|------|
-| **v1.0.0** | 首个正式版：弱网续传上传/下载、校验、深色模式等完整能力 | ✅ 当前 |
+### Unreleased (next: v1.1.0)
+- **Security:** host key verification with fingerprint confirmation; passwords in the macOS Keychain
+- **Reliability:** unlimited reconnect for network errors only; non-blocking UI; connect timeout; keepalive during hashing; verify-only resume; diagnostic log file
+- **Interface:** sidebar layout, block map, activity log, history with resumable transfers
+- **Transfer:** bookmarked/recent remote folders, post-transfer command, multi-file upload queue
+- **i18n:** English and Chinese UI
 
-后续小版本（v1.x）按需迭代；大功能见下方「可选增强」。
+See [CHANGELOG.md](./CHANGELOG.md) for details.
 
----
+## Next
 
-## v1.0.0 功能范围
+Ordered by how directly they serve the positioning.
 
-### 核心传输
+| Item | Why |
+|---|---|
+| Free-space check before upload | Fail in a second instead of at 90% when the remote disk is full |
+| Offer to resume unfinished transfers on launch | Recover from crashes and reboots without hunting through History |
+| Skip identical files (size + SHA-256) | Re-running a batch shouldn't re-send what's already there |
+| Multi-file download | Symmetry with the upload queue |
+| Recursive folder upload | Keep directory structure; reuse the queue |
 
-- [x] 单文件 SFTP 上传 / 下载
-- [x] 1MB 块对齐续传
-- [x] 弱网自动重试（指数退避 1s → 15s）
-- [x] 断点 JSON（上传 / 下载各一份）
-- [x] 远端 / 本地路径目录自动拼接文件名
-- [x] 取消传输（socket shutdown 打断阻塞 IO）
-- [x] 关窗确认（传输进行中）
+## Project health (before wider release)
 
-### 完整性
+| Item | Why |
+|---|---|
+| Integration tests against a Docker `sshd` in CI | The transfer core is correctness-critical and currently tested by hand |
+| Signed & notarized releases, Homebrew cask | Remove Gatekeeper and repeated Keychain prompts |
+| Persistent remote file handle across blocks | Cut ~5 round trips per MB on high-latency links |
+| Split `src/main.ts` into modules | Make the frontend approachable for contributors |
+| Content Security Policy | Defense in depth for the webview |
 
-- [x] 传完 SHA-256 校验
-- [x] 续传前块边界内容校验
-- [x] 本地文件 size / mtime 变更检测
-- [x] 弱网可靠模式逐块读回校验 + verified_bytes
-- [x] 完成后校验摘要（前端 + 后端事件）
+## Later / maybe
 
-### 连接
+ProxyJump (bastion hosts) · bandwidth limit · keep running from the menu bar · export a verification report · Windows & Linux builds (Tauri supports them; needs testing and packaging).
 
-- [x] 密码 + 私钥认证
-- [x] 读取 `~/.ssh/config` Host
-- [x] 连接保存 profiles（不存密码）
-- [x] 测试连接
-- [x] 远端目录 / 文件浏览
+## Out of scope
 
-### 体验
+These are deliberate non-goals — good tools already exist for them:
 
-- [x] 上传历史（最近 30 条）
-- [x] 拖拽选文件
-- [x] macOS 系统通知
-- [x] 重试 / stall 状态徽章与进度细节
-- [x] 45s stall watchdog + UI 无响应提示
-- [x] 传输前远端 / 本地 probe 预检
-- [x] 传输模式：弱网可靠 / 快速
-- [x] 强制覆盖 + 应用内确认框
-- [x] 连接区 / 传输选项折叠
-- [x] 深色模式（系统 / 浅 / 深）
-- [x] 底部数据流动画（随网速 / 重连暂停）
-- [x] 传输中表单锁定、取消按钮优化
+- Dual-pane file manager / FileZilla replacement
+- SSH terminal, port forwarding
+- Deployment orchestration: multi-server fan-out, pipelines, watching folders for changes
+- Two-way sync
 
----
-
-## 发布与分发（v1.0.0）
-
-| 项 | 说明 | 状态 |
-|----|------|------|
-| README / ROADMAP / LICENSE | 文档齐全 | ✅ |
-| 版本号 v1.0.0 | 首个正式版 | ✅ |
-| GitHub 公开仓库 | `ResiliSSH` · MIT | ✅ 文档就绪 |
-| Release 构建 `.dmg` | `npm run app` + tag `v1.0.0` | 🔲 |
-| 代码签名 & 公证 | 可选，减少 Gatekeeper 拦截 | 🔲 |
-| 演示截图 / 录屏 | README 展示 | 🔲 |
-
-### 真机验证清单（建议发布前自测）
-
-- [ ] 大 jar 弱网续传后 `unzip -t` 无 CRC 错误
-- [ ] 从块边界续传（非 0 开始）
-- [ ] 连接暂时失败后持续重试不放弃
-- [ ] 取消后尽快响应
-- [ ] 上传 / 下载对称场景
-- [ ] config 选 Host → 保存 → 下拉里可选
-
----
-
-## 可选增强（v1.1+）
-
-| 项 | 说明 | 优先级 |
-|----|------|--------|
-| 密码 / 口令进钥匙串 | 续传不用重输 | P1 |
-| 传输历史可展开 | 点选复用路径 | P2 |
-| 弱网块大小可配置 | 256KB 等 | P2 |
-| 可折叠诊断日志 | 排查弱网重试 | P3 |
-| 快捷键 | ⌘O 选文件、⌘↩ 开始 | P3 |
-| ProxyJump 等复杂 SSH config | 后期 | P3 |
-| Windows / Linux 移植 | Tauri 跨平台，需单独测试发布 | 低 |
-
----
-
-## 明确不做
-
-- 双栏 SFTP 文件管理器
-- SSH 终端、端口转发
-- 批量上传队列
-- 和完整 SFTP 客户端正面竞争
-
----
-
-## 已知问题 / 技术债
-
-1. **进度按 1MB 跳变**：单块写入慢时，界面可能较长时间不变；已有 stall 检测与「等待响应」提示。
-2. **TCP 读/写超时 90s**：stall 检测（45s）会先触发。
-3. **SSH 操作超时 30s**：依赖 libssh2，极弱网慢速写入时不一定及时触发。
-4. **密码不持久化**：断点续传需重新输入密码 / 私钥口令（钥匙串待做）。
-5. **`main.ts` 单体较大**：后续可按模块拆分，不影响功能。
-
----
-
-*最后更新：2026-07-07*
+Issues and pull requests that fit the positioning are very welcome. For anything on the "Next" list, comment on (or open) an issue so we don't duplicate work.

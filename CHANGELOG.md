@@ -2,6 +2,29 @@
 
 本项目的版本记录。ResiliSSH 以 **v1.0.0** 作为首个对外正式版。
 
+## [Unreleased]
+
+### Added
+- Host key verification: unknown servers require fingerprint confirmation; changed keys are refused. Trusted keys are stored in the app's own `known_hosts`; `~/.ssh/known_hosts` is read, never modified.
+- Passwords and key passphrases are stored in the macOS Keychain (existing plaintext entries in `profiles.json` are migrated automatically) and read only when needed.
+- New sidebar interface (Transfer / Servers / History / Activity / Settings) with a live block map, result page and unfinished-transfer list.
+- Activity log: connection, auth, host key, network, permission, transfer, verification and command events, filterable and copyable.
+- Bookmarked and recent remote folders per server.
+- Post-transfer command with safely shell-quoted variables (`{remote_dir}` `{file_name}` `{remote_path}` `{files}`).
+- Multi-file upload queue; the post-transfer command runs once after all files succeed.
+- English UI and language setting; backend messages follow the UI language.
+- Diagnostic log file under `~/Library/Logs/com.resiliss.desktop/`.
+
+### Changed
+- Network errors are retried without limit; only errors that reconnecting cannot fix (permissions, paths, host keys, disk full) stop a transfer.
+- Long-running commands no longer block the UI thread; TCP connect has a 20 s timeout; SSH keepalive is sent while hashing large files.
+
+### Fixed
+- A single failed `stat` could reset upload progress to zero or permanently fail a download.
+- "Retry verification only" re-transferred the whole file.
+- Transfer direction could be switched mid-transfer, and double-clicking Start could mark a running transfer as failed.
+- Repeated Keychain authorization prompts on launch.
+
 ## [1.0.0] - 2026-07-07
 
 首个正式版（macOS）。

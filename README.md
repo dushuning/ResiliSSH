@@ -1,182 +1,151 @@
-# ResiliSSH
+<p align="center">
+  <img src="public/app-logo.png" width="96" height="96" alt="ResiliSSH logo" />
+</p>
 
-**macOS 上的弱网 SFTP 单文件传输工具** — 大文件断了接着传，传完自动校验。
+<h1 align="center">ResiliSSH</h1>
 
-**当前版本：v1.0.0**（首个正式版）
+<p align="center">
+  <b>Get files to your server reliably — and know they arrived intact.</b><br />
+  A focused SFTP transfer app for macOS: resumes after any interruption, verifies every byte.
+</p>
 
-> 产品定位：弱网环境下，大文件 SFTP 上传/下载能稳定续传，传完能信得过。  
-> 刻意不做：双栏文件管理器、SSH 终端、批量队列。
+<p align="center">
+  English · <a href="./README.zh-CN.md">简体中文</a>
+</p>
 
-个人开源项目，主要在 macOS 弱网环境下传大文件使用。欢迎 Star / Issue / PR，不保证及时回复。
+<p align="center">
+  <img src="docs/screenshots/en-transfer.png" width="720" alt="Transfer in progress: block map showing resumed data, verified blocks and reconnect points" />
+</p>
 
-**GitHub 仓库：** [dushuning/ResiliSSH](https://github.com/dushuning/ResiliSSH)（公开 · MIT）
+## Why
 
----
+Copying a large file over SFTP sounds trivial until the VPN drops at 87%, the hotel Wi‑Fi stalls for a minute, or you're left wondering whether the file on the server is actually the file you sent.
 
-## 功能特性
+ResiliSSH treats every transfer as something that **must finish correctly**:
 
-### 传输
+- **It never gives up on the network.** Timeouts, resets and stalls trigger automatic reconnection with backoff, forever — until the transfer completes or you cancel.
+- **It never starts over.** Progress is checkpointed in 1 MB blocks. After a crash, a reboot or a cancel, the next run continues from the last verified block.
+- **It proves the result.** In *Reliable* mode every block is read back and compared after writing; every transfer ends with a full SHA-256 comparison of local and remote files.
 
-- 单文件 **上传 / 下载**，支持切换方向
-- **1MB 块对齐**断点续传（避免半块脏数据）
-- 弱网 **自动重连重试**（指数退避 1s → 15s，直到完成或用户取消）
-- 45s 无进度 **卡住检测** + socket 中断重连
-- 传输模式：**弱网可靠**（逐块读回校验）/ **快速传输**
-- 可选 **强制从头覆盖**（忽略断点）
-- 传输中可 **取消**；关闭窗口会提示确认
+## Features
 
-### 完整性
+**Transfer**
+- Upload and download single files or **queue several uploads** at once (drag them in)
+- Block-level resume with integrity check at the resume boundary
+- Two modes: *Reliable* (read back every block) and *Fast* (verify once at the end)
+- A live **block map** shows what was resumed, what's verified, where the connection dropped
+- **Then run** — optionally execute a command on the server after a verified upload (e.g. `sudo systemctl restart app`), with `{remote_dir}` `{file_name}` `{remote_path}` `{files}` variables safely shell-quoted
 
-- 传完 **SHA-256 全文件校验**（本地 vs 远端）
-- 弱网可靠模式下每块写完后读回校验，维护 `verified_bytes`
-- 续传前块边界内容校验；本地文件变更会提示清断点
-- 完成后显示 **校验摘要**
+**Trust & security**
+- **Host key verification** against `~/.ssh/known_hosts`; unknown hosts must be confirmed by fingerprint, changed keys are refused
+- Passwords and key passphrases live in the **macOS Keychain**, never in config files
+- Private keys stay where they are; `ssh-agent` is supported
 
-### 连接
+**Everyday comfort**
+- Saved servers, import from `~/.ssh/config`, connection test
+- Bookmarked and recent remote folders per server
+- History with one-click reuse; unfinished transfers listed with a *Resume* button
+- **Activity log**: every connect, auth, reconnect, permission error and verification step, filterable and copyable
+- macOS notifications, light/dark theme, English and Chinese UI
 
-- 密码 / SSH 私钥认证
-- 读取 `~/.ssh/config` 中的 Host，一键填充
-- **保存连接**（`profiles.json`，不存密码）
-- **测试连接**（SSH + SFTP）
-- 远端 **目录 / 文件浏览**（选择保存路径）
+<table>
+  <tr>
+    <td><img src="docs/screenshots/en-compose.png" alt="Composing a transfer" /></td>
+    <td><img src="docs/screenshots/en-result.png" alt="Verified upload followed by a restart command" /></td>
+  </tr>
+  <tr>
+    <td align="center">Pick a server, a file and a destination</td>
+    <td align="center">Verified, then the service restarted</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/en-activity.png" alt="Activity log" /></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">The activity log tells you exactly what happened</td>
+  </tr>
+</table>
 
-### 体验
+## What it is not
 
-- 拖拽选文件、精确字节进度、实时网速与 ETA
-- 状态徽章（上传中 / 重连中 / 等待响应 / 校验中等）
-- 传输历史（最近 30 条）
-- 完成 / 失败 **macOS 系统通知**
-- **深色模式**（跟随系统 / 浅色 / 深色）
-- 连接区、传输选项可折叠
+ResiliSSH deliberately stays small. It is **not**:
 
----
+- a dual-pane file manager or a FileZilla replacement
+- an SSH terminal or port-forwarding tool
+- a deployment / CI system (no multi-server fan-out, no pipelines, no folder watching)
 
-## 系统要求
+If you need those, great tools already exist. ResiliSSH does one job: getting files there, intact.
 
-- **macOS**（Apple Silicon / Intel）
-- 暂不支持 Windows / Linux 安装包（核心 Rust 代码可移植，但未测试发布）
+## How it compares
 
----
+| | ResiliSSH | scp | rsync -P | Typical SFTP client |
+|---|---|---|---|---|
+| Automatic reconnect & resume | ✅ unlimited | ❌ | manual re-run | varies |
+| Per-block read-back verification | ✅ | ❌ | ❌ | rare |
+| Whole-file check after transfer | ✅ SHA-256 | ❌ | ✅ built-in checksum | rarely |
+| Host key confirmation UI | ✅ | terminal prompt | terminal prompt | ✅ |
+| Learning curve | fill a form | CLI | CLI | feature-heavy |
 
-## 安装
+## Install
 
-### 方式一：从源码构建
+**Requirements:** macOS on Apple Silicon or Intel. Developed and tested on recent macOS releases; older versions are untested.
+
+### Download
+
+Grab the latest `.dmg` from [Releases](https://github.com/dushuning/ResiliSSH/releases) and drag ResiliSSH into Applications.
+
+> Builds are not notarized yet. If macOS blocks the first launch, right-click the app and choose **Open**. Until builds are signed, macOS may also ask once per build to allow Keychain access — choose **Always Allow**.
+
+### Build from source
 
 ```bash
 git clone https://github.com/dushuning/ResiliSSH.git
 cd ResiliSSH
 npm install
-npm run app          # Release 构建
-# 或
-npm run app:debug    # Debug 构建（更快，体积更大）
+npm run app            # release build → src-tauri/target/release/bundle/
 ```
 
-构建产物：
+## Usage
 
-```text
-src-tauri/target/release/bundle/macos/ResiliSSH.app
-src-tauri/target/release/bundle/dmg/ResiliSSH_*.dmg
-```
+1. **Servers** — add a server or import one from `~/.ssh/config`, then *Test connection*. The first connection asks you to confirm the server's fingerprint.
+2. **Transfer** — choose the server, drop one or more files, set the remote folder (end with `/`).
+3. Optionally fill in **Then run** with a command to execute after a successful upload.
+4. Press **Start upload** (⌘↩). If the network drops, just wait — it reconnects and resumes on its own.
+5. Closed the app mid-transfer? Open **History** and press **Resume**.
 
-将 `ResiliSSH.app` 拖入「应用程序」即可。未签名的本地构建首次打开若被拦截，请 **右键 → 打开**。
+Keyboard: ⌘1–⌘5 switch pages, ⌘O picks a file, ⌘↩ starts.
 
-### 方式二：GitHub Releases
+## Where your data lives
 
-在 [Releases](https://github.com/dushuning/ResiliSSH/releases) 下载最新 `.dmg`（如 `ResiliSSH_1.0.0_aarch64.dmg`），打开后拖入「应用程序」。
+| What | Where |
+|---|---|
+| Passwords & passphrases | macOS Keychain (service `com.resiliss.desktop`) |
+| Saved servers, checkpoints, history (last 30) | `~/Library/Application Support/sshutil/` |
+| Host keys you trusted in the app | `~/Library/Application Support/sshutil/known_hosts` (your `~/.ssh/known_hosts` is read, never modified) |
+| Diagnostic logs | `~/Library/Logs/com.resiliss.desktop/` |
 
-未签名构建首次打开若被拦截，请 **右键 → 打开**。
+ResiliSSH has no telemetry and makes no network connections other than to the servers you configure.
 
----
+## Development
 
-## 开发
-
-### 环境
-
-- [Rust](https://www.rust-lang.org/tools/install)（stable）
-- Node.js 18+
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-### 常用命令
+Prerequisites: [Rust](https://www.rust-lang.org/tools/install) (stable) and Node.js 18+.
 
 ```bash
 npm install
-npm run tauri dev    # 开发模式（热更新）
-npm run build        # 仅构建前端
-npm run app          # 打包 macOS 应用
-npm run icon         # 从 logo 重新生成图标（需项目内脚本环境）
+npm run tauri dev       # run with hot reload
+npm run check:i18n      # every UI string has an English translation
+cd src-tauri && cargo test
 ```
 
----
+| Layer | Tech |
+|---|---|
+| Shell | [Tauri 2](https://tauri.app/) |
+| Backend | Rust · [ssh2](https://crates.io/crates/ssh2) (libssh2, vendored OpenSSL) · keyring |
+| Frontend | TypeScript · Vite, no framework |
 
-## 使用说明
+**Translations** use the Chinese source text as the key (gettext style): `t("开始上传")` → `src/i18n/en.ts`. To add a language, add a dictionary next to `en.ts`; backend messages use `tr!(zh, en)` in `src-tauri/src/i18n.rs`.
 
-1. 展开 **连接设置**：从 `~/.ssh/config` 选 Host，或手动填写主机 / 端口 / 用户名
-2. 选择认证方式（私钥或密码），可 **测试连接**
-3. 选择 **上传** 或 **下载**
-4. 填写本地路径与远端路径（目录以 `/` 结尾时会自动拼接文件名）
-5. 在 **传输选项** 中选择模式（弱网可靠 / 快速）与外观
-6. 点击 **开始上传** 或 **开始下载**
-7. 网络中断时会自动重试续传；点击 **取消** 可停止（已传部分保留为断点）
-8. 完成后查看 **校验摘要**；失败或取消后断点保留，下次需重新输入密码 / 私钥口令
+Contributions are welcome — please open an issue to discuss larger changes first. See [ROADMAP.md](./ROADMAP.md) for direction and [CHANGELOG.md](./CHANGELOG.md) for history.
 
----
-
-## 本地数据文件
-
-数据目录（macOS）：
-
-```text
-~/Library/Application Support/sshutil/
-```
-
-| 文件 | 说明 |
-|------|------|
-| `upload-checkpoint.json` | 上传断点 |
-| `download-checkpoint.json` | 下载断点 |
-| `profiles.json` | 已保存的连接（不含密码） |
-| `upload-history.json` | 传输历史（最近 30 条） |
-
----
-
-## 技术栈
-
-| 层 | 技术 |
-|----|------|
-| 桌面壳 | [Tauri 2](https://tauri.app/) |
-| 后端 | Rust · [ssh2](https://crates.io/crates/ssh2)（SFTP）·  vendored OpenSSL |
-| 前端 | TypeScript · Vite |
-| 存储 | JSON 文件（无 SQLite） |
-
----
-
-## 与 FileZilla / scp / rsync 的区别
-
-| | ResiliSSH | scp | rsync -P | 通用 SFTP 客户端 |
-|---|-----------|-----|----------|------------------|
-| 弱网自动重试 | ✅ 核心能力 | ❌ | 需自己脚本 | 体验因工具而异 |
-| 块级 verified 续传 | ✅ | ❌ | 部分 | 少见 |
-| 传完 SHA-256 校验 | ✅ | ❌ | 需自行校验 | 一般无 |
-| 上手成本 | 填表即用 | 命令行 | 命令行 | 功能多、偏重 |
-
----
-
-## 路线图
-
-详见 [ROADMAP.md](./ROADMAP.md)。版本历史见 [CHANGELOG.md](./CHANGELOG.md)。
-
----
-
-## 许可证
+## License
 
 [MIT](./LICENSE)
-
----
-
-## 说明
-
-- 应用显示名：**ResiliSSH**（`com.resiliss.desktop`）
-- 本地开发目录若仍为 `sshutil`，与 GitHub 仓库名 `ResiliSSH` 不一致无影响
