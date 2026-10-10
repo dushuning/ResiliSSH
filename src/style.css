@@ -1365,6 +1365,14 @@ input[type="radio"] {
   overflow: hidden;
 }
 
+/* 窄窗口下把宽度让给编辑表单：列表里的长名称本来就会省略显示，表单里的主机名却需要看全。 */
+@media (max-width: 860px) {
+  .servers-layout {
+    grid-template-columns: 180px 1fr;
+    gap: 18px;
+  }
+}
+
 .server-list-pane {
   display: flex;
   flex-direction: column;
@@ -1470,7 +1478,8 @@ input[type="radio"] {
 
 .host-port {
   display: grid;
-  grid-template-columns: 1fr auto 86px;
+  /* 端口最多 5 位数字，78px（含输入框内边距）刚好放下；多出的宽度留给主机名 */
+  grid-template-columns: 1fr auto 78px;
   align-items: center;
   gap: 6px;
 }
@@ -1642,8 +1651,9 @@ input[type="radio"] {
 }
 
 .history-row {
+  position: relative;
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 12px;
   padding: 9px 14px;
@@ -1658,13 +1668,35 @@ input[type="radio"] {
   background: var(--bg-hover);
 }
 
-.history-row .btn {
+/*
+ * 「复用」按钮（或「无法复用」说明）只在悬停时浮在行尾、盖住状态标签，平时不占宽度：
+ * 占位隐藏会让说明文字（大小、重连次数）无谓地被截断。
+ */
+.history-row .btn,
+.history-row .entry-note {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
   visibility: hidden;
 }
 
+.history-row .entry-note {
+  padding: 4px 8px;
+  border-radius: var(--radius-s);
+  background: var(--bg-hover);
+}
+
 .history-row:hover .btn,
+.history-row:hover .entry-note,
 .history-row .btn:focus-visible {
   visibility: visible;
+}
+
+/* 按钮背景是半透明的，叠在状态标签上会两段文字重影：悬停（或键盘聚焦按钮）时让出位置 */
+.history-row:hover .status-chip,
+.history-row:has(.btn:focus-visible) .status-chip {
+  visibility: hidden;
 }
 
 .status-chip {

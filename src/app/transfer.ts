@@ -6,7 +6,7 @@ import { BACKEND_TEXT, clarifyTransferError, matchesBackend } from "./backendTex
 import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { TRANSFER_LOCK_SELECTORS, UI_STALL_WARN_MS } from "./constants";
-import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, forceOverwriteInput, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, verifySummary, viewLogBtn } from "./dom";
+import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, forceOverwriteInput, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
 import { describeError, formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
 import { isQueueSelection, updateResolvedPathHint } from "./paths";
@@ -142,6 +142,9 @@ export function updateTransferButtonLabel() {
 
 export function updateTransferDirectionUI() {
   const download = isDownloadMode();
+  // 字段顺序跟着传输方向走（从哪来 → 到哪去）：下载时远端文件在前、保存位置在后，填写时不用倒着想。
+  if (download) localField.before(remoteField);
+  else remoteField.before(localField);
   localPathLabel.textContent = download ? t("保存到") : t("本地文件");
   remotePathLabel.textContent = download ? t("远端文件") : t("远端路径");
   localPathInput.placeholder = download

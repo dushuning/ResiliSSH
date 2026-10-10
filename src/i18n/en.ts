@@ -324,7 +324,6 @@ export const en: Record<string, string> = {
   "关闭": "Close",
   "在钥匙串中记住密码与口令": "Remember password & passphrase in Keychain",
   "不保存密码：只在本次运行中使用，下次选择该服务器时需要重新输入": "Not saved: used for this session only — you'll be asked again next time",
-  "「{name}」设置为不保存密码，请输入密码后连接": "“{name}” doesn't save its password — enter it to connect",
   "，密码不保存（仅本次使用）": ", password not saved (this session only)",
   "远端 SHA-256 与本地一致": "Remote SHA-256 matches local",
   "远端已是最新": "Already up to date",

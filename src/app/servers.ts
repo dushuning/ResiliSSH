@@ -97,10 +97,8 @@ export async function applyProfile(profile: ConnectionProfile) {
       setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "ok");
       return;
     }
-    setConnectionStatus(
-      t("「{name}」设置为不保存密码，请输入密码后连接", { name: profile.name }),
-      "normal",
-    );
+    // 「不保存密码、需要输入」已由密码框下方的说明讲清楚，这里不再重复一遍。
+    setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "normal");
     return;
   }
   // 用户主动选择服务器时才读钥匙串：此时弹出系统授权框是可预期的。

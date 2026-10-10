@@ -85,7 +85,7 @@ export function appTemplate(appName: string): string {
               <button class="btn btn-link hidden" id="clearCheckpointBtn" type="button">${t("清除断点")}</button>
             </div>
 
-            <div class="field">
+            <div class="field" id="localField">
               <div class="field-label"><label for="localPath" id="localPathLabel">${t("本地文件")}</label></div>
               <div id="fileChip" class="file-chip hidden">
                 <span class="file-chip-icon">${icons.file}</span>
@@ -105,7 +105,7 @@ export function appTemplate(appName: string): string {
               </div>
             </div>
 
-            <div class="field">
+            <div class="field" id="remoteField">
               <div class="field-label">
                 <label for="remotePath" id="remotePathLabel">${t("远端路径")}</label>
                 <span class="field-hint" id="pathHint"></span>
@@ -248,6 +248,11 @@ export function appTemplate(appName: string): string {
               <label for="username">${t("用户名")}</label>
               <input id="username" placeholder="root" spellcheck="false" />
 
+              <label for="jumpProfile">${t("经由")}</label>
+              <select id="jumpProfile" title="${t("内网服务器只能经堡垒机访问时，选择作为跳板机的已保存服务器（相当于 ssh -J）")}">
+                <option value="">${t("直接连接")}</option>
+              </select>
+
               <label for="authType">${t("认证方式")}</label>
               <select id="authType">
                 <option value="key">${t("私钥")}</option>
@@ -269,10 +274,6 @@ export function appTemplate(appName: string): string {
                 <input id="password" type="password" />
               </div>
 
-              <label for="jumpProfile">${t("经由")}</label>
-              <select id="jumpProfile" title="${t("内网服务器只能经堡垒机访问时，选择作为跳板机的已保存服务器（相当于 ssh -J）")}">
-                <option value="">${t("直接连接")}</option>
-              </select>
             </div>
             <label class="checkbox remember-row" id="rememberRow">
               <input type="checkbox" id="rememberSecrets" checked />

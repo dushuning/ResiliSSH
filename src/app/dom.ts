@@ -284,3 +284,5 @@ export const remoteBrowseShowHidden = document.querySelector<HTMLInputElement>("
 export const onboarding = document.querySelector<HTMLElement>("#onboarding")!;
 export const onboardingDetail = document.querySelector<HTMLElement>("#onboardingDetail")!;
 export const onboardingActions = document.querySelector<HTMLElement>("#onboardingActions")!;
+export const localField = document.querySelector<HTMLElement>("#localField")!;
+export const remoteField = document.querySelector<HTMLElement>("#remoteField")!;
