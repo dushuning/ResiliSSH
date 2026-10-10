@@ -1,4 +1,10 @@
 use super::errors::is_permanent_sftp_error;
+use super::transfer_common::{
+    align_down, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
+    increment_retry_count, sha256_bytes, sha256_local_file, sha256_remote_file,
+    should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
+    HASH_READ_BUFFER_SIZE, hex_encode,
+};
 use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
@@ -9,13 +15,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-/// 固定块大小：续传时回退到块边界，避免“半块”脏数据（你遇到的 33556504 正是此类问题）。
-const CHUNK_SIZE: u64 = 1024 * 1024;
-const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
 /// 写入分片大小的上下限。libssh2 会把单次写入的数据流水线发送，分片越大，每个往返在途的数据越多：
 /// 实测 100 ms 往返延迟下 5 MB 上传，64 KB 分片 12.5 s、256 KB 6.0 s、1 MB 4.2 s。
 /// 但进度只在每个分片写完时刷新，慢速链路上大分片会让进度条长时间不动、被误判为无响应，
@@ -100,6 +101,37 @@ impl std::error::Error for UploadError {
 impl From<ConnectError> for UploadError {
     fn from(err: ConnectError) -> Self {
         UploadError::Connect(err)
+    }
+}
+
+impl TransferError for UploadError {
+    fn cancelled() -> Self {
+        UploadError::Cancelled
+    }
+    fn sftp(detail: String) -> Self {
+        UploadError::Sftp(detail)
+    }
+    fn local_io(detail: String) -> Self {
+        UploadError::LocalIo(detail)
+    }
+}
+
+impl TransferCheckpoint for UploadCheckpoint {
+    type Error = UploadError;
+    fn transferred_bytes(&self) -> u64 {
+        self.uploaded_bytes
+    }
+    fn verified_bytes(&self) -> u64 {
+        self.verified_bytes
+    }
+    fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+    fn set_retry_count(&mut self, count: u32) {
+        self.retry_count = count;
+    }
+    fn mark_failed(&mut self) {
+        self.status = CheckpointStatus::Failed;
     }
 }
 
@@ -350,7 +382,7 @@ pub fn upload_with_resume(
                     };
                     log::warn!("upload retry #{retry_count}: {message}");
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                    sleep_backoff(&cancel_flag, backoff_ms)?;
+                    sleep_backoff::<UploadError>(&cancel_flag, backoff_ms)?;
                     backoff_ms = next_backoff_ms(backoff_ms);
                     continue;
                 }
@@ -458,7 +490,7 @@ pub fn upload_with_resume(
                 );
                 log::warn!("upload retry #{retry_count}: {message}");
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                sleep_backoff(&cancel_flag, backoff_ms)?;
+                sleep_backoff::<UploadError>(&cancel_flag, backoff_ms)?;
                 backoff_ms = next_backoff_ms(backoff_ms);
             }
         }
@@ -526,126 +558,6 @@ fn verify_upload_integrity(
     Ok(current_retry_count(checkpoint))
 }
 
-/// 哈希大文件可能要几十秒，期间 SSH 连接上没有任何流量；顺带发 keepalive，
-/// 防止 NAT/防火墙或服务器 ClientAlive 把空闲连接掐掉，导致随后读远端时又得重连。
-fn sha256_local_file(
-    session: &Session,
-    path: &Path,
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
-) -> Result<[u8; 32], UploadError> {
-    let mut file = File::open(path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-    loop {
-        ensure_not_cancelled(cancel_flag, checkpoint)?;
-        // keepalive_send 内部按 set_keepalive 的间隔节流，每轮调用并不会真的每次发包。
-        if let Err(e) = session.keepalive_send() {
-            log::debug!("keepalive during local hash failed: {e}");
-        }
-        let read_bytes = file
-            .read(&mut buffer)
-            .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-        if read_bytes == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read_bytes]);
-    }
-    Ok(hasher.finalize().into())
-}
-
-fn sha256_remote_file(
-    sftp: &Sftp,
-    remote_path: &str,
-    size: u64,
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
-) -> Result<[u8; 32], UploadError> {
-    let mut remote_file = sftp
-        .open_mode(
-            Path::new(remote_path),
-            OpenFlags::READ,
-            0,
-            OpenType::File,
-        )
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-    let mut remaining = size;
-
-    while remaining > 0 {
-        ensure_not_cancelled(cancel_flag, checkpoint)?;
-
-        let to_read = (buffer.len() as u64).min(remaining) as usize;
-        let read_bytes = remote_file
-            .read(&mut buffer[..to_read])
-            .map_err(|e| UploadError::Sftp(e.to_string()))?;
-        if read_bytes == 0 {
-            return Err(UploadError::Sftp(
-                crate::tr!(
-                    "读取远端文件用于校验时意外结束",
-                    "Remote file ended unexpectedly while reading for verification"
-                )
-                .into(),
-            ));
-        }
-        hasher.update(&buffer[..read_bytes]);
-        remaining -= read_bytes as u64;
-    }
-
-    Ok(hasher.finalize().into())
-}
-
-fn should_skip_full_file_hash(
-    strict_chunk_verify: &AtomicBool,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
-    local_size: u64,
-) -> Result<bool, UploadError> {
-    if !strict_chunk_verify.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-    let cp = checkpoint
-        .lock()
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    Ok(cp.verified_bytes == local_size && cp.uploaded_bytes >= local_size)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn ensure_not_cancelled(
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
-) -> Result<(), UploadError> {
-    if cancel_flag.load(Ordering::Relaxed) {
-        checkpoint
-            .lock()
-            .map_err(|e| UploadError::Sftp(e.to_string()))?
-            .status = CheckpointStatus::Failed;
-        return Err(UploadError::Cancelled);
-    }
-    Ok(())
-}
-
-fn increment_retry_count(checkpoint: &Arc<Mutex<UploadCheckpoint>>) -> Result<u32, UploadError> {
-    let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
-    cp.retry_count = cp.retry_count.saturating_add(1);
-    Ok(cp.retry_count)
-}
-
-fn current_retry_count(checkpoint: &Arc<Mutex<UploadCheckpoint>>) -> u32 {
-    checkpoint
-        .lock()
-        .map(|cp| cp.retry_count)
-        .unwrap_or(0)
-}
-
-fn align_down(offset: u64) -> u64 {
-    offset - (offset % CHUNK_SIZE)
-}
-
 /// 给定断点可信续传位置与远端实际字节数，返回安全的续传偏移。
 /// 远端不少于可信位置时直接用可信位置；否则夹紧到远端块对齐位置——
 /// 否则续传边界校验会 read_exact 读过远端 EOF，抛出非永久错误而无限重连死循环。
@@ -658,19 +570,6 @@ fn safe_resume_offset(trusted: u64, remote_size: u64) -> u64 {
 }
 
 
-
-fn sleep_backoff(cancel_flag: &Arc<AtomicBool>, backoff_ms: u64) -> Result<(), UploadError> {
-    let step_ms = 200_u64;
-    let mut waited = 0_u64;
-    while waited < backoff_ms {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(UploadError::Cancelled);
-        }
-        thread::sleep(Duration::from_millis(step_ms));
-        waited += step_ms;
-    }
-    Ok(())
-}
 
 fn truncate_remote_file(sftp: &Sftp, remote_path: &str, size: u64) -> Result<(), UploadError> {
     let stat = FileStat {
@@ -761,24 +660,6 @@ fn verify_resume_boundary(
 
     log::info!("resume boundary verified at offset {resume_offset}");
     Ok(())
-}
-
-fn effective_verified_bytes(cp: &UploadCheckpoint) -> u64 {
-    if cp.verified_bytes > 0 {
-        return cp.verified_bytes;
-    }
-    if cp.uploaded_bytes > 0 {
-        return align_down(cp.uploaded_bytes);
-    }
-    0
-}
-
-/// 直接对内存字节求 SHA-256。上传时本地块内容已在缓冲区里（刚从本地文件读入），
-/// 无需再打开+读一遍本地文件即可与远端读回结果比对。
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
 }
 
 /// 在已打开的句柄上读回 [offset, offset+len) 并计算 SHA-256（不重新打开文件）。

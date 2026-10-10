@@ -7,6 +7,7 @@ pub use errors::is_remote_path_message;
 mod host_key;
 mod preflight;
 mod remote_command;
+mod transfer_common;
 mod upload;
 
 pub use browse::{create_remote_directory, list_remote_directory, RemoteDirListing};

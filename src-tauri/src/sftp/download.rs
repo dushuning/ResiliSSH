@@ -1,4 +1,10 @@
 use super::errors::is_permanent_sftp_error;
+use super::transfer_common::{
+    align_down, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
+    increment_retry_count, sha256_bytes, sha256_local_file, sha256_remote_file,
+    should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
+    HASH_READ_BUFFER_SIZE,
+};
 use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use crate::checkpoint::CheckpointStatus;
 use crate::download_checkpoint::{save_download_checkpoint, DownloadCheckpoint};
@@ -11,11 +17,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
-const CHUNK_SIZE: u64 = 1024 * 1024;
-const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
 const PROGRESS_SLICE_SIZE: usize = 64 * 1024;
 
 pub struct DownloadCallbacks {
@@ -105,6 +107,37 @@ impl From<ConnectError> for DownloadError {
     }
 }
 
+impl TransferError for DownloadError {
+    fn cancelled() -> Self {
+        DownloadError::Cancelled
+    }
+    fn sftp(detail: String) -> Self {
+        DownloadError::Sftp(detail)
+    }
+    fn local_io(detail: String) -> Self {
+        DownloadError::LocalIo(detail)
+    }
+}
+
+impl TransferCheckpoint for DownloadCheckpoint {
+    type Error = DownloadError;
+    fn transferred_bytes(&self) -> u64 {
+        self.downloaded_bytes
+    }
+    fn verified_bytes(&self) -> u64 {
+        self.verified_bytes
+    }
+    fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+    fn set_retry_count(&mut self, count: u32) {
+        self.retry_count = count;
+    }
+    fn mark_failed(&mut self) {
+        self.status = CheckpointStatus::Failed;
+    }
+}
+
 pub fn resolve_local_path(local_path: &str, remote_file_name: &str) -> Result<String, DownloadError> {
     let trimmed = local_path.trim();
     if trimmed.is_empty() {
@@ -172,7 +205,7 @@ pub fn download_with_resume(
                         format!("Connection failed, retrying in {backoff_ms}ms: {err}")
                     );
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                    sleep_backoff(&cancel_flag, backoff_ms)?;
+                    sleep_backoff::<DownloadError>(&cancel_flag, backoff_ms)?;
                     backoff_ms = next_backoff_ms(backoff_ms);
                     continue;
                 }
@@ -284,7 +317,7 @@ pub fn download_with_resume(
                     format!("Transfer interrupted ({detail}), reconnecting to resume in {backoff_ms}ms")
                 );
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                sleep_backoff(&cancel_flag, backoff_ms)?;
+                sleep_backoff::<DownloadError>(&cancel_flag, backoff_ms)?;
                 backoff_ms = next_backoff_ms(backoff_ms);
             }
         }
@@ -726,88 +759,6 @@ fn truncate_local_file(path: &Path, size: u64) -> Result<(), DownloadError> {
     Ok(())
 }
 
-fn effective_verified_bytes(cp: &DownloadCheckpoint) -> u64 {
-    if cp.verified_bytes > 0 {
-        return cp.verified_bytes;
-    }
-    if cp.downloaded_bytes > 0 {
-        return align_down(cp.downloaded_bytes);
-    }
-    0
-}
-
-fn should_skip_full_file_hash(
-    strict_chunk_verify: &AtomicBool,
-    checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
-    file_size: u64,
-) -> Result<bool, DownloadError> {
-    if !strict_chunk_verify.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-    let cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
-    Ok(cp.verified_bytes == file_size && cp.downloaded_bytes >= file_size)
-}
-
-/// 哈希大文件可能要几十秒，期间 SSH 连接上没有任何流量；顺带发 keepalive，
-/// 防止 NAT/防火墙或服务器 ClientAlive 把空闲连接掐掉，导致随后读远端时又得重连。
-fn sha256_local_file(
-    session: &Session,
-    path: &Path,
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
-) -> Result<[u8; 32], DownloadError> {
-    let mut file = File::open(path).map_err(|e| DownloadError::LocalIo(e.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-    loop {
-        ensure_not_cancelled(cancel_flag, checkpoint)?;
-        // keepalive_send 内部按 set_keepalive 的间隔节流，每轮调用并不会真的每次发包。
-        if let Err(e) = session.keepalive_send() {
-            log::debug!("keepalive during local hash failed: {e}");
-        }
-        let read_bytes = file.read(&mut buffer).map_err(|e| DownloadError::LocalIo(e.to_string()))?;
-        if read_bytes == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read_bytes]);
-    }
-    Ok(hasher.finalize().into())
-}
-
-fn sha256_remote_file(
-    sftp: &Sftp,
-    remote_path: &str,
-    size: u64,
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
-) -> Result<[u8; 32], DownloadError> {
-    let mut remote_file = sftp
-        .open_mode(Path::new(remote_path), OpenFlags::READ, 0, OpenType::File)
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
-    let mut remaining = size;
-    while remaining > 0 {
-        ensure_not_cancelled(cancel_flag, checkpoint)?;
-        let to_read = (buffer.len() as u64).min(remaining) as usize;
-        let read_bytes = remote_file
-            .read(&mut buffer[..to_read])
-            .map_err(|e| DownloadError::Sftp(e.to_string()))?;
-        if read_bytes == 0 {
-            return Err(DownloadError::Sftp(
-                crate::tr!(
-                    "读取远端文件用于校验时意外结束",
-                    "Remote file ended unexpectedly while reading for verification"
-                )
-                .into(),
-            ));
-        }
-        hasher.update(&buffer[..read_bytes]);
-        remaining -= read_bytes as u64;
-    }
-    Ok(hasher.finalize().into())
-}
-
 fn sha256_local_range(
     path: &Path,
     offset: u64,
@@ -833,18 +784,6 @@ fn sha256_local_range(
     Ok(hasher.finalize().into())
 }
 
-/// 直接对内存字节求 SHA-256。下载时远端块内容已在缓冲区里（刚下载的字节），
-/// 无需再向远端读一遍即可与本地磁盘读回结果比对——省去一次远端往返（弱网关键）。
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
-fn align_down(offset: u64) -> u64 {
-    offset - (offset % CHUNK_SIZE)
-}
-
 /// 给定断点可信续传位置、本地实际字节、远端实际字节，返回安全的续传偏移。
 /// 下载同时依赖本地已写字节与远端可读字节，任一侧不足都会让边界校验读过 EOF：
 /// 本地不足 → LocalIo（永久失败）；远端不足 → 非永久错误会无限重连死循环。
@@ -861,43 +800,6 @@ fn safe_resume_offset(trusted: u64, local_size: u64, remote_size: u64) -> u64 {
 }
 
 
-
-fn sleep_backoff(cancel_flag: &Arc<AtomicBool>, backoff_ms: u64) -> Result<(), DownloadError> {
-    let step_ms = 200_u64;
-    let mut waited = 0_u64;
-    while waited < backoff_ms {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(DownloadError::Cancelled);
-        }
-        thread::sleep(Duration::from_millis(step_ms));
-        waited += step_ms;
-    }
-    Ok(())
-}
-
-fn ensure_not_cancelled(
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<DownloadCheckpoint>>,
-) -> Result<(), DownloadError> {
-    if cancel_flag.load(Ordering::Relaxed) {
-        checkpoint
-            .lock()
-            .map_err(|e| DownloadError::Sftp(e.to_string()))?
-            .status = CheckpointStatus::Failed;
-        return Err(DownloadError::Cancelled);
-    }
-    Ok(())
-}
-
-fn increment_retry_count(checkpoint: &Arc<Mutex<DownloadCheckpoint>>) -> Result<u32, DownloadError> {
-    let mut cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
-    cp.retry_count = cp.retry_count.saturating_add(1);
-    Ok(cp.retry_count)
-}
-
-fn current_retry_count(checkpoint: &Arc<Mutex<DownloadCheckpoint>>) -> u32 {
-    checkpoint.lock().map(|cp| cp.retry_count).unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {
