@@ -14,22 +14,21 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **Security:** host key verification with fingerprint confirmation; passwords in the macOS Keychain
 - **Reliability:** unlimited reconnect for network errors only; non-blocking UI; connect timeout; keepalive during hashing; verify-only resume; diagnostic log file
 - **Interface:** sidebar layout, block map, activity log, history with resumable transfers
-- **Transfer:** bookmarked/recent remote folders, post-transfer command, multi-file upload queue
+- **Transfer:** bookmarked/recent remote folders, post-transfer command, multi-file upload queue, batch download, folder upload
+- **Preflight:** remote free-space check, skip files that are already identical (SHA-256)
+- **Recovery:** offer to resume unfinished transfers on launch
+- **Privacy:** per-server "remember password in Keychain" option
 - **i18n:** English and Chinese UI
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Next
 
-Ordered by how directly they serve the positioning.
-
 | Item | Why |
 |---|---|
-| Free-space check before upload | Fail in a second instead of at 90% when the remote disk is full |
-| Offer to resume unfinished transfers on launch | Recover from crashes and reboots without hunting through History |
-| Skip identical files (size + SHA-256) | Re-running a batch shouldn't re-send what's already there |
-| Multi-file download | Symmetry with the upload queue |
-| Recursive folder upload | Keep directory structure; reuse the queue |
+| Recursive folder download | Symmetry with folder upload |
+| Skip identical files on download | Same benefit as for uploads when re-running a batch |
+| Local free-space check before download | Same reasoning as the remote check |
 
 ## Project health (before wider release)
 

@@ -30,7 +30,8 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 ## Features
 
 **Transfer**
-- Upload and download single files or **queue several uploads** at once (drag them in)
+- Upload and download files one at a time or in **batches** — drag in several files or a **whole folder** (structure kept), or multi-select remote files to download
+- **Preflight**: refuses early if the server is out of space; skips files that are already identical (SHA-256)
 - Block-level resume with integrity check at the resume boundary
 - Two modes: *Reliable* (read back every block) and *Fast* (verify once at the end)
 - A live **block map** shows what was resumed, what's verified, where the connection dropped
@@ -38,13 +39,13 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 
 **Trust & security**
 - **Host key verification** against `~/.ssh/known_hosts`; unknown hosts must be confirmed by fingerprint, changed keys are refused
-- Passwords and key passphrases live in the **macOS Keychain**, never in config files
+- Passwords and key passphrases live in the **macOS Keychain**, never in config files — or, per server, aren't stored at all
 - Private keys stay where they are; `ssh-agent` is supported
 
 **Everyday comfort**
 - Saved servers, import from `~/.ssh/config`, connection test
 - Bookmarked and recent remote folders per server
-- History with one-click reuse; unfinished transfers listed with a *Resume* button
+- History with one-click reuse; unfinished transfers listed with a *Resume* button, and offered again on launch
 - **Activity log**: every connect, auth, reconnect, permission error and verification step, filterable and copyable
 - macOS notifications, light/dark theme, English and Chinese UI
 
