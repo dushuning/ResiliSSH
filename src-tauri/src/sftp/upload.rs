@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use thiserror::Error;
 
 /// 固定块大小：续传时回退到块边界，避免“半块”脏数据（你遇到的 33556504 正是此类问题）。
 const CHUNK_SIZE: u64 = 1024 * 1024;
@@ -27,35 +26,83 @@ pub struct UploadCallbacks {
     pub on_activity: Box<dyn Fn() + Send + Sync>,
 }
 
-#[derive(Debug, Error)]
+/// 不用 thiserror 的固定 `#[error]` 文案：错误会原样展示给用户，必须在展示时按界面语言选择。
+/// 注意 `is_permanent_sftp_error` 依赖这里的部分措辞（续传边界、SHA-256），改文案时同步关键字表。
+#[derive(Debug)]
 pub enum UploadError {
-    #[error("用户取消了上传")]
     Cancelled,
-    #[error("远端路径无效: {0}")]
     InvalidRemotePath(String),
-    #[error("远端文件大于本地文件，无法续传")]
     RemoteLargerThanLocal { remote: u64, local: u64 },
-    #[error("续传边界校验失败（offset={offset}），请清除断点后重新上传")]
     ResumeBoundaryMismatch { offset: u64 },
-    #[error("上传完成后远端大小不一致（本地={local}，远端={remote}）")]
     SizeMismatch { local: u64, remote: u64 },
-    #[error("上传完成后校验不一致（SHA-256 不匹配）")]
     HashMismatch,
-    #[error("块校验失败（offset={offset}，len={len}），将重传该块")]
     ChunkVerifyMismatch { offset: u64, len: u64 },
-    #[error("本地文件读取失败: {0}")]
     LocalIo(String),
-    #[error("连接失败: {0}")]
-    Connect(#[from] ConnectError),
-    #[error("SFTP 错误: {0}")]
+    Connect(ConnectError),
     Sftp(String),
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            UploadError::Cancelled => crate::tr!("用户取消了上传", "Upload cancelled by user").to_string(),
+            UploadError::InvalidRemotePath(e) => {
+                crate::tr!(format!("远端路径无效: {e}"), format!("Invalid remote path: {e}"))
+            }
+            UploadError::RemoteLargerThanLocal { .. } => crate::tr!(
+                "远端文件大于本地文件，无法续传",
+                "Remote file is larger than the local file; cannot resume"
+            )
+            .to_string(),
+            UploadError::ResumeBoundaryMismatch { offset } => crate::tr!(
+                format!("续传边界校验失败（offset={offset}），请清除断点后重新上传"),
+                format!("Resume boundary verification failed (offset={offset}); clear the checkpoint and upload again")
+            ),
+            UploadError::SizeMismatch { local, remote } => crate::tr!(
+                format!("上传完成后远端大小不一致（本地={local}，远端={remote}）"),
+                format!("Remote size mismatch after upload (local={local}, remote={remote})")
+            ),
+            UploadError::HashMismatch => crate::tr!(
+                "上传完成后校验不一致（SHA-256 不匹配）",
+                "Verification failed after upload (SHA-256 mismatch)"
+            )
+            .to_string(),
+            UploadError::ChunkVerifyMismatch { offset, len } => crate::tr!(
+                format!("块校验失败（offset={offset}，len={len}），将重传该块"),
+                format!("Chunk verification failed (offset={offset}, len={len}); resending the chunk")
+            ),
+            UploadError::LocalIo(e) => {
+                crate::tr!(format!("本地文件读取失败: {e}"), format!("Failed to read local file: {e}"))
+            }
+            UploadError::Connect(e) => crate::tr!(format!("连接失败: {e}"), format!("Connection failed: {e}")),
+            UploadError::Sftp(e) => crate::tr!(format!("SFTP 错误: {e}"), format!("SFTP error: {e}")),
+        };
+        f.write_str(&text)
+    }
+}
+
+impl std::error::Error for UploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            UploadError::Connect(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<ConnectError> for UploadError {
+    fn from(err: ConnectError) -> Self {
+        UploadError::Connect(err)
+    }
 }
 
 /// 远端填目录时自动拼接本地文件名；连接后若发现路径是已存在目录，也会自动拼接。
 pub fn resolve_remote_path(remote_path: &str, local_path: &Path) -> Result<String, UploadError> {
     let trimmed = remote_path.trim();
     if trimmed.is_empty() {
-        return Err(UploadError::InvalidRemotePath("远端路径不能为空".into()));
+        return Err(UploadError::InvalidRemotePath(
+            crate::tr!("远端路径不能为空", "Remote path cannot be empty").into(),
+        ));
     }
 
     if trimmed.ends_with('/') {
@@ -69,7 +116,9 @@ fn append_local_filename(dir_path: &str, local_path: &Path) -> Result<String, Up
     let file_name = local_path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| UploadError::InvalidRemotePath("无法读取本地文件名".into()))?;
+        .ok_or_else(|| UploadError::InvalidRemotePath(
+                crate::tr!("无法读取本地文件名", "Cannot read the local file name").into(),
+            ))?;
     Ok(format!("{dir_path}{file_name}"))
 }
 
@@ -101,7 +150,9 @@ pub fn resolve_upload_target(
 ) -> Result<String, UploadError> {
     let trimmed = remote_path.trim();
     if trimmed.is_empty() {
-        return Err(UploadError::InvalidRemotePath("远端路径不能为空".into()));
+        return Err(UploadError::InvalidRemotePath(
+            crate::tr!("远端路径不能为空", "Remote path cannot be empty").into(),
+        ));
     }
 
     if trimmed.ends_with('/') {
@@ -113,7 +164,9 @@ pub fn resolve_upload_target(
         let file_name = local_path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| UploadError::InvalidRemotePath("无法读取本地文件名".into()))?;
+            .ok_or_else(|| UploadError::InvalidRemotePath(
+                crate::tr!("无法读取本地文件名", "Cannot read the local file name").into(),
+            ))?;
         let resolved = join_remote_path(trimmed, file_name);
         log::info!("remote path is directory, upload target: {resolved}");
         return Ok(resolved);
@@ -137,21 +190,38 @@ pub fn format_remote_sftp_error(message: &str, remote_path: &str) -> String {
 
     if lower.contains("no such file") || lower.contains("sftp(2)") {
         if let Some(p) = parent {
-            return format!(
-                "远端路径错误：{remote_path}\n上级目录「{p}」在服务器上不存在，请核对用户名与目录名（本地文件不受影响）"
+            return crate::tr!(
+                format!(
+                    "远端路径错误：{remote_path}\n上级目录「{p}」在服务器上不存在，请核对用户名与目录名（本地文件不受影响）"
+                ),
+                format!(
+                    "Remote path error: {remote_path}\nParent directory \"{p}\" does not exist on the server; check the username and directory name (local file is unaffected)"
+                )
             );
         }
-        return format!(
-            "远端路径错误：{remote_path}\n该路径在服务器上不存在（本地文件不受影响）"
+        return crate::tr!(
+            format!("远端路径错误：{remote_path}\n该路径在服务器上不存在（本地文件不受影响）"),
+            format!(
+                "Remote path error: {remote_path}\nThe path does not exist on the server (local file is unaffected)"
+            )
         );
     }
     if lower.contains("permission denied") || lower.contains("access denied") {
-        return format!("远端路径错误：{remote_path}\n没有写入权限，请检查该目录权限");
+        return crate::tr!(
+            format!("远端路径错误：{remote_path}\n没有写入权限，请检查该目录权限"),
+            format!("Remote path error: {remote_path}\nNo write permission; check the directory permissions")
+        );
     }
     if lower.contains("sftp(4)") || lower.contains("failure") {
-        return format!("远端路径错误：{remote_path}\n写入失败：{message}");
+        return crate::tr!(
+            format!("远端路径错误：{remote_path}\n写入失败：{message}"),
+            format!("Remote path error: {remote_path}\nWrite failed: {message}")
+        );
     }
-    format!("远端路径「{remote_path}」操作失败：{message}")
+    crate::tr!(
+        format!("远端路径「{remote_path}」操作失败：{message}"),
+        format!("Remote path \"{remote_path}\" failed: {message}")
+    )
 }
 
 /// 递归创建远端父目录（类似 mkdir -p），仅创建路径中缺失的目录。
@@ -179,7 +249,10 @@ fn ensure_remote_parent_directories(sftp: &Sftp, remote_file: &str) -> Result<()
         }
         sftp.mkdir(dir, 0o755).map_err(|e| {
             UploadError::Sftp(format_remote_sftp_error(
-                &format!("创建远端目录「{current}」失败: {e}"),
+                &crate::tr!(
+                    format!("创建远端目录「{current}」失败: {e}"),
+                    format!("Failed to create remote directory \"{current}\": {e}")
+                ),
                 remote_file,
             ))
         })?;
@@ -195,8 +268,9 @@ pub fn remote_parent_status(sftp: &Sftp, remote_file: &str) -> Option<String> {
     if sftp.stat(Path::new(parent_str)).is_ok() {
         return None;
     }
-    Some(format!(
-        "远端路径可能有问题：上级目录「{parent_str}」在服务器上不存在"
+    Some(crate::tr!(
+        format!("远端路径可能有问题：上级目录「{parent_str}」在服务器上不存在"),
+        format!("Remote path may be wrong: parent directory \"{parent_str}\" does not exist on the server")
     ))
 }
 
@@ -253,11 +327,19 @@ pub fn upload_with_resume(
                         .map(|cp| cp.uploaded_bytes)
                         .unwrap_or(0);
                     let message = if uploaded_bytes > 0 {
-                        format!(
-                            "连接失败（已传 {uploaded_bytes} 字节），{backoff_ms}ms 后重连续传: {err}"
+                        crate::tr!(
+                            format!(
+                                "连接失败（已传 {uploaded_bytes} 字节），{backoff_ms}ms 后重连续传: {err}"
+                            ),
+                            format!(
+                                "Connection failed ({uploaded_bytes} bytes sent), reconnecting to resume in {backoff_ms}ms: {err}"
+                            )
                         )
                     } else {
-                        format!("连接失败，{backoff_ms}ms 后重试: {err}")
+                        crate::tr!(
+                            format!("连接失败，{backoff_ms}ms 后重试: {err}"),
+                            format!("Connection failed, retrying in {backoff_ms}ms: {err}")
+                        )
                     };
                     log::warn!("upload retry #{retry_count}: {message}");
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
@@ -363,7 +445,10 @@ pub fn upload_with_resume(
                 *abort_socket_holder
                     .lock()
                     .map_err(|e| UploadError::Sftp(e.to_string()))? = None;
-                let message = format!("传输中断（{detail}），{backoff_ms}ms 后重连续传");
+                let message = crate::tr!(
+                    format!("传输中断（{detail}），{backoff_ms}ms 后重连续传"),
+                    format!("Transfer interrupted ({detail}), reconnecting to resume in {backoff_ms}ms")
+                );
                 log::warn!("upload retry #{retry_count}: {message}");
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
                 sleep_backoff(&cancel_flag, backoff_ms)?;
@@ -399,8 +484,13 @@ fn verify_upload_integrity(
             cp.failure_reason = Some("verify_read_failed".into());
             cp.status = CheckpointStatus::Failed;
             let _ = save_checkpoint(&cp);
-            return Err(UploadError::Sftp(format!(
-                "传完后校验时读取远端失败（弱网常见），数据块已全部校验通过，可点「开始上传」仅重试校验: {detail}"
+            return Err(UploadError::Sftp(crate::tr!(
+                format!(
+                    "传完后校验时读取远端失败（弱网常见），数据块已全部校验通过，可点「开始上传」仅重试校验: {detail}"
+                ),
+                format!(
+                    "Failed to read the remote file for final verification (common on weak networks); all chunks already verified, click \"Start upload\" to retry verification only: {detail}"
+                )
             )));
         }
         Err(err) => return Err(err),
@@ -485,7 +575,13 @@ fn sha256_remote_file(
             .read(&mut buffer[..to_read])
             .map_err(|e| UploadError::Sftp(e.to_string()))?;
         if read_bytes == 0 {
-            return Err(UploadError::Sftp("读取远端文件用于校验时意外结束".into()));
+            return Err(UploadError::Sftp(
+                crate::tr!(
+                    "读取远端文件用于校验时意外结束",
+                    "Remote file ended unexpectedly while reading for verification"
+                )
+                .into(),
+            ));
         }
         hasher.update(&buffer[..read_bytes]);
         remaining -= read_bytes as u64;
@@ -710,7 +806,13 @@ fn sha256_remote_range(
             .read(&mut buffer[..to_read])
             .map_err(|e| UploadError::Sftp(e.to_string()))?;
         if read_bytes == 0 {
-            return Err(UploadError::Sftp("读取远端块用于校验时意外结束".into()));
+            return Err(UploadError::Sftp(
+                crate::tr!(
+                    "读取远端块用于校验时意外结束",
+                    "Remote chunk ended unexpectedly while reading for verification"
+                )
+                .into(),
+            ));
         }
         hasher.update(&buffer[..read_bytes]);
         remaining -= read_bytes as u64;
@@ -807,10 +909,16 @@ pub(super) fn log_resume_point(offset: u64, total: u64) {
     if offset > 0 {
         info(
             Category::Transfer,
-            format!("从 {} 处续传（共 {}）", format_bytes(offset), format_bytes(total)),
+            crate::tr!(
+                format!("从 {} 处续传（共 {}）", format_bytes(offset), format_bytes(total)),
+                format!("Resuming from {} (of {})", format_bytes(offset), format_bytes(total))
+            ),
         );
     } else {
-        info(Category::Transfer, format!("从头开始传输，共 {}", format_bytes(total)));
+        info(Category::Transfer, crate::tr!(
+                format!("从头开始传输，共 {}", format_bytes(total)),
+                format!("Starting transfer from the beginning, {} total", format_bytes(total))
+            ));
     }
 }
 

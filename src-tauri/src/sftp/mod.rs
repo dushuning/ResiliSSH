@@ -2,6 +2,8 @@ mod browse;
 mod client;
 mod download;
 mod errors;
+
+pub use errors::is_remote_path_message;
 mod host_key;
 mod remote_command;
 mod upload;

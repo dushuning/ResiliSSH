@@ -3,6 +3,8 @@
  * 只依赖传入的 DOM 节点，不感知其他页面；main.ts 负责把事件接进来。
  */
 
+import { locale, t } from "../i18n";
+
 export type LogLevel = "info" | "success" | "warn" | "error";
 export type LogCategory =
   | "connect"
@@ -24,21 +26,21 @@ export interface ActivityEntry {
 }
 
 const CATEGORY_LABEL: Record<LogCategory, string> = {
-  connect: "连接",
-  auth: "认证",
-  host_key: "指纹",
-  network: "网络",
-  permission: "权限",
-  transfer: "传输",
-  verify: "校验",
-  command: "命令",
+  connect: t("连接"),
+  auth: t("认证"),
+  host_key: t("指纹"),
+  network: t("网络"),
+  permission: t("权限"),
+  transfer: t("传输"),
+  verify: t("校验"),
+  command: t("命令"),
 };
 
 const LEVEL_LABEL: Record<LogLevel, string> = {
-  info: "信息",
-  success: "成功",
-  warn: "警告",
-  error: "错误",
+  info: t("信息"),
+  success: t("成功"),
+  warn: t("警告"),
+  error: t("错误"),
 };
 
 /** 筛选按严重程度阈值：「警告及以上」包含错误。 */
@@ -51,7 +53,7 @@ const MAX_ENTRIES = 500;
 const FOLLOW_THRESHOLD_PX = 24;
 
 function formatClock(tsMs: number): string {
-  return new Date(tsMs).toLocaleTimeString("zh-CN", { hour12: false });
+  return new Date(tsMs).toLocaleTimeString(locale(), { hour12: false });
 }
 
 export class ActivityLogView {
@@ -147,8 +149,8 @@ export class ActivityLogView {
       empty.className = "list-empty";
       empty.textContent =
         this.entries.length === 0
-          ? "暂无日志\n连接、认证、传输、重连、校验的每一步都会记录在这里"
-          : "当前筛选条件下没有日志";
+          ? t("暂无日志\n连接、认证、传输、重连、校验的每一步都会记录在这里")
+          : t("当前筛选条件下没有日志");
       this.list.replaceChildren(empty);
       this.jumpButton.classList.add("hidden");
       return;

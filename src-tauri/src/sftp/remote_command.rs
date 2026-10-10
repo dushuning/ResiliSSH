@@ -81,7 +81,7 @@ pub fn run_remote_command(
     mut on_line: impl FnMut(&str),
 ) -> Result<CommandOutcome, String> {
     let command = expand_template(template, ctx);
-    activity::info(Category::Command, format!("开始执行：{command}"));
+    activity::info(Category::Command, crate::tr!(format!("开始执行：{command}"), format!("Running: {command}")));
 
     let (session, socket) = connect_session(config).map_err(|e| e.to_string())?;
     if let Ok(mut holder) = abort_socket.lock() {
@@ -91,10 +91,10 @@ pub fn run_remote_command(
 
     let mut channel = session
         .channel_session()
-        .map_err(|e| format!("无法打开命令通道: {e}"))?;
+        .map_err(|e| crate::tr!(format!("无法打开命令通道: {e}"), format!("Cannot open command channel: {e}")))?;
     channel
         .exec(&wrap_for_exec(&command))
-        .map_err(|e| format!("无法执行命令: {e}"))?;
+        .map_err(|e| crate::tr!(format!("无法执行命令: {e}"), format!("Cannot run command: {e}")))?;
 
     let mut tail: VecDeque<String> = VecDeque::with_capacity(OUTPUT_TAIL_LINES);
     let mut logged = 0_usize;
@@ -136,7 +136,10 @@ pub fn run_remote_command(
                     timed_out = true;
                     break;
                 }
-                return Err(format!("读取命令输出失败: {e}"));
+                return Err(crate::tr!(
+                    format!("读取命令输出失败: {e}"),
+                    format!("Failed to read command output: {e}")
+                ));
             }
         }
     }
@@ -147,7 +150,10 @@ pub fn run_remote_command(
     if logged > MAX_LOGGED_LINES {
         activity::info(
             Category::Command,
-            format!("…另有 {} 行输出未写入日志", logged - MAX_LOGGED_LINES),
+            crate::tr!(
+                format!("…另有 {} 行输出未写入日志", logged - MAX_LOGGED_LINES),
+                format!("…{} more lines of output not logged", logged - MAX_LOGGED_LINES)
+            ),
         );
     }
 
@@ -172,16 +178,22 @@ pub fn run_remote_command(
 
 fn record_outcome(outcome: &CommandOutcome) {
     if outcome.cancelled {
-        activity::warn(Category::Command, "命令已取消（远端进程可能仍在运行）");
+        activity::warn(Category::Command, crate::tr!(
+                "命令已取消（远端进程可能仍在运行）",
+                "Command cancelled (the remote process may still be running)"
+            ));
     } else if outcome.timed_out {
-        activity::error(Category::Command, "命令超过 10 分钟没有任何输出，已停止等待");
+        activity::error(Category::Command, crate::tr!(
+                "命令超过 10 分钟没有任何输出，已停止等待",
+                "Command produced no output for 10 minutes; stopped waiting"
+            ));
     } else if outcome.succeeded() {
-        activity::success(Category::Command, "命令执行成功（退出码 0）");
+        activity::success(Category::Command, crate::tr!("命令执行成功（退出码 0）", "Command succeeded (exit code 0)"));
     } else {
         let code = outcome
             .exit_code
-            .map_or_else(|| "未知".to_string(), |c| c.to_string());
-        activity::error(Category::Command, format!("命令执行失败（退出码 {code}）"));
+            .map_or_else(|| crate::tr!("未知", "unknown").to_string(), |c| c.to_string());
+        activity::error(Category::Command, crate::tr!(format!("命令执行失败（退出码 {code}）"), format!("Command failed (exit code {code})")));
     }
 }
 

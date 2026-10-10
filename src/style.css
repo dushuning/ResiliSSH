@@ -1684,7 +1684,8 @@ input[type="radio"] {
 
 .log-row {
   display: grid;
-  grid-template-columns: 62px 16px 46px 1fr;
+  /* 分类列按最长的英文分类（Permission）留宽，中文两个字也不会显得空 */
+  grid-template-columns: 62px 16px 78px 1fr;
   align-items: start;
   gap: 8px;
   padding: 3px 14px;
@@ -1726,6 +1727,9 @@ input[type="radio"] {
 .log-category {
   font-size: 11px;
   color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .log-message {

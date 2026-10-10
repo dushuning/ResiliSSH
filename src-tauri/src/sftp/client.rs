@@ -4,7 +4,6 @@ use ssh2::Session;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
-use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub enum AuthMethod {
@@ -23,21 +22,45 @@ pub struct ConnectionConfig {
     pub auth: AuthMethod,
 }
 
-#[derive(Debug, Error)]
+/// 不用 thiserror 的固定 `#[error]` 文案：错误会原样展示给用户，必须在展示时按界面语言选择。
+#[derive(Debug)]
 pub enum ConnectError {
-    #[error("TCP 连接失败: {0}")]
     Tcp(String),
-    #[error("SSH 握手失败: {0}")]
     Handshake(String),
-    #[error("认证失败: {0}")]
     Auth(String),
-    #[error("未信任的服务器（指纹 {0}），请确认后再连接")]
     HostKeyUnknown(String),
-    #[error("服务器指纹已变化（{0}），可能遭遇中间人攻击，已拒绝连接")]
     HostKeyChanged(String),
-    #[error("主机密钥校验失败: {0}")]
     HostKeyCheck(String),
 }
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            ConnectError::Tcp(e) => crate::tr!(format!("TCP 连接失败: {e}"), format!("TCP connection failed: {e}")),
+            ConnectError::Handshake(e) => {
+                crate::tr!(format!("SSH 握手失败: {e}"), format!("SSH handshake failed: {e}"))
+            }
+            ConnectError::Auth(e) => {
+                crate::tr!(format!("认证失败: {e}"), format!("Authentication failed: {e}"))
+            }
+            ConnectError::HostKeyUnknown(fp) => crate::tr!(
+                format!("未信任的服务器（指纹 {fp}），请确认后再连接"),
+                format!("Untrusted server (host key fingerprint {fp}), please confirm before connecting")
+            ),
+            ConnectError::HostKeyChanged(fp) => crate::tr!(
+                format!("服务器指纹已变化（{fp}），可能遭遇中间人攻击，已拒绝连接"),
+                format!("Server host key fingerprint changed ({fp}), possible man-in-the-middle attack; connection refused")
+            ),
+            ConnectError::HostKeyCheck(e) => crate::tr!(
+                format!("主机密钥校验失败: {e}"),
+                format!("Host key verification failed: {e}")
+            ),
+        };
+        f.write_str(&text)
+    }
+}
+
+impl std::error::Error for ConnectError {}
 
 impl ConnectError {
     /// 主机密钥问题不会因重连自愈：未知主机需要用户确认，指纹变化更不能自动重试，
@@ -73,7 +96,7 @@ fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream, ConnectError
     let timeout = Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS);
     let addrs = (host, port)
         .to_socket_addrs()
-        .map_err(|e| ConnectError::Tcp(format!("无法解析主机 {host}: {e}")))?;
+        .map_err(|e| ConnectError::Tcp(crate::tr!(format!("无法解析主机 {host}: {e}"), format!("Cannot resolve host {host}: {e}"))))?;
     let mut last_err = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
@@ -85,7 +108,7 @@ fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream, ConnectError
         }
     }
     Err(ConnectError::Tcp(
-        last_err.map_or_else(|| format!("主机 {host} 没有可用地址"), |e| e.to_string()),
+        last_err.map_or_else(|| crate::tr!(format!("主机 {host} 没有可用地址"), format!("Host {host} has no usable address")), |e| e.to_string()),
     ))
 }
 
@@ -119,9 +142,15 @@ pub fn connect_session(config: &ConnectionConfig) -> Result<(Session, TcpStream)
         Ok((session, socket, auth_label)) => {
             activity::success(
                 Category::Connect,
-                format!(
-                    "已连接 {target} · 用时 {} ms · {auth_label}",
-                    started.elapsed().as_millis()
+                crate::tr!(
+                    format!(
+                        "已连接 {target} · 用时 {} ms · {auth_label}",
+                        started.elapsed().as_millis()
+                    ),
+                    format!(
+                        "Connected to {target} · {} ms · {auth_label}",
+                        started.elapsed().as_millis()
+                    )
                 ),
             );
             Ok((session, socket))
@@ -135,21 +164,27 @@ pub fn connect_session(config: &ConnectionConfig) -> Result<(Session, TcpStream)
 
 fn record_connect_failure(target: &str, err: &ConnectError) {
     match err {
-        ConnectError::Tcp(e) => activity::warn(Category::Network, format!("无法连接 {target}：{e}")),
+        ConnectError::Tcp(e) => activity::warn(Category::Network, crate::tr!(format!("无法连接 {target}：{e}"), format!("Cannot connect to {target}: {e}"))),
         ConnectError::Handshake(e) => {
-            activity::warn(Category::Network, format!("SSH 握手失败 {target}：{e}"))
+            activity::warn(Category::Network, crate::tr!(format!("SSH 握手失败 {target}：{e}"), format!("SSH handshake failed for {target}: {e}")))
         }
-        ConnectError::Auth(e) => activity::error(Category::Auth, format!("认证失败 {target}：{e}")),
+        ConnectError::Auth(e) => activity::error(Category::Auth, crate::tr!(format!("认证失败 {target}：{e}"), format!("Authentication failed for {target}: {e}"))),
         ConnectError::HostKeyUnknown(fp) => activity::warn(
             Category::HostKey,
-            format!("{target} 是未信任的服务器（指纹 {fp}），需要确认后才能连接"),
+            crate::tr!(
+                format!("{target} 是未信任的服务器（指纹 {fp}），需要确认后才能连接"),
+                format!("{target} is an untrusted server (host key fingerprint {fp}); confirm it before connecting")
+            ),
         ),
         ConnectError::HostKeyChanged(fp) => activity::error(
             Category::HostKey,
-            format!("{target} 的指纹与记录不一致（当前 {fp}），已拒绝连接"),
+            crate::tr!(
+                format!("{target} 的指纹与记录不一致（当前 {fp}），已拒绝连接"),
+                format!("{target} host key fingerprint does not match the record (now {fp}); connection refused")
+            ),
         ),
         ConnectError::HostKeyCheck(e) => {
-            activity::error(Category::HostKey, format!("{target} 指纹校验出错：{e}"))
+            activity::error(Category::HostKey, crate::tr!(format!("{target} 指纹校验出错：{e}"), format!("Host key fingerprint check failed for {target}: {e}")))
         }
     }
 }
@@ -164,7 +199,7 @@ fn establish(config: &ConnectionConfig) -> Result<(Session, TcpStream, &'static 
             session
                 .userauth_password(&config.username, password)
                 .map_err(|e| ConnectError::Auth(e.to_string()))?;
-            "密码认证"
+            crate::tr!("密码认证", "password auth")
         }
         AuthMethod::PrivateKey { key_path, passphrase } => {
             authenticate_with_private_key(&session, &config.username, key_path, passphrase.as_deref())?
@@ -172,7 +207,9 @@ fn establish(config: &ConnectionConfig) -> Result<(Session, TcpStream, &'static 
     };
 
     if !session.authenticated() {
-        return Err(ConnectError::Auth("服务器拒绝了提供的凭据".into()));
+        return Err(ConnectError::Auth(
+            crate::tr!("服务器拒绝了提供的凭据", "The server rejected the credentials").into(),
+        ));
     }
 
     session.set_timeout(SSH_OPERATION_TIMEOUT_MS as u32);
@@ -193,18 +230,18 @@ fn authenticate_with_private_key(
 ) -> Result<&'static str, ConnectError> {
     if has_passphrase(passphrase) {
         auth_with_key_file(session, username, key_path, passphrase)?;
-        return Ok("私钥认证");
+        return Ok(crate::tr!("私钥认证", "private key auth"));
     }
 
     if std::env::var_os("SSH_AUTH_SOCK").is_some()
         && session.userauth_agent(username).is_ok()
         && session.authenticated()
     {
-        return Ok("ssh-agent 认证");
+        return Ok(crate::tr!("ssh-agent 认证", "ssh-agent auth"));
     }
 
     auth_with_key_file(session, username, key_path, None)?;
-    Ok("私钥认证")
+    Ok(crate::tr!("私钥认证", "private key auth"))
 }
 
 fn auth_with_key_file(
@@ -228,11 +265,17 @@ pub fn test_connection(config: &ConnectionConfig) -> Result<String, ConnectError
     let (session, _) = connect_session(config)?;
     let sftp = session
         .sftp()
-        .map_err(|e| ConnectError::Handshake(format!("SFTP 子系统不可用: {e}")))?;
+        .map_err(|e| ConnectError::Handshake(crate::tr!(format!("SFTP 子系统不可用: {e}"), format!("SFTP subsystem unavailable: {e}"))))?;
     sftp.stat(Path::new("."))
-        .map_err(|e| ConnectError::Handshake(format!("SFTP 访问失败: {e}")))?;
-    Ok(format!(
-        "连接成功：{}@{}:{}，SFTP 可用",
-        config.username, config.host, config.port
+        .map_err(|e| ConnectError::Handshake(crate::tr!(format!("SFTP 访问失败: {e}"), format!("SFTP access failed: {e}"))))?;
+    Ok(crate::tr!(
+        format!(
+            "连接成功：{}@{}:{}，SFTP 可用",
+            config.username, config.host, config.port
+        ),
+        format!(
+            "Connected: {}@{}:{}, SFTP available",
+            config.username, config.host, config.port
+        )
     ))
 }

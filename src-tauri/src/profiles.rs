@@ -156,19 +156,19 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
     let username = request.username.trim();
 
     if name.is_empty() {
-        return Err("请填写连接名称".into());
+        return Err(crate::tr!("请填写连接名称", "Please enter a connection name").into());
     }
     if host.is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if username.is_empty() {
-        return Err("请填写用户名".into());
+        return Err(crate::tr!("请填写用户名", "Please enter a username").into());
     }
 
     let auth_kind = match request.auth_type.as_str() {
         "password" => AuthKind::Password,
         "key" => AuthKind::PrivateKey,
-        _ => return Err("未知认证方式".into()),
+        _ => return Err(crate::tr!("未知认证方式", "Unknown authentication method").into()),
     };
 
     if matches!(auth_kind, AuthKind::PrivateKey) {
@@ -177,9 +177,14 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
             .as_ref()
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
-            .ok_or_else(|| "私钥认证需要填写私钥路径".to_string())?;
+            .ok_or_else(|| {
+                crate::tr!("私钥认证需要填写私钥路径", "Private key auth requires a private key path").to_string()
+            })?;
         if !std::path::Path::new(&expand_key_path(key_path)).exists() {
-            return Err(format!("私钥文件不存在: {key_path}"));
+            return Err(crate::tr!(
+                format!("私钥文件不存在: {key_path}"),
+                format!("Private key file does not exist: {key_path}")
+            ));
         }
     }
 
@@ -205,7 +210,11 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
     });
 
     if matches!(auth_kind, AuthKind::Password) && password.is_none() {
-        return Err("密码登录保存时请填写密码".into());
+        return Err(crate::tr!(
+            "密码登录保存时请填写密码",
+            "Please enter a password to save a password-login connection"
+        )
+        .into());
     }
 
     // 收藏目录与常用命令不在连接表单里编辑，保存连接时必须沿用旧值，否则一保存就被清空。
@@ -254,7 +263,7 @@ pub fn delete_profile(id: String) -> Result<(), String> {
     let before = store.profiles.len();
     store.profiles.retain(|p| p.id != id);
     if store.profiles.len() == before {
-        return Err("连接配置不存在".into());
+        return Err(crate::tr!("连接配置不存在", "Connection profile not found").into());
     }
     save_store(&store)?;
     delete_secret(&id, SecretKind::Password);
@@ -290,7 +299,7 @@ pub fn update_profile_extras(request: UpdateProfileExtrasRequest) -> Result<Conn
         .profiles
         .iter_mut()
         .find(|p| p.id == request.id)
-        .ok_or_else(|| "连接配置不存在".to_string())?;
+        .ok_or_else(|| crate::tr!("连接配置不存在", "Connection profile not found").to_string())?;
     if let Some(bookmarks) = request.bookmarks {
         profile.bookmarks = normalize_list(bookmarks);
     }

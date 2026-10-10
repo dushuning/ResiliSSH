@@ -44,11 +44,11 @@ pub fn create_remote_directory(
     let new_path = join_remote_path(&parent, name);
 
     if sftp.stat(Path::new(&new_path)).is_ok() {
-        return Err(format!("「{name}」已存在"));
+        return Err(crate::tr!(format!("「{name}」已存在"), format!("\"{name}\" already exists")));
     }
 
     sftp.mkdir(Path::new(&new_path), 0o755)
-        .map_err(|e| format!("创建目录失败: {e}"))?;
+        .map_err(|e| crate::tr!(format!("创建目录失败: {e}"), format!("Failed to create directory: {e}")))?;
 
     read_directory_listing(&sftp, &parent)
 }
@@ -56,13 +56,13 @@ pub fn create_remote_directory(
 fn validate_dir_name(name: &str) -> Result<&str, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("目录名不能为空".into());
+        return Err(crate::tr!("目录名不能为空", "Directory name cannot be empty").into());
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err("目录名不能包含 / 或 \\".into());
+        return Err(crate::tr!("目录名不能包含 / 或 \\", "Directory name cannot contain / or \\").into());
     }
     if trimmed == "." || trimmed == ".." {
-        return Err("无效的目录名".into());
+        return Err(crate::tr!("无效的目录名", "Invalid directory name").into());
     }
     Ok(trimmed)
 }
@@ -91,21 +91,36 @@ fn resolve_listing_path(sftp: &Sftp, user_path: Option<&str>) -> Result<String, 
 fn canonicalize_remote_path(sftp: &Sftp, path: &str) -> Result<String, String> {
     let resolved = sftp
         .realpath(Path::new(path))
-        .map_err(|e| format!("无法访问远端路径「{path}」: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                format!("无法访问远端路径「{path}」: {e}"),
+                format!("Cannot access remote path \"{path}\": {e}")
+            )
+        })?;
     Ok(resolved.to_string_lossy().to_string())
 }
 
 fn read_directory_listing(sftp: &Sftp, dir_path: &str) -> Result<RemoteDirListing, String> {
     let stat = sftp
         .stat(Path::new(dir_path))
-        .map_err(|e| format!("无法读取远端目录「{dir_path}」: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                format!("无法读取远端目录「{dir_path}」: {e}"),
+                format!("Cannot read remote directory \"{dir_path}\": {e}")
+            )
+        })?;
     if !stat.is_dir() {
-        return Err(format!("「{dir_path}」不是目录"));
+        return Err(crate::tr!(format!("「{dir_path}」不是目录"), format!("\"{dir_path}\" is not a directory")));
     }
 
     let raw = sftp
         .readdir(Path::new(dir_path))
-        .map_err(|e| format!("无法列出目录「{dir_path}」: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                format!("无法列出目录「{dir_path}」: {e}"),
+                format!("Cannot list directory \"{dir_path}\": {e}")
+            )
+        })?;
 
     let mut entries = Vec::new();
     for (name_path, file_stat) in raw {

@@ -123,10 +123,12 @@ fn known_hosts_line(host: &str, port: u16, type_name: &str, key: &[u8]) -> Strin
 pub fn inspect_host_key(session: &Session, host: &str, port: u16) -> Result<HostKeyInfo, ConnectError> {
     let (key, key_type) = session
         .host_key()
-        .ok_or_else(|| ConnectError::HostKeyCheck("服务器未提供主机密钥".into()))?;
+        .ok_or_else(|| ConnectError::HostKeyCheck(crate::tr!("服务器未提供主机密钥", "The server did not provide a host key").into()))?;
     let digest = session
         .host_key_hash(HashType::Sha256)
-        .ok_or_else(|| ConnectError::HostKeyCheck("无法计算主机密钥指纹".into()))?;
+        .ok_or_else(|| ConnectError::HostKeyCheck(
+            crate::tr!("无法计算主机密钥指纹", "Cannot compute the host key fingerprint").into(),
+        ))?;
     let fingerprint = format!("SHA256:{}", base64_encode(digest, false));
     let key_type = key_type_name(key_type).unwrap_or("unknown").to_string();
 
@@ -135,7 +137,9 @@ pub fn inspect_host_key(session: &Session, host: &str, port: u16) -> Result<Host
         CheckResult::NotFound => HostKeyStatus::Unknown,
         CheckResult::Mismatch => HostKeyStatus::Changed,
         CheckResult::Failure => {
-            return Err(ConnectError::HostKeyCheck("known_hosts 校验失败".into()));
+            return Err(ConnectError::HostKeyCheck(
+                crate::tr!("known_hosts 校验失败", "known_hosts verification failed").into(),
+            ));
         }
     };
     Ok(HostKeyInfo {
@@ -175,23 +179,29 @@ pub fn trust_host_key(
             "host key changed during confirmation: host={host}:{port} shown={expected_fingerprint} now={}",
             info.fingerprint
         );
-        return Err("确认期间服务器指纹发生了变化，已拒绝信任，请重新连接核对".into());
+        return Err(crate::tr!(
+            "确认期间服务器指纹发生了变化，已拒绝信任，请重新连接核对",
+            "The server host key fingerprint changed during confirmation; trust refused, please reconnect and check again"
+        )
+        .into());
     }
     match info.status {
         HostKeyStatus::Trusted => return Ok(()),
         // 指纹变化必须由用户手动清理旧记录，应用内一键覆盖等于替攻击者点了确认。
         HostKeyStatus::Changed => {
-            return Err(
-                "该服务器已记录的指纹与当前不一致，请先核实并手动从 known_hosts 中移除旧记录".into(),
+            return Err(crate::tr!(
+                "该服务器已记录的指纹与当前不一致，请先核实并手动从 known_hosts 中移除旧记录",
+                "The recorded host key fingerprint for this server does not match; verify it and remove the old entry from known_hosts manually"
             )
+            .into())
         }
         HostKeyStatus::Unknown => {}
     }
 
     let (key, key_type) = session
         .host_key()
-        .ok_or_else(|| "服务器未提供主机密钥".to_string())?;
-    let type_name = key_type_name(key_type).ok_or_else(|| "不支持的主机密钥类型".to_string())?;
+        .ok_or_else(|| crate::tr!("服务器未提供主机密钥", "The server did not provide a host key").to_string())?;
+    let type_name = key_type_name(key_type).ok_or_else(|| crate::tr!("不支持的主机密钥类型", "Unsupported host key type").to_string())?;
     let line = known_hosts_line(host, port, type_name, key);
 
     let path = app_known_hosts_path();
@@ -203,13 +213,16 @@ pub fn trust_host_key(
         .append(true)
         .mode(KNOWN_HOSTS_FILE_MODE)
         .open(&path)
-        .map_err(|e| format!("写入 known_hosts 失败: {e}"))?;
+        .map_err(|e| crate::tr!(format!("写入 known_hosts 失败: {e}"), format!("Failed to write known_hosts: {e}")))?;
     file.write_all(line.as_bytes())
         .and_then(|_| file.sync_all())
-        .map_err(|e| format!("写入 known_hosts 失败: {e}"))?;
+        .map_err(|e| crate::tr!(format!("写入 known_hosts 失败: {e}"), format!("Failed to write known_hosts: {e}")))?;
     crate::activity::success(
         crate::activity::Category::HostKey,
-        format!("已信任 {host}:{port} 的指纹 {type_name} {}", info.fingerprint),
+        crate::tr!(
+            format!("已信任 {host}:{port} 的指纹 {type_name} {}", info.fingerprint),
+            format!("Trusted host key fingerprint for {host}:{port}: {type_name} {}", info.fingerprint)
+        ),
     );
     Ok(())
 }

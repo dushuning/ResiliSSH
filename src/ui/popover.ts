@@ -3,6 +3,8 @@
  * 也不能分组显示「收藏 / 最近」，所以自己渲染。
  */
 
+import { t } from "../i18n";
+
 export interface PopoverItem {
   label: string;
   title?: string;
@@ -91,7 +93,7 @@ export class Popover {
       if (item.onRemove) {
         const remove = document.createElement("span");
         remove.className = "popover-item-remove";
-        remove.title = "移除";
+        remove.title = t("移除");
         remove.textContent = "×";
         remove.addEventListener("click", (event) => {
           // 删除不应同时触发「选中」。

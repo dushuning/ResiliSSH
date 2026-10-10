@@ -11,6 +11,7 @@ import { BlockMap, type BlockMapPhase } from "./ui/blockMap";
 import { icons } from "./ui/icons";
 import { Popover, type PopoverItem } from "./ui/popover";
 import { appTemplate } from "./ui/template";
+import { language, languagePreference, locale, setLanguagePreference, t, type LanguagePreference } from "./i18n";
 
 interface SshHostEntry {
   alias: string;
@@ -206,6 +207,11 @@ interface TransferStateView {
 }
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
+
+// 先告诉后端界面语言：之后后端生成的错误信息、活动日志都按这个语言输出。
+void invoke("set_language", { language: language() }).catch(() => {
+  // 浏览器预览模式下没有后端。
+});
 
 app.innerHTML = appTemplate(APP_NAME);
 
@@ -485,7 +491,7 @@ function setTransferring(running: boolean) {
   testConnBtn.disabled = running;
   setTransferFormLocked(running);
   syncDirectionLock();
-  cancelBtn.textContent = "取消传输";
+  cancelBtn.textContent = t("取消传输");
   cancelBtn.classList.remove("is-cancelling");
   if (running) {
     isConnecting = true;
@@ -541,7 +547,7 @@ function syncDirectionLock() {
 }
 
 function updateTransferButtonLabel() {
-  const verb = isDownloadMode() ? "下载" : "上传";
+  const verb = isDownloadMode() ? t("下载") : t("上传");
   // 成功后唯一的下一步是「再传一个」，把它升级为主按钮；其他情况它只是次要的「返回修改」。
   // 「传完但命令失败」也算传输成功：下一步同样是「再传一个」，重试传输没有意义。
   const successResult = currentView === "result" && resultCard.dataset.transferOk === "1";
@@ -550,15 +556,16 @@ function updateTransferButtonLabel() {
   resultBackBtn.classList.toggle("btn-secondary", !successResult);
   if (successResult) {
     transferBtn.classList.add("hidden");
-    resultBackBtn.textContent = `再${verb}一个`;
+    resultBackBtn.textContent = t("再{verb}一个", { verb });
     return;
   }
-  resultBackBtn.textContent = "返回修改";
+  resultBackBtn.textContent = t("返回修改");
   if (currentView === "result") {
-    const retryLabel = isQueueSelection() ? `重试 ${selectedUploads.length} 个文件` : "重试";
-    transferBtn.innerHTML = resultCard.classList.contains("paused") ? "继续传输" : retryLabel;
+    const retryLabel = isQueueSelection() ? t("重试 {length} 个文件", { length: selectedUploads.length }) : t("重试");
+    transferBtn.innerHTML = resultCard.classList.contains("paused") ? t("继续传输") : retryLabel;
   } else {
-    transferBtn.innerHTML = `开始${verb} <kbd>⌘↩</kbd>`;
+    // 用整句翻译而不是拼接动词：后端提示里会引用按钮原文（如 click "Start upload"），两边必须一致。
+    transferBtn.innerHTML = `${isDownloadMode() ? t("开始下载") : t("开始上传")} <kbd>⌘↩</kbd>`;
   }
 }
 
@@ -575,7 +582,7 @@ function beginRunVisuals() {
   blockMap.reset();
   blockMap.setVerifiedPerBlock(isReliableMode());
   if (activeQueue) {
-    queueChip.textContent = `第 ${activeQueue.index + 1} / ${activeQueue.items.length} 个`;
+    queueChip.textContent = t("第 {p1} / {length} 个", { p1: activeQueue.index + 1, length: activeQueue.items.length });
     queueChip.classList.remove("hidden");
   } else {
     queueChip.classList.add("hidden");
@@ -602,27 +609,27 @@ function beginRunVisuals() {
 
 function updateTransferDirectionUI() {
   const download = isDownloadMode();
-  localPathLabel.textContent = download ? "保存到" : "本地文件";
-  remotePathLabel.textContent = download ? "远端文件" : "远端路径";
+  localPathLabel.textContent = download ? t("保存到") : t("本地文件");
+  remotePathLabel.textContent = download ? t("远端文件") : t("远端路径");
   localPathInput.placeholder = download
-    ? "本地目录（以 / 结尾）或完整文件路径"
-    : "选择或拖拽文件到此处";
+    ? t("本地目录（以 / 结尾）或完整文件路径")
+    : t("选择或拖拽文件到此处");
   remotePathInput.placeholder = download
     ? "/home/user/file.jar"
-    : "/home/user/dir/ 或 /home/user/file.jar";
+    : t("/home/user/dir/ 或 /home/user/file.jar");
   pathHint.textContent = download
-    ? "保存路径填目录时自动拼接远端文件名"
-    : "以 / 结尾表示目录，会自动拼接文件名";
+    ? t("保存路径填目录时自动拼接远端文件名")
+    : t("以 / 结尾表示目录，会自动拼接文件名");
   dropHint.textContent = download
-    ? "点「选择…」指定保存目录"
-    : "也可以直接把文件拖到窗口里";
+    ? t("点「选择…」指定保存目录")
+    : t("也可以直接把文件拖到窗口里");
   dropZone.classList.toggle("download-mode", download);
-  forceOverwriteLabel.textContent = "强制从头覆盖";
+  forceOverwriteLabel.textContent = t("强制从头覆盖");
   forceOverwriteInput.parentElement!.title = download
-    ? "忽略断点与本地已有文件，从头重新下载"
-    : "忽略断点与远端已有数据，从头重新上传";
+    ? t("忽略断点与本地已有文件，从头重新下载")
+    : t("忽略断点与远端已有数据，从头重新上传");
   updateTransferButtonLabel();
-  browseRemoteBtn.textContent = "浏览…";
+  browseRemoteBtn.textContent = t("浏览…");
   updateRemoteBrowseModeUi();
   updateResolvedPathHint();
   updateTransferStatePanel();
@@ -637,8 +644,8 @@ function isReliableMode(): boolean {
 
 function updateModeHint() {
   modeHint.textContent = isReliableMode()
-    ? "每块写完读回比对，略慢但最稳"
-    : "只在传完后整体校验，速度更快";
+    ? t("每块写完读回比对，略慢但最稳")
+    : t("只在传完后整体校验，速度更快");
 }
 
 interface ConnectionReadiness {
@@ -657,29 +664,29 @@ function getConnectionReadiness(): ConnectionReadiness {
     : "";
 
   if (!host && !user) {
-    return { ready: false, summary: "未配置连接" };
+    return { ready: false, summary: t("未配置连接") };
   }
 
   const endpoint = user && host ? `${user}@${host}:${port}` : host || user;
   const issues: string[] = [];
 
-  if (!host) issues.push("缺主机");
-  if (!user) issues.push("缺用户名");
+  if (!host) issues.push(t("缺主机"));
+  if (!user) issues.push(t("缺用户名"));
 
   const needsPassword = authTypeSelect.value === "password";
   const missingPassword = needsPassword && !passwordInput.value;
   const missingKey = !needsPassword && !keyPathInput.value.trim();
 
   // 已保存的服务器密码在钥匙串里、连接时才读取，此时输入框为空不代表缺密码。
-  if (missingPassword && !profileSelected) issues.push("缺密码");
-  if (missingKey) issues.push("缺私钥");
+  if (missingPassword && !profileSelected) issues.push(t("缺密码"));
+  if (missingKey) issues.push(t("缺私钥"));
   if (!profileSelected && (missingPassword || missingKey)) {
-    issues.unshift("未选连接");
+    issues.unshift(t("未选连接"));
   }
 
   if (issues.length === 0) {
     // 选择器本身已显示服务器名称，摘要只补充地址；未保存的连接才需要在摘要里说明。
-    const summary = profileLabel ? endpoint : `${endpoint} · 未保存`;
+    const summary = profileLabel ? endpoint : t("{endpoint} · 未保存", { endpoint });
     return { ready: true, summary };
   }
 
@@ -693,8 +700,8 @@ function getConnectionReadiness(): ConnectionReadiness {
 function updateConnectionSummary() {
   const state = getConnectionReadiness();
   let summaryText: string;
-  if (state.summary === "未配置连接") {
-    summaryText = "还没有配置服务器，点「编辑」添加";
+  if (state.summary === t("未配置连接")) {
+    summaryText = t("还没有配置服务器，点「编辑」添加");
   } else if (state.detail) {
     summaryText = `${state.summary} · ${state.detail}`;
   } else {
@@ -725,26 +732,26 @@ function validateConnectionBeforeTransfer(): void {
 
   if (!host || !user) {
     throw new Error(
-      "还没有选择服务器。请在上方选择已保存的服务器，或到「服务器」页添加",
+      t("还没有选择服务器。请在上方选择已保存的服务器，或到「服务器」页添加"),
     );
   }
 
   if (authTypeSelect.value === "password" && !passwordInput.value) {
     throw new Error(
       profileSelected
-        ? "所选服务器没有保存密码。请到「服务器」页填写密码并保存"
-        : "密码为空。请到「服务器」页填写密码",
+        ? t("所选服务器没有保存密码。请到「服务器」页填写密码并保存")
+        : t("密码为空。请到「服务器」页填写密码"),
     );
   }
 
   if (authTypeSelect.value === "key" && !keyPathInput.value.trim()) {
-    throw new Error("请到「服务器」页选择私钥文件");
+    throw new Error(t("请到「服务器」页选择私钥文件"));
   }
 
   throw new Error(
     state.detail
-      ? `连接未就绪（${state.detail}）。请到「服务器」页检查`
-      : "连接未就绪，请到「服务器」页检查",
+      ? t("连接未就绪（{detail}）。请到「服务器」页检查", { detail: state.detail })
+      : t("连接未就绪，请到「服务器」页检查"),
   );
 }
 
@@ -755,7 +762,7 @@ function analyzeCheckpointState(
   const transferred = getTransferredBytes(cp);
   const total = cp.file_size;
   const pct = total > 0 ? Math.round((transferred / total) * 100) : 0;
-  const action = download ? "开始下载" : "开始上传";
+  const action = download ? t("开始下载") : t("开始上传");
   const verifyReadFailed = cp.failure_reason === "verify_read_failed";
   const needsRedo =
     cp.failure_reason === "hash_mismatch" ||
@@ -764,44 +771,44 @@ function analyzeCheckpointState(
   if (verifyReadFailed && transferred >= total) {
     return {
       kind: "info",
-      title: "传输已完成，待最终校验",
-      detail: `各数据块均已通过校验（${formatBytes(total)}）`,
-      hint: `直接点「${action}」重试校验即可，无需从头重传`,
+      title: t("传输已完成，待最终校验"),
+      detail: t("各数据块均已通过校验（{p1}）", { p1: formatBytes(total) }),
+      hint: t("直接点「{action}」重试校验即可，无需从头重传", { action }),
       showClear: true,
     };
   }
   if (needsRedo) {
     return {
       kind: "error",
-      title: download ? "校验未通过，需重新下载" : "校验未通过，需重新上传",
-      detail: `已传输 ${formatBytes(transferred)}，但完整性校验失败`,
-      hint: "请勾选「强制覆盖」或先清除断点后再试",
+      title: download ? t("校验未通过，需重新下载") : t("校验未通过，需重新上传"),
+      detail: t("已传输 {p1}，但完整性校验失败", { p1: formatBytes(transferred) }),
+      hint: t("请勾选「强制覆盖」或先清除断点后再试"),
       showClear: true,
     };
   }
   if (transferred > 0 && transferred < total) {
     return {
       kind: "info",
-      title: `可续传（${pct}%）`,
-      detail: `${download ? "已下" : "已传"} ${formatBytes(transferred)} / ${formatBytes(total)}`,
-      hint: `点击「${action}」将从断点继续`,
+      title: t("可续传（{pct}%）", { pct }),
+      detail: t("{p1} {p2} / {p3}", { p1: download ? t("已下") : t("已传"), p2: formatBytes(transferred), p3: formatBytes(total) }),
+      hint: t("点击「{action}」将从断点继续", { action }),
       showClear: true,
     };
   }
   if (transferred === 0 && cp.status === "failed") {
     return {
       kind: "warn",
-      title: download ? "上次下载未完成" : "上次上传未完成",
-      detail: "断点记录无有效进度",
-      hint: `点击「${action}」将重新传输；若远端/本地已有文件会自动处理`,
+      title: download ? t("上次下载未完成") : t("上次上传未完成"),
+      detail: t("断点记录无有效进度"),
+      hint: t("点击「{action}」将重新传输；若远端/本地已有文件会自动处理", { action }),
       showClear: true,
     };
   }
   return {
     kind: "warn",
-    title: download ? "检测到未完成下载" : "检测到未完成上传",
+    title: download ? t("检测到未完成下载") : t("检测到未完成上传"),
     detail: transferred > 0 ? `${formatBytes(transferred)} / ${formatBytes(total)}` : undefined,
-    hint: `点击「${action}」继续`,
+    hint: t("点击「{action}」继续", { action }),
     showClear: true,
   };
 }
@@ -813,9 +820,9 @@ function analyzeProbeState(
   if (forceOverwriteInput.checked) {
     return {
       kind: "warn",
-      title: download ? "将强制覆盖本地文件" : "将强制覆盖远端文件",
+      title: download ? t("将强制覆盖本地文件") : t("将强制覆盖远端文件"),
       detail: probe.message,
-      hint: "开始传输前会删除已有文件并从头重来",
+      hint: t("开始传输前会删除已有文件并从头重来"),
       showClear: false,
     };
   }
@@ -824,25 +831,25 @@ function analyzeProbeState(
   if (action === "verify_retry") {
     return {
       kind: "info",
-      title: "传输已完成，待最终校验",
+      title: t("传输已完成，待最终校验"),
       detail: probe.message,
-      hint: download ? "直接开始下载即可重试校验" : "直接开始上传即可重试校验",
+      hint: download ? t("直接开始下载即可重试校验") : t("直接开始上传即可重试校验"),
       showClear: false,
     };
   }
   if (action === "full_reupload" || action === "full_redownload") {
     return {
       kind: "error",
-      title: action === "full_redownload" ? "需从头重下" : "需从头重传",
+      title: action === "full_redownload" ? t("需从头重下") : t("需从头重传"),
       detail: probe.message,
-      hint: "继续将删除已有文件并重新传输",
+      hint: t("继续将删除已有文件并重新传输"),
       showClear: false,
     };
   }
   if (action === "overwrite") {
     return {
       kind: "warn",
-      title: download ? "将覆盖本地文件" : "将覆盖远端文件",
+      title: download ? t("将覆盖本地文件") : t("将覆盖远端文件"),
       detail: probe.message,
       showClear: false,
     };
@@ -850,14 +857,14 @@ function analyzeProbeState(
   if (action === "resume") {
     return {
       kind: "info",
-      title: "可续传",
+      title: t("可续传"),
       detail: probe.message,
       showClear: false,
     };
   }
   return {
     kind: "neutral",
-    title: download ? "可以开始下载" : "可以开始上传",
+    title: download ? t("可以开始下载") : t("可以开始上传"),
     detail: probe.message,
     showClear: false,
   };
@@ -985,12 +992,12 @@ let remoteBrowseLoading = false;
 
 function updateRemoteBrowseModeUi() {
   const download = isDownloadMode();
-  remoteBrowseTitle.textContent = download ? "浏览远端文件" : "浏览远端目录";
+  remoteBrowseTitle.textContent = download ? t("浏览远端文件") : t("浏览远端目录");
   remoteBrowseSelectDirBtn.classList.toggle("hidden", download);
-  remoteBrowseSelectDirBtn.textContent = "选择此目录";
+  remoteBrowseSelectDirBtn.textContent = t("选择此目录");
   remoteBrowseHint.textContent = download
-    ? "双击文件夹进入；单击文件选中"
-    : "双击文件夹进入；双击文件选中";
+    ? t("双击文件夹进入；单击文件选中")
+    : t("双击文件夹进入；双击文件选中");
 }
 
 function openRemoteBrowseOverlay() {
@@ -1038,7 +1045,7 @@ function renderRemoteBrowseListing(listing: RemoteDirListing) {
   if (listing.entries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "remote-browse-empty";
-    empty.textContent = "此目录为空";
+    empty.textContent = t("此目录为空");
     remoteBrowseList.appendChild(empty);
     return;
   }
@@ -1061,7 +1068,7 @@ function renderRemoteBrowseListing(listing: RemoteDirListing) {
 
     const meta = document.createElement("span");
     meta.className = "remote-browse-meta";
-    meta.textContent = entry.is_dir ? "目录" : formatBytes(entry.size);
+    meta.textContent = entry.is_dir ? t("目录") : formatBytes(entry.size);
 
     row.append(icon, name, meta);
     row.addEventListener("click", () => {
@@ -1102,18 +1109,18 @@ async function handleRemoteBrowseEntryActivate(entry: RemoteDirEntry) {
 async function createRemoteBrowseDir() {
   const dirName = remoteBrowseNewDirName.value.trim();
   if (!dirName) {
-    setRemoteBrowseStatus("请输入目录名称", "error");
+    setRemoteBrowseStatus(t("请输入目录名称"), "error");
     return;
   }
 
   const parentPath = remoteBrowseCurrent?.path ?? remoteBrowsePath.value.trim();
   if (!parentPath) {
-    setRemoteBrowseStatus("请先进入父目录", "error");
+    setRemoteBrowseStatus(t("请先进入父目录"), "error");
     return;
   }
 
   remoteBrowseCreateDirBtn.disabled = true;
-  setRemoteBrowseStatus("正在创建…");
+  setRemoteBrowseStatus(t("正在创建…"));
 
   try {
     await prepareConnection();
@@ -1126,7 +1133,7 @@ async function createRemoteBrowseDir() {
     });
     hideRemoteBrowseNewDirForm();
     renderRemoteBrowseListing(listing);
-    setRemoteBrowseStatus(`已创建「${dirName}」`);
+    setRemoteBrowseStatus(t("已创建「{dirName}」", { dirName }));
   } catch (error) {
     setRemoteBrowseStatus(describeError(error), "error");
   } finally {
@@ -1140,7 +1147,7 @@ async function loadRemoteBrowseDir(path?: string) {
   browseRemoteBtn.disabled = true;
   remoteBrowseGoBtn.disabled = true;
   remoteBrowseUpBtn.disabled = true;
-  setRemoteBrowseStatus("正在加载…");
+  setRemoteBrowseStatus(t("正在加载…"));
 
   try {
     await prepareConnection();
@@ -1151,7 +1158,7 @@ async function loadRemoteBrowseDir(path?: string) {
       },
     });
     renderRemoteBrowseListing(listing);
-    setRemoteBrowseStatus(`${listing.entries.length} 项`);
+    setRemoteBrowseStatus(t("{length} 项", { length: listing.entries.length }));
   } catch (error) {
     setRemoteBrowseStatus(describeError(error), "error");
   } finally {
@@ -1210,8 +1217,8 @@ async function probeRemoteDownload(): Promise<RemoteDownloadProbe> {
   validateConnectionBeforeTransfer();
   const localPath = localPathInput.value.trim();
   const remotePath = remotePathInput.value.trim();
-  if (!localPath) throw new Error("请填写本地保存路径");
-  if (!remotePath) throw new Error("请填写远端文件路径");
+  if (!localPath) throw new Error(t("请填写本地保存路径"));
+  if (!remotePath) throw new Error(t("请填写远端文件路径"));
 
   return invoke<RemoteDownloadProbe>("probe_remote_download", {
     request: {
@@ -1231,22 +1238,22 @@ async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise<boolea
 
   if (forceOverwriteInput.checked) {
     return showConfirm(
-      "强制覆盖下载",
-      "将删除本地已有文件并从头重下，是否继续？",
+      t("强制覆盖下载"),
+      t("将删除本地已有文件并从头重下，是否继续？"),
     );
   }
 
   if (probe.action === "full_redownload") {
     return showConfirm(
-      "需要从头重下",
-      `${probe.message}\n\n将删除本地已有文件并重新下载，是否继续？`,
+      t("需要从头重下"),
+      t("{message}\n\n将删除本地已有文件并重新下载，是否继续？", { message: probe.message }),
     );
   }
 
   if (probe.action === "overwrite") {
     return showConfirm(
-      "覆盖本地文件",
-      `${probe.message}\n\n本地已有同名文件，继续将覆盖重下，是否继续？`,
+      t("覆盖本地文件"),
+      t("{message}\n\n本地已有同名文件，继续将覆盖重下，是否继续？", { message: probe.message }),
     );
   }
 
@@ -1270,7 +1277,7 @@ async function invokeStartDownload(forceOverwrite: boolean) {
     });
   } catch (error) {
     const message = describeError(error);
-    if (!isTransferring && message.includes("已有下载任务在进行中")) {
+    if (!isTransferring && matchesBackend(message, BACKEND_TEXT.downloadRunning)) {
       await invoke("reset_download_state");
       await invoke("start_download", {
         request: downloadPayload(forceOverwrite),
@@ -1298,7 +1305,7 @@ async function startDownloadFlow() {
   isConnecting = true;
   setProgressState("uploading");
   applyActiveTransferBadge("download");
-  showProgressSpeed("正在建立 SSH 连接…");
+  showProgressSpeed(t("正在建立 SSH 连接…"));
 
   await invokeStartDownload(forceOverwrite);
 }
@@ -1307,8 +1314,8 @@ async function probeRemoteUpload(): Promise<RemoteUploadProbe> {
   validateConnectionBeforeTransfer();
   const localPath = localPathInput.value.trim();
   const remotePath = remotePathInput.value.trim();
-  if (!localPath) throw new Error("请选择本地文件");
-  if (!remotePath) throw new Error("请填写远端路径");
+  if (!localPath) throw new Error(t("请选择本地文件"));
+  if (!remotePath) throw new Error(t("请填写远端路径"));
 
   return invoke<RemoteUploadProbe>("probe_remote_upload", {
     request: {
@@ -1328,22 +1335,22 @@ async function confirmUploadAction(probe: RemoteUploadProbe): Promise<boolean> {
 
   if (forceOverwriteInput.checked) {
     return showConfirm(
-      "强制覆盖上传",
-      "将删除远端已有文件并从头重传，是否继续？",
+      t("强制覆盖上传"),
+      t("将删除远端已有文件并从头重传，是否继续？"),
     );
   }
 
   if (probe.action === "full_reupload") {
     return showConfirm(
-      "需要从头重传",
-      `${probe.message}\n\n将删除远端已有文件并重新上传，是否继续？`,
+      t("需要从头重传"),
+      t("{message}\n\n将删除远端已有文件并重新上传，是否继续？", { message: probe.message }),
     );
   }
 
   if (probe.action === "overwrite") {
     return showConfirm(
-      "覆盖远端文件",
-      `${probe.message}\n\n远端已有同名文件，继续将覆盖重传，是否继续？`,
+      t("覆盖远端文件"),
+      t("{message}\n\n远端已有同名文件，继续将覆盖重传，是否继续？", { message: probe.message }),
     );
   }
 
@@ -1357,7 +1364,7 @@ async function invokeStartUpload(forceOverwrite: boolean) {
     });
   } catch (error) {
     const message = describeError(error);
-    if (!isTransferring && message.includes("已有上传任务在进行中")) {
+    if (!isTransferring && matchesBackend(message, BACKEND_TEXT.uploadRunning)) {
       await invoke("reset_upload_state");
       await invoke("start_upload", {
         request: uploadPayload(forceOverwrite),
@@ -1407,7 +1414,7 @@ async function startOneUpload(): Promise<boolean> {
   isConnecting = true;
   setProgressState("uploading");
   applyActiveTransferBadge("upload");
-  showProgressSpeed("正在建立 SSH 连接…");
+  showProgressSpeed(t("正在建立 SSH 连接…"));
 
   await invokeStartUpload(forceOverwrite);
   return true;
@@ -1421,7 +1428,7 @@ async function startQueueFlow() {
   await prepareConnection();
   // 多个文件必须传到目录里，否则会互相覆盖成同一个远端文件。
   const remoteDir = remotePathInput.value.trim();
-  if (!remoteDir) throw new Error("请填写远端目录");
+  if (!remoteDir) throw new Error(t("请填写远端目录"));
   if (!remoteDir.endsWith("/")) remotePathInput.value = `${remoteDir}/`;
 
   const queueStartedAt = Date.now();
@@ -1454,7 +1461,7 @@ async function startQueueFlow() {
       if (!started) {
         resolveQueueStep = null;
         item.status = "skipped";
-        item.message = "已跳过";
+        item.message = t("已跳过");
         continue;
       }
       item.remote = runRemotePath;
@@ -1467,10 +1474,10 @@ async function startQueueFlow() {
         item.message = clarifyTransferError(result.message);
       } else {
         item.status = "cancelled";
-        item.message = "已取消，断点已保留";
+        item.message = t("已取消，断点已保留");
         for (const rest of queue.items.slice(i + 1)) {
           rest.status = "cancelled";
-          rest.message = "未开始";
+          rest.message = t("未开始");
         }
         break;
       }
@@ -1504,8 +1511,8 @@ async function finishQueue(items: QueueItem[], template: string, startedAt: numb
   if (done.length === total) {
     runPostCommandTemplate = template;
     await finishSuccessfulRun(
-      `${total} 个文件全部上传完成`,
-      `已传到 ${hostInput.value.trim()}:${remoteDirOf(done[0].remote)}`,
+      t("{total} 个文件全部上传完成", { total }),
+      t("已传到 {p1}:{p2}", { p1: hostInput.value.trim(), p2: remoteDirOf(done[0].remote) }),
       stats,
       done.map((i) => i.remote),
     );
@@ -1518,29 +1525,29 @@ async function finishQueue(items: QueueItem[], template: string, startedAt: numb
   const failedCount = items.filter((i) => i.status === "failed").length;
   const otherCount = total - done.length - failedCount;
   const summary = [
-    `成功 ${done.length} 个`,
-    failedCount > 0 ? `失败 ${failedCount} 个` : "",
-    otherCount > 0 ? `未完成 ${otherCount} 个` : "",
+    t("成功 {length} 个", { length: done.length }),
+    failedCount > 0 ? t("失败 {failedCount} 个", { failedCount }) : "",
+    otherCount > 0 ? t("未完成 {otherCount} 个", { otherCount }) : "",
   ]
     .filter(Boolean)
     .join("，");
-  const commandNote = template ? "\n因有文件未成功，传完后命令没有执行" : "";
+  const commandNote = template ? t("\n因有文件未成功，传完后命令没有执行") : "";
   if (cancelled) {
-    showResult("paused", "批量上传已取消", `${summary}${commandNote}`, stats);
+    showResult("paused", t("批量上传已取消"), `${summary}${commandNote}`, stats);
   } else if (done.length === 0) {
-    showResult("error", "批量上传失败", `${summary}${commandNote}`, stats);
+    showResult("error", t("批量上传失败"), `${summary}${commandNote}`, stats);
   } else {
-    showResult("warn", "部分文件上传失败", `${summary}${commandNote}`, stats, false);
+    showResult("warn", t("部分文件上传失败"), `${summary}${commandNote}`, stats, false);
   }
 }
 
 const QUEUE_STATUS_LABEL: Record<QueueItemStatus, string> = {
-  pending: "未开始",
-  running: "传输中",
-  done: "完成",
-  failed: "失败",
-  skipped: "已跳过",
-  cancelled: "已取消",
+  pending: t("未开始"),
+  running: t("传输中"),
+  done: t("完成"),
+  failed: t("失败"),
+  skipped: t("已跳过"),
+  cancelled: t("已取消"),
 };
 
 function renderQueueResultFiles(items: QueueItem[] | null) {
@@ -1587,7 +1594,7 @@ function formatBytes(bytes: number): string {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts * 1000).toLocaleString("zh-CN", {
+  return new Date(ts * 1000).toLocaleString(locale(), {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -1619,12 +1626,12 @@ function updateBookmarkButton() {
   bookmarkBtn.classList.toggle("is-active", bookmarked);
   bookmarkBtn.innerHTML = bookmarked ? icons.starFilled : icons.star;
   bookmarkBtn.title = !profile
-    ? "保存服务器后才能收藏目录"
+    ? t("保存服务器后才能收藏目录")
     : !dir
-      ? "填写远端目录后可收藏"
+      ? t("填写远端目录后可收藏")
       : bookmarked
-        ? `取消收藏 ${dir}`
-        : `收藏 ${dir}`;
+        ? t("取消收藏 {dir}", { dir })
+        : t("收藏 {dir}", { dir });
 }
 
 async function saveProfileExtras(
@@ -1698,12 +1705,12 @@ function openPathMenu() {
   }));
   pathMenu.show(
     [
-      { heading: "收藏", items: bookmarkItems },
-      { heading: "最近使用", items: recentItems },
+      { heading: t("收藏"), items: bookmarkItems },
+      { heading: t("最近使用"), items: recentItems },
     ],
     profile
-      ? "还没有常用目录\n填好远端目录后点输入框里的 ☆ 收藏"
-      : "这台服务器还没保存\n到「服务器」页保存后即可收藏目录",
+      ? t("还没有常用目录\n填好远端目录后点输入框里的 ☆ 收藏")
+      : t("这台服务器还没保存\n到「服务器」页保存后即可收藏目录"),
   );
 }
 
@@ -1722,17 +1729,17 @@ async function ensureHostTrusted(): Promise<void> {
   const info = await invoke<HostKeyInfo>("check_host_key", { request: { host, port } });
   if (info.status === "changed") {
     throw new Error(
-      `服务器 ${hostId} 的指纹与已记录的不一致（当前 ${info.fingerprint}），可能遭遇中间人攻击，已拒绝连接。\n` +
-        "如确认服务器重装过系统，请从 ~/.ssh/known_hosts 或 ~/Library/Application Support/sshutil/known_hosts 中删除旧记录后重试。",
+      t("服务器 {hostId} 的指纹与已记录的不一致（当前 {fingerprint}），可能遭遇中间人攻击，已拒绝连接。\n", { hostId, fingerprint: info.fingerprint }) +
+        t("如确认服务器重装过系统，请从 ~/.ssh/known_hosts 或 ~/Library/Application Support/sshutil/known_hosts 中删除旧记录后重试。"),
     );
   }
   if (info.status === "unknown") {
     const trusted = await showConfirm(
-      "首次连接该服务器",
+      t("首次连接该服务器"),
       `${hostId}\n${info.key_type}\n${info.fingerprint}\n\n` +
-        "请与服务器管理员核对上面的指纹（服务器上可运行 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub）。确认信任后将记住该服务器。",
+        t("请与服务器管理员核对上面的指纹（服务器上可运行 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub）。确认信任后将记住该服务器。"),
     );
-    if (!trusted) throw new Error("未信任该服务器，已取消连接");
+    if (!trusted) throw new Error(t("未信任该服务器，已取消连接"));
     await invoke("trust_host_key", {
       request: { host, port, fingerprint: info.fingerprint },
     });
@@ -1761,34 +1768,51 @@ function setBadge(
   if (kind !== "idle") progressBadge.classList.add(kind);
 }
 
+/**
+ * 后端错误文本中的固定片段（中英文各一份）。后端按界面语言出文案，但切换语言前产生的消息
+ * 仍是旧语言，所以两种都要认。与 src-tauri 中对应文案保持一致，修改时两边同步。
+ */
+const BACKEND_TEXT = {
+  uploadRunning: ["已有上传任务在进行中", "An upload is already in progress"],
+  downloadRunning: ["已有下载任务在进行中", "A download is already in progress"],
+  remotePath: ["远端路径错误", "远端路径「", "Remote path error", 'Remote path "'],
+  passwordMissing: ["请填写密码", "Please enter a password"],
+  authFailed: ["认证失败", "服务器拒绝了提供的凭据", "Authentication failed", "The server rejected the credentials"],
+  sftpError: ["SFTP 错误", "SFTP error"],
+} as const;
+
+function matchesBackend(message: string, fragments: readonly string[]): boolean {
+  return fragments.some((fragment) => message.includes(fragment));
+}
+
 /** 只取错误信息本身：直接 String(new Error(x)) 会在界面上带出英文 "Error: " 前缀。 */
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 function clarifyTransferError(message: string): string {
-  if (message.includes("远端路径错误") || message.includes("远端路径「")) {
+  if (matchesBackend(message, BACKEND_TEXT.remotePath)) {
     return message;
   }
-  if (message.includes("请填写密码")) {
-    return "未填写密码。请到「服务器」页填写密码";
+  if (matchesBackend(message, BACKEND_TEXT.passwordMissing)) {
+    return t("未填写密码。请到「服务器」页填写密码");
   }
   if (
-    /认证失败|服务器拒绝了提供的凭据/i.test(message) &&
+    matchesBackend(message, BACKEND_TEXT.authFailed) &&
     authTypeSelect.value === "password" &&
     !passwordInput.value
   ) {
-    return "未填写密码。请到「服务器」页填写密码";
+    return t("未填写密码。请到「服务器」页填写密码");
   }
-  if (/认证失败|服务器拒绝了提供的凭据/i.test(message)) {
-    return `SSH 认证失败，密码或私钥可能不正确。\n${message}`;
+  if (matchesBackend(message, BACKEND_TEXT.authFailed)) {
+    return t("SSH 认证失败，密码或私钥可能不正确。\n{message}", { message });
   }
   const remote = remotePathInput.value.trim();
   if (/no such file|sftp\(2\)/i.test(message) && remote) {
-    return `远端路径错误：${remote}\n该路径或上级目录在服务器上不存在（本地文件不受影响）`;
+    return t("远端路径错误：{remote}\n该路径或上级目录在服务器上不存在（本地文件不受影响）", { remote });
   }
-  if (/SFTP 错误/i.test(message) && remote && !message.includes(remote)) {
-    return `远端路径错误：${remote}\n${message}`;
+  if (matchesBackend(message, BACKEND_TEXT.sftpError) && remote && !message.includes(remote)) {
+    return t("远端路径错误：{remote}\n{message}", { remote, message });
   }
   return message;
 }
@@ -1810,20 +1834,20 @@ function setProgressState(state: "idle" | "uploading" | "retrying" | "verifying"
 
 /** 传输进行中徽章：连接中 / 重连无响应 / 正常传输 */
 function applyActiveTransferBadge(direction: TransferDirection) {
-  const badgeActive = direction === "upload" ? "上传中" : "下载中";
+  const badgeActive = direction === "upload" ? t("上传中") : t("下载中");
   if (isConnecting) {
     setProgressState("uploading");
-    setBadge("连接中", "retrying");
+    setBadge(t("连接中"), "retrying");
     return;
   }
   if (progressWrap.classList.contains("stalled")) {
     setProgressState("retrying");
-    setBadge("等待响应", "stalled");
+    setBadge(t("等待响应"), "stalled");
     return;
   }
   if (isReconnecting) {
     setProgressState("retrying");
-    setBadge("重试中", "retrying");
+    setBadge(t("重试中"), "retrying");
     return;
   }
   setProgressState("uploading");
@@ -1859,10 +1883,10 @@ function refreshLiveVisuals() {
   miniTransfer.classList.toggle("is-waiting", waiting);
   if (!isTransferring) return;
 
-  const verb = runDirection === "download" ? "下载" : "上传";
+  const verb = runDirection === "download" ? t("下载") : t("上传");
   const queuePart = activeQueue ? ` ${activeQueue.index + 1}/${activeQueue.items.length}` : "";
   miniTransferLabel.textContent =
-    (phase === "connecting" ? "连接中" : phase === "verifying" ? "校验中" : waiting ? "重连中" : `${verb}中`) +
+    (phase === "connecting" ? t("连接中") : phase === "verifying" ? t("校验中") : waiting ? t("重连中") : t("{verb}中", { verb })) +
     queuePart;
   const pct = progressTotalBytes > 0 ? (progressTransferredBytes / progressTotalBytes) * 100 : 0;
   miniTransferPct.textContent = `${Math.floor(pct)}%`;
@@ -1912,7 +1936,7 @@ function initThemePreference() {
 function formatProgressDetail(transferred: number, total: number, retries: number): string {
   // 百分比已经用大号数字单独展示，这里只给字节数与重连次数。
   const size = `${formatBytes(transferred)} / ${formatBytes(total)}`;
-  return retries > 0 ? `${size} · 已自动重连 ${retries} 次` : size;
+  return retries > 0 ? t("{size} · 已自动重连 {retries} 次", { size, retries }) : size;
 }
 
 function syncProgressStatsRow() {
@@ -1931,7 +1955,7 @@ function showProgressSpeed(text: string, stale = false) {
 function formatRetryDelayHint(): string {
   if (retryScheduledAt <= 0 || retryDelayMs <= 0) return "";
   const remaining = Math.max(0, Math.ceil((retryScheduledAt + retryDelayMs - Date.now()) / 1000));
-  return remaining > 0 ? `约 ${remaining}s 后重试` : "";
+  return remaining > 0 ? t("约 {remaining}s 后重试", { remaining }) : "";
 }
 
 /** Stall/retry 副文本：动态计时，避免用户误以为界面卡死 */
@@ -1939,10 +1963,10 @@ function showWaitingSpeedText(elapsedMs: number) {
   const secs = Math.floor(elapsedMs / 1000);
   const delayHint = formatRetryDelayHint();
   const details: string[] = [];
-  if (isReconnecting && retryCount > 0) details.push(`第 ${retryCount} 次重试`);
+  if (isReconnecting && retryCount > 0) details.push(t("第 {retryCount} 次重试", { retryCount }));
   if (delayHint) details.push(delayHint);
-  details.push(`已等待 ${secs}s`);
-  const prefix = isReconnecting ? "重连中..." : "等待响应...";
+  details.push(t("已等待 {secs}s", { secs }));
+  const prefix = isReconnecting ? t("重连中...") : t("等待响应...");
   showProgressSpeed(`${prefix} (${details.join(" · ")})`, true);
 }
 
@@ -1950,9 +1974,9 @@ function showWaitingSpeedText(elapsedMs: number) {
 function showReconnectingSpeedText() {
   const delayHint = formatRetryDelayHint();
   const details: string[] = [];
-  if (retryCount > 0) details.push(`第 ${retryCount} 次重试`);
+  if (retryCount > 0) details.push(t("第 {retryCount} 次重试", { retryCount }));
   if (delayHint) details.push(delayHint);
-  const prefix = "重连中...";
+  const prefix = t("重连中...");
   showProgressSpeed(
     details.length > 0 ? `${prefix} (${details.join(" · ")})` : prefix,
     true,
@@ -2037,15 +2061,15 @@ function restoreCredentialsFromProfile(host: string, port: number, username: str
   // 真正连接前由 ensureCredentialsLoaded 按需补齐密码。
 
   restorePostCommand();
-  setConnectionStatus(`已匹配服务器「${profile.name}」`, "ok");
+  setConnectionStatus(t("已匹配服务器「{name}」", { name: profile.name }), "ok");
   updateConnectionSummary();
 }
 
 function formatEtaSeconds(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "";
-  if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`;
-  return `${(seconds / 3600).toFixed(1)} 小时`;
+  if (seconds < 60) return t("{p1} 秒", { p1: Math.ceil(seconds) });
+  if (seconds < 3600) return t("{p1} 分钟", { p1: Math.ceil(seconds / 60) });
+  return t("{p1} 小时", { p1: (seconds / 3600).toFixed(1) });
 }
 
 function formatProgressPercent(transferred: number, total: number): string {
@@ -2069,8 +2093,8 @@ function updateProgress(transferred: number, total: number) {
   const perCell = blockMap.blocksPerCell;
   mapCaption.textContent =
     perCell > 1
-      ? `${blockMap.blockCount.toLocaleString()} 块 · 每格 ${perCell} MB`
-      : `${blockMap.blockCount.toLocaleString()} 块 · 每块 1 MB`;
+      ? t("{p1} 块 · 每格 {perCell} MB", { p1: blockMap.blockCount.toLocaleString(), perCell })
+      : t("{p1} 块 · 每块 1 MB", { p1: blockMap.blockCount.toLocaleString() });
   syncMapLegend();
   updateProgressDetail(transferred, total);
   refreshLiveVisuals();
@@ -2080,7 +2104,7 @@ function updateProgress(transferred: number, total: number) {
 function syncMapLegend() {
   const perBlock = blockMap.verifiesPerBlock;
   mapLegend.classList.toggle("per-block", perBlock);
-  legendDoneLabel.textContent = perBlock ? "本次已传并校验" : "本次已传（待最终校验）";
+  legendDoneLabel.textContent = perBlock ? t("本次已传并校验") : t("本次已传（待最终校验）");
   legendResumed.classList.toggle("hidden", !blockMap.hasResumedPart);
   legendRetry.classList.toggle("hidden", blockMap.retryCount === 0);
 }
@@ -2155,7 +2179,7 @@ function refreshSpeedDisplay() {
   const total = progressTotalBytes;
   if (total > transferred && speed > 0) {
     const eta = formatEtaSeconds((total - transferred) / speed);
-    if (eta) speedText += ` · 约 ${eta}`;
+    if (eta) speedText += t(" · 约 {eta}", { eta });
   }
   showProgressSpeed(speedText);
   refreshLiveVisuals();
@@ -2166,7 +2190,7 @@ function refreshStallUi() {
 
   if (isConnecting) {
     applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
-    showProgressSpeed("正在建立 SSH 连接…");
+    showProgressSpeed(t("正在建立 SSH 连接…"));
     refreshLiveVisuals();
     return;
   }
@@ -2218,7 +2242,7 @@ function updateDropZoneState() {
   if (!hasPath) return;
 
   if (isQueueSelection()) {
-    fileChipName.textContent = `${selectedUploads.length} 个文件`;
+    fileChipName.textContent = t("{length} 个文件", { length: selectedUploads.length });
     fileChipPath.textContent = selectedUploads.map(fileNameOf).join("、");
     fileChipPath.title = selectedUploads.join("\n");
   } else {
@@ -2271,7 +2295,10 @@ function updateResolvedPathHint() {
   if (isQueueSelection()) {
     const dir = remotePathInput.value.trim();
     resolvedPathHint.textContent = dir
-      ? `将依次上传 ${selectedUploads.length} 个文件到：${dir.endsWith("/") ? dir : `${dir}/`}`
+      ? t("将依次上传 {count} 个文件到：{dir}", {
+          count: selectedUploads.length,
+          dir: dir.endsWith("/") ? dir : `${dir}/`,
+        })
       : "";
     resolvedPathHint.classList.toggle("hidden", !dir);
     return;
@@ -2279,7 +2306,7 @@ function updateResolvedPathHint() {
   const resolved = previewResolvedPath();
   const remote = remotePathInput.value.trim();
   if (resolved && resolved !== remote && resolved !== localPathInput.value.trim()) {
-    const label = isDownloadMode() ? "实际保存至" : "实际上传至";
+    const label = isDownloadMode() ? t("实际保存至") : t("实际上传至");
     resolvedPathHint.textContent = `${label}：${resolved}`;
     resolvedPathHint.classList.remove("hidden");
   } else {
@@ -2288,9 +2315,9 @@ function updateResolvedPathHint() {
 }
 
 const HISTORY_STATUS_LABEL: Record<string, string> = {
-  completed: "完成",
-  failed: "失败",
-  cancelled: "已取消",
+  completed: t("完成"),
+  failed: t("失败"),
+  cancelled: t("已取消"),
 };
 
 function entryIcon(direction: TransferDirection): HTMLSpanElement {
@@ -2366,8 +2393,8 @@ function renderPendingTransfers() {
       const actions = document.createElement("div");
       actions.className = "pending-actions";
       actions.append(
-        makeButton("清除", "btn btn-plain btn-small", () => void clearCheckpointFor(direction)),
-        makeButton("继续", "btn btn-primary btn-small", () => void resumePendingTransfer(direction)),
+        makeButton(t("清除"), "btn btn-plain btn-small", () => void clearCheckpointFor(direction)),
+        makeButton(t("继续"), "btn btn-primary btn-small", () => void resumePendingTransfer(direction)),
       );
 
       row.append(entryIcon(direction), entryMain(name, target), actions, progress);
@@ -2380,7 +2407,7 @@ function renderHistory() {
   if (historyEntries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "list-empty";
-    empty.textContent = "还没有传输记录";
+    empty.textContent = t("还没有传输记录");
     historyList.replaceChildren(empty);
     return;
   }
@@ -2390,7 +2417,7 @@ function renderHistory() {
       const row = document.createElement("div");
       row.className = "history-row";
       const name = fileNameOf(direction === "download" ? entry.remote_path : entry.local_path);
-      const retries = entry.retry_count > 0 ? ` · 重连 ${entry.retry_count} 次` : "";
+      const retries = entry.retry_count > 0 ? t(" · 重连 {retry_count} 次", { retry_count: entry.retry_count }) : "";
       const meta = `${entry.username}@${entry.host} · ${formatBytes(entry.file_size)} · ${formatTime(entry.finished_at)}${retries}`;
       const chip = document.createElement("span");
       chip.className = `status-chip ${entry.status}`;
@@ -2400,7 +2427,7 @@ function renderHistory() {
         entryIcon(direction),
         entryMain(name, meta),
         chip,
-        makeButton("复用", "btn btn-secondary btn-small", () => void reuseHistoryEntry(entry)),
+        makeButton(t("复用"), "btn btn-secondary btn-small", () => void reuseHistoryEntry(entry)),
       );
       return row;
     }),
@@ -2460,10 +2487,10 @@ async function resumePendingTransfer(direction: TransferDirection) {
 async function clearCheckpointFor(direction: TransferDirection) {
   const download = direction === "download";
   const confirmed = await showConfirm(
-    "清除断点",
+    t("清除断点"),
     download
-      ? "确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。"
-      : "确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。",
+      ? t("确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。")
+      : t("确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。"),
   );
   if (!confirmed) return;
 
@@ -2475,7 +2502,7 @@ async function clearCheckpointFor(direction: TransferDirection) {
     activeUploadCheckpoint = null;
   }
   updateTransferStatePanel();
-  setStatus("断点记录已清除");
+  setStatus(t("断点记录已清除"));
 }
 
 function defaultProfileName(): string {
@@ -2523,12 +2550,12 @@ async function applyProfile(profile: ConnectionProfile) {
   if (profile.auth_kind === "password") {
     setConnectionStatus(
       secrets.password
-        ? `已加载「${profile.name}」，密码已自动填入`
-        : `已加载「${profile.name}」，请填写密码后点保存`,
+        ? t("已加载「{name}」，密码已自动填入", { name: profile.name })
+        : t("已加载「{name}」，请填写密码后点保存", { name: profile.name }),
       secrets.password ? "ok" : "normal",
     );
   } else {
-    setConnectionStatus(`已加载「${profile.name}」`, "ok");
+    setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "ok");
   }
 }
 
@@ -2573,7 +2600,7 @@ async function loadProfiles() {
   profileSelect.replaceChildren();
   const defaultOption = document.createElement("option");
   defaultOption.value = "";
-  defaultOption.textContent = "未保存的服务器";
+  defaultOption.textContent = t("未保存的服务器");
   profileSelect.appendChild(defaultOption);
 
   for (const profile of savedProfiles) {
@@ -2592,7 +2619,7 @@ function renderServerList() {
   if (savedProfiles.length === 0) {
     const empty = document.createElement("div");
     empty.className = "list-empty";
-    empty.textContent = "还没有保存的服务器\n在右侧填写后点「保存」";
+    empty.textContent = t("还没有保存的服务器\n在右侧填写后点「保存」");
     serverList.replaceChildren(empty);
     return;
   }
@@ -2795,7 +2822,7 @@ profileSelect.addEventListener("change", async () => {
 saveProfileBtn.addEventListener("click", async () => {
   const name = profileNameInput.value.trim() || defaultProfileName();
   if (!name) {
-    setConnectionStatus("请先填写连接名称，或选择 SSH Config Host", "error");
+    setConnectionStatus(t("请先填写连接名称，或选择 SSH Config Host"), "error");
     profileNameInput.focus();
     return;
   }
@@ -2818,11 +2845,11 @@ saveProfileBtn.addEventListener("click", async () => {
     profileNameInput.value = saved.name;
     const stored =
       authTypeSelect.value === "password" && passwordInput.value
-        ? "，密码已保存"
+        ? t("，密码已保存")
         : keyPassphraseInput.value
-          ? "，私钥口令已保存"
+          ? t("，私钥口令已保存")
           : "";
-    setConnectionStatus(`已保存为「${saved.name}」${stored}`, "ok");
+    setConnectionStatus(t("已保存为「{name}」{stored}", { name: saved.name, stored }), "ok");
   } catch (error) {
     setConnectionStatus(describeError(error), "error");
   }
@@ -2831,12 +2858,12 @@ saveProfileBtn.addEventListener("click", async () => {
 deleteProfileBtn.addEventListener("click", async () => {
   const id = profileSelect.value;
   if (!id) {
-    setConnectionStatus("请先选择要删除的连接", "error");
+    setConnectionStatus(t("请先选择要删除的连接"), "error");
     return;
   }
   const confirmed = await showConfirm(
-    "删除连接",
-    "确定删除这个已保存的连接？",
+    t("删除连接"),
+    t("确定删除这个已保存的连接？"),
   );
   if (!confirmed) return;
 
@@ -2845,7 +2872,7 @@ deleteProfileBtn.addEventListener("click", async () => {
     profileSelect.value = "";
     profileNameInput.value = "";
     await loadProfiles();
-    setConnectionStatus("连接配置已删除", "ok");
+    setConnectionStatus(t("连接配置已删除"), "ok");
   } catch (error) {
     setConnectionStatus(describeError(error), "error");
   }
@@ -2859,7 +2886,7 @@ hostSelect.addEventListener("change", () => {
   input.addEventListener("input", () => {
     updateConnectionSummary();
     if (!profileNameInput.value.trim()) {
-      profileNameInput.placeholder = defaultProfileName() || "保存名称，如 myserver 或 user@host";
+      profileNameInput.placeholder = defaultProfileName() || t("保存名称，如 myserver 或 user@host");
     }
   });
 });
@@ -2968,7 +2995,7 @@ remoteBrowseNewDirName.addEventListener("keydown", (event) => {
 testConnBtn.addEventListener("click", async () => {
   try {
     testConnBtn.disabled = true;
-    setConnectionStatus("正在测试连接…");
+    setConnectionStatus(t("正在测试连接…"));
     await prepareConnection();
     const message = await invoke<string>("test_connection", {
       request: connectionPayload(),
@@ -3006,6 +3033,29 @@ changeFileBtn.addEventListener("click", () => void pickLocalPaths());
 
 forceOverwriteInput.addEventListener("change", () => {
   if (lastProbe) updateTransferStatePanel();
+});
+
+const languageHint = document.querySelector<HTMLParagraphElement>("#languageHint")!;
+
+function initLanguagePreference() {
+  const saved = languagePreference();
+  const radio = document.querySelector<HTMLInputElement>(
+    `input[name="languageMode"][value="${saved}"]`,
+  );
+  if (radio) radio.checked = true;
+}
+
+document.querySelectorAll<HTMLInputElement>('input[name="languageMode"]').forEach((radio) => {
+  radio.addEventListener("change", () => {
+    if (!radio.checked) return;
+    // 切换语言会重新加载页面；传输虽在后端继续，但进行中视图会丢失本次的续传起点等信息。
+    if (isTransferring || commandRunning) {
+      initLanguagePreference();
+      languageHint.textContent = t("传输进行中，完成后再切换语言");
+      return;
+    }
+    setLanguagePreference(radio.value as LanguagePreference);
+  });
 });
 
 document.querySelectorAll<HTMLInputElement>('input[name="themeMode"]').forEach((radio) => {
@@ -3106,9 +3156,9 @@ const copyLogBtn = document.querySelector<HTMLButtonElement>("#copyLogBtn")!;
 copyLogBtn.addEventListener("click", async () => {
   await copyText(activityLog.toText());
   const label = copyLogBtn.lastChild;
-  if (label) label.textContent = "已复制";
+  if (label) label.textContent = t("已复制");
   window.setTimeout(() => {
-    if (label) label.textContent = "复制";
+    if (label) label.textContent = t("复制");
   }, COPY_FEEDBACK_MS);
 });
 
@@ -3172,7 +3222,7 @@ document.addEventListener("keydown", (event) => {
 cancelBtn.addEventListener("click", () => {
   if (commandRunning) {
     cancelBtn.disabled = true;
-    cancelBtn.textContent = "停止中…";
+    cancelBtn.textContent = t("停止中…");
     void invoke("cancel_remote_command").catch(() => {});
     return;
   }
@@ -3180,17 +3230,17 @@ cancelBtn.addEventListener("click", () => {
 
   cancelInFlight = true;
   cancelBtn.disabled = true;
-  cancelBtn.textContent = "取消中…";
+  cancelBtn.textContent = t("取消中…");
   cancelBtn.classList.add("is-cancelling");
-  setBadge("取消中", "retrying");
-  setStatus("正在取消…");
+  setBadge(t("取消中"), "retrying");
+  setStatus(t("正在取消…"));
 
   const cmd = runDirection === "download" ? "cancel_download" : "cancel_upload";
   void invoke(cmd).catch((error) => {
     cancelInFlight = false;
     if (isTransferring) {
       cancelBtn.disabled = false;
-      cancelBtn.textContent = "取消传输";
+      cancelBtn.textContent = t("取消传输");
       cancelBtn.classList.remove("is-cancelling");
     }
     setStatus(describeError(error), "error");
@@ -3231,10 +3281,10 @@ function collectRunStats(): RunStats {
 
 function formatDuration(ms: number): string {
   const secs = Math.round(ms / 1000);
-  if (secs < 60) return `${secs} 秒`;
+  if (secs < 60) return t("{secs} 秒", { secs });
   const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins} 分 ${secs % 60} 秒`;
-  return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
+  if (mins < 60) return t("{mins} 分 {p2} 秒", { mins, p2: secs % 60 });
+  return t("{p1} 小时 {p2} 分", { p1: Math.floor(mins / 60), p2: mins % 60 });
 }
 
 /** 控制台只保留最近若干行，长时间输出的命令也不会让 DOM 无限增长。 */
@@ -3260,10 +3310,10 @@ function updateSaveCommandButton() {
   saveCommandBtn.classList.toggle("is-active", saved);
   saveCommandBtn.innerHTML = saved ? icons.starFilled : icons.star;
   saveCommandBtn.title = !profile
-    ? "保存服务器后才能保存常用命令"
+    ? t("保存服务器后才能保存常用命令")
     : saved
-      ? "从常用命令中移除"
-      : "保存为常用命令";
+      ? t("从常用命令中移除")
+      : t("保存为常用命令");
 }
 
 async function toggleSavedCommand() {
@@ -3285,7 +3335,7 @@ function openCommandMenu() {
   const profile = currentProfile();
   const commands = profile?.post_commands ?? [];
   const footer = document.createElement("div");
-  footer.append("可用变量（自动加引号）：");
+  footer.append(t("可用变量（自动加引号）："));
   const vars = document.createElement("code");
   vars.textContent = COMMAND_VARIABLES_HINT;
   footer.append(vars);
@@ -3310,7 +3360,7 @@ function openCommandMenu() {
         })),
       },
     ],
-    profile ? "还没有常用命令\n填好命令后点输入框里的 ☆ 保存" : "保存服务器后即可保存常用命令",
+    profile ? t("还没有常用命令\n填好命令后点输入框里的 ☆ 保存") : t("保存服务器后即可保存常用命令"),
     footer,
   );
 }
@@ -3343,8 +3393,8 @@ async function runPostCommand(
   commandOutput.textContent = "";
   commandConsoleCmd.textContent = template;
   commandConsole.classList.remove("hidden");
-  setBadge("执行命令中", "verifying");
-  cancelBtn.textContent = "停止命令";
+  setBadge(t("执行命令中"), "verifying");
+  cancelBtn.textContent = t("停止命令");
   cancelBtn.disabled = false;
   cancelBtn.classList.remove("hidden", "is-cancelling");
   navTransferLive.classList.remove("hidden");
@@ -3372,14 +3422,14 @@ function showCommandResult(outcome: CommandOutcome | null, error?: string) {
   resultCommand.classList.remove("hidden");
   resultCommandLine.textContent = `$ ${outcome?.command ?? runPostCommandTemplate}`;
   const output = outcome ? outcome.output_tail.join("\n") : (error ?? "");
-  resultCommandOutput.textContent = output || "（没有输出）";
+  resultCommandOutput.textContent = output || t("（没有输出）");
 }
 
 function describeCommandFailure(outcome: CommandOutcome | null, error?: string): string {
-  if (!outcome) return `命令没能执行：${error ?? "未知错误"}`;
-  if (outcome.cancelled) return "命令已被停止（远端进程可能仍在运行）";
-  if (outcome.timed_out) return "命令超过 10 分钟没有任何输出，已停止等待";
-  return `命令执行失败，退出码 ${outcome.exit_code ?? "未知"}`;
+  if (!outcome) return t("命令没能执行：{p1}", { p1: error ?? t("未知错误") });
+  if (outcome.cancelled) return t("命令已被停止（远端进程可能仍在运行）");
+  if (outcome.timed_out) return t("命令超过 10 分钟没有任何输出，已停止等待");
+  return t("命令执行失败，退出码 {p1}", { p1: outcome.exit_code ?? t("未知") });
 }
 
 /** 传输成功后的收尾：有命令就先执行命令，再按命令结果决定结果页是「完成」还是「警告」。 */
@@ -3397,9 +3447,9 @@ async function finishSuccessfulRun(
   const { outcome, error } = await runPostCommand(runPostCommandTemplate, commandContextFor(remotePaths));
   showCommandResult(outcome, error);
   if (outcome?.exit_code === 0 && !outcome.cancelled && !outcome.timed_out) {
-    showResult("ok", title, `${message}\n已执行命令，退出码 0`, stats);
+    showResult("ok", title, t("{message}\n已执行命令，退出码 0", { message }), stats);
   } else {
-    showResult("warn", `${title}，但命令未成功`, describeCommandFailure(outcome, error), stats);
+    showResult("warn", t("{title}，但命令未成功", { title }), describeCommandFailure(outcome, error), stats);
   }
 }
 
@@ -3426,9 +3476,9 @@ function showResult(
 
   const avg = stats.elapsedMs > 0 ? stats.movedBytes / (stats.elapsedMs / 1000) : 0;
   const rows: [string, string][] = [
-    ["用时", formatDuration(stats.elapsedMs)],
-    ["本次传输", formatBytes(stats.movedBytes)],
-    [stats.retries > 0 ? "自动重连" : "平均速度", stats.retries > 0 ? `${stats.retries} 次` : `${formatBytes(avg)}/s`],
+    [t("用时"), formatDuration(stats.elapsedMs)],
+    [t("本次传输"), formatBytes(stats.movedBytes)],
+    [stats.retries > 0 ? t("自动重连") : t("平均速度"), stats.retries > 0 ? t("{retries} 次", { retries: stats.retries }) : `${formatBytes(avg)}/s`],
   ];
   resultStats.replaceChildren(
     ...rows.map(([label, value]) => {
@@ -3485,15 +3535,15 @@ function handleProgressUpdate(
     setTransferring(false);
     setProgressState("idle");
     resetSpeedTracker();
-    setBadge("已完成", "verifying");
+    setBadge(t("已完成"), "verifying");
     statusText.textContent = "";
     cancelBtn.classList.add("hidden");
     blockMap.setPhase("completed");
     showVerifySummary(
       verify_summary ??
         (isReliableMode()
-          ? "校验通过 · 逐块校验 + SHA-256 一致"
-          : "校验通过 · SHA-256 一致"),
+          ? t("校验通过 · 逐块校验 + SHA-256 一致")
+          : t("校验通过 · SHA-256 一致")),
     );
     if (uploading) activeUploadCheckpoint = null;
     else activeDownloadCheckpoint = null;
@@ -3507,7 +3557,7 @@ function handleProgressUpdate(
     // 先让地图播完「全部变绿」的波纹再切结果页：这一刻是整个等待的回报，值得被看到。
     window.setTimeout(() => {
       if (isTransferring) return;
-      void finishSuccessfulRun(uploading ? "上传完成" : "下载完成", message, stats, [runRemotePath]);
+      void finishSuccessfulRun(uploading ? t("上传完成") : t("下载完成"), message, stats, [runRemotePath]);
     }, prefersReducedMotion() ? 0 : COMPLETE_REVEAL_MS);
     return;
   }
@@ -3528,8 +3578,8 @@ function handleProgressUpdate(
     }
     showResult(
       "paused",
-      "已暂停",
-      "已传输的部分保存为断点，随时可以从这里继续。",
+      t("已暂停"),
+      t("已传输的部分保存为断点，随时可以从这里继续。"),
       stats,
     );
     return;
@@ -3537,10 +3587,10 @@ function handleProgressUpdate(
 
   if (status === "cancelling") {
     cancelBtn.disabled = true;
-    cancelBtn.textContent = "取消中…";
+    cancelBtn.textContent = t("取消中…");
     cancelBtn.classList.add("is-cancelling");
     setProgressState("retrying");
-    setBadge("取消中", "retrying");
+    setBadge(t("取消中"), "retrying");
     showTransferStatus(message, "retry");
     return;
   }
@@ -3559,7 +3609,7 @@ function handleProgressUpdate(
       resolveQueueStep({ status: "failed", message, stats });
       return;
     }
-    showResult("error", uploading ? "上传失败" : "下载失败", clarifyTransferError(message), stats);
+    showResult("error", uploading ? t("上传失败") : t("下载失败"), clarifyTransferError(message), stats);
     return;
   }
 
@@ -3568,11 +3618,11 @@ function handleProgressUpdate(
     isFullVerifying = true;
     markProgressActivity();
     setProgressState("verifying");
-    setBadge("校验中", "verifying");
+    setBadge(t("校验中"), "verifying");
     updateProgress(transferred, total);
     updateProgressDetail(transferred, total, retry_count);
-    showTransferStatus("正在校验文件完整性，请稍候…");
-    showProgressSpeed("校验中");
+    showTransferStatus(t("正在校验文件完整性，请稍候…"));
+    showProgressSpeed(t("校验中"));
     refreshLiveVisuals();
     return;
   }
@@ -3595,7 +3645,7 @@ function handleProgressUpdate(
   if (status === "retrying") {
     isReconnecting = true;
     setProgressState("retrying");
-    setBadge("重试中", "retrying");
+    setBadge(t("重试中"), "retrying");
     showReconnectingSpeedText();
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(message, "retry");
@@ -3614,8 +3664,8 @@ function handleProgressUpdate(
 
 void listen("transfer-close-requested", async () => {
   const ok = await showConfirm(
-    "传输进行中",
-    "关闭窗口将取消当前传输，已传输的部分会保留为断点。\n\n确定关闭吗？",
+    t("传输进行中"),
+    t("关闭窗口将取消当前传输，已传输的部分会保留为断点。\n\n确定关闭吗？"),
   );
   if (!ok) return;
 
@@ -3640,8 +3690,8 @@ async function syncTransferStateOnStartup() {
       blockMap.reset(0, 0);
       syncMapLegend();
       setProgressState("uploading");
-      setBadge(state.download_running ? "下载中" : "上传中", "uploading");
-      setStatus("检测到进行中的传输任务…");
+      setBadge(state.download_running ? t("下载中") : t("上传中"), "uploading");
+      setStatus(t("检测到进行中的传输任务…"));
     }
   } catch {
     // 忽略启动同步失败
@@ -3684,7 +3734,7 @@ void listen<UploadRetryEvent>("upload-retry", (event) => {
   syncMapLegend();
   updateProgressDetail(progressTransferredBytes, progressTotalBytes, retryCount);
   setProgressState("retrying");
-  setBadge("重试中", "retrying");
+  setBadge(t("重试中"), "retrying");
   showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
   refreshLiveVisuals();
@@ -3700,7 +3750,7 @@ void listen<DownloadRetryEvent>("download-retry", (event) => {
   syncMapLegend();
   updateProgressDetail(progressTransferredBytes, progressTotalBytes, retryCount);
   setProgressState("retrying");
-  setBadge("重试中", "retrying");
+  setBadge(t("重试中"), "retrying");
   showReconnectingSpeedText();
   showTransferStatus(event.payload.message, "retry");
   refreshLiveVisuals();
@@ -3708,6 +3758,7 @@ void listen<DownloadRetryEvent>("download-retry", (event) => {
 
 setupDragDrop();
 initThemePreference();
+initLanguagePreference();
 showTransferView("compose");
 updateConnectionSummary();
 updateModeHint();

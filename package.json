@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "icon": ".icon-venv/bin/python scripts/fix_icon.py logo.png && tauri icon src-tauri/icons/source-square.png -o src-tauri/icons && cp src-tauri/icons/128x128.png public/app-logo.png",
     "app:debug": "tauri build --debug",
-    "app": "tauri build"
+    "app": "tauri build",
+    "check:i18n": "node scripts/check-i18n.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.4.0",

@@ -39,7 +39,7 @@ fn remember(profile_id: &str, kind: SecretKind, value: Option<String>) {
 
 fn entry(profile_id: &str, kind: SecretKind) -> Result<Entry, String> {
     let account = format!("profile:{profile_id}:{}", kind.account_suffix());
-    Entry::new(KEYCHAIN_SERVICE, &account).map_err(|e| format!("钥匙串不可用: {e}"))
+    Entry::new(KEYCHAIN_SERVICE, &account).map_err(|e| crate::tr!(format!("钥匙串不可用: {e}"), format!("Keychain unavailable: {e}")))
 }
 
 /// 写入钥匙串而不是 profiles.json：JSON 文件可被同机其他进程/用户读取，
@@ -49,7 +49,7 @@ pub fn store_secret(profile_id: &str, kind: SecretKind, value: &str) -> Result<(
         .set_password(value)
         .map_err(|e| {
             log::error!("keychain write failed: profile={profile_id} kind={kind:?} err={e}");
-            format!("写入钥匙串失败: {e}")
+            crate::tr!(format!("写入钥匙串失败: {e}"), format!("Failed to write to Keychain: {e}"))
         })?;
     remember(profile_id, kind, Some(value.to_string()));
     Ok(())

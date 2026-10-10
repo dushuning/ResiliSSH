@@ -126,14 +126,14 @@ pub fn clear() {
 /// 把底层错误文本归到用户能理解的类别：用户最关心的是「是网络问题、权限问题还是密码问题」。
 pub fn classify_failure(message: &str) -> Category {
     let lower = message.to_ascii_lowercase();
-    if ["permission denied", "access denied", "read-only file system", "权限"]
+    if ["permission denied", "access denied", "read-only file system", "权限", "permission"]
         .iter()
         .any(|k| lower.contains(k))
     {
         Category::Permission
-    } else if ["auth", "认证", "凭据"].iter().any(|k| lower.contains(k)) {
+    } else if ["auth", "认证", "凭据", "credential"].iter().any(|k| lower.contains(k)) {
         Category::Auth
-    } else if ["指纹", "host key", "主机密钥"].iter().any(|k| lower.contains(k)) {
+    } else if ["指纹", "host key", "主机密钥", "fingerprint"].iter().any(|k| lower.contains(k)) {
         Category::HostKey
     } else if [
         "timed out",
@@ -143,7 +143,9 @@ pub fn classify_failure(message: &str) -> Category {
         "refused",
         "unreachable",
         "无响应",
+        "no response",
         "连接失败",
+        "connection failed",
         "tcp",
         "socket",
     ]
@@ -184,6 +186,25 @@ mod tests {
         assert_eq!(classify_failure("Timed out waiting on socket"), Category::Network);
         assert_eq!(classify_failure("Connection reset by peer"), Category::Network);
         assert_eq!(classify_failure("SHA-256 校验未通过"), Category::Transfer);
+    }
+
+    /// 文案随界面语言切换，归类结果不能因语言不同而改变。
+    #[test]
+    fn english_messages_classify_like_chinese() {
+        let pairs = [
+            ("SFTP 错误: Permission denied", "SFTP error: Permission denied"),
+            ("远端路径错误：/a\n没有写入权限，请检查该目录权限", "Remote path error: /a\nNo write permission; check the directory permissions"),
+            ("认证失败: [Session(-18)]", "Authentication failed: [Session(-18)]"),
+            ("服务器拒绝了提供的凭据", "The server rejected the credentials"),
+            ("未信任的服务器（指纹 SHA256:x），请确认后再连接", "Untrusted server (host key fingerprint SHA256:x), please confirm before connecting"),
+            ("服务器指纹已变化（SHA256:x）", "Server host key fingerprint changed (SHA256:x)"),
+            ("连接失败，1000ms 后重试: x", "Connection failed, retrying in 1000ms: x"),
+            ("传输超过 60 秒无响应", "Transfer had no response for 60 seconds"),
+            ("SHA-256 校验未通过", "SHA-256 verification failed"),
+        ];
+        for (zh, en) in pairs {
+            assert_eq!(classify_failure(zh), classify_failure(en), "{zh} vs {en}");
+        }
     }
 
     #[test]

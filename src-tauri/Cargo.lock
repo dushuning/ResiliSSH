@@ -3339,7 +3339,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "tauri-plugin-notification",
- "thiserror 2.0.18",
 ]
 
 [[package]]

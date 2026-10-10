@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use thiserror::Error;
 
 const CHUNK_SIZE: u64 = 1024 * 1024;
 const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
@@ -26,38 +25,92 @@ pub struct DownloadCallbacks {
     pub on_activity: Box<dyn Fn() + Send + Sync>,
 }
 
-#[derive(Debug, Error)]
+/// 不用 thiserror 的固定 `#[error]` 文案：错误会原样展示给用户，必须在展示时按界面语言选择。
+/// 注意 `is_permanent_sftp_error` 依赖这里的部分措辞（远端不是文件、续传边界、SHA-256），改文案时同步关键字表。
+#[derive(Debug)]
 pub enum DownloadError {
-    #[error("用户取消了下载")]
     Cancelled,
-    #[error("远端路径无效: {0}")]
     InvalidRemotePath(String),
-    #[error("本地路径无效: {0}")]
     InvalidLocalPath(String),
-    #[error("远端不是文件: {0}")]
     RemoteNotAFile(String),
-    #[error("本地文件大于远端文件，无法续传")]
+    /// 字段只在 Debug 诊断输出里使用（用户文案不展示具体大小），先前由 thiserror 的展开隐式读取。
+    #[allow(dead_code)]
     LocalLargerThanRemote { local: u64, remote: u64 },
-    #[error("续传边界校验失败（offset={offset}），请清除断点后重新下载")]
     ResumeBoundaryMismatch { offset: u64 },
-    #[error("下载完成后大小不一致（远端={remote}，本地={local}）")]
     SizeMismatch { remote: u64, local: u64 },
-    #[error("下载完成后校验不一致（SHA-256 不匹配）")]
     HashMismatch,
-    #[error("块校验失败（offset={offset}，len={len}），将重下该块")]
     ChunkVerifyMismatch { offset: u64, len: u64 },
-    #[error("本地文件写入失败: {0}")]
     LocalIo(String),
-    #[error("连接失败: {0}")]
-    Connect(#[from] ConnectError),
-    #[error("SFTP 错误: {0}")]
+    Connect(ConnectError),
     Sftp(String),
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            DownloadError::Cancelled => crate::tr!("用户取消了下载", "Download cancelled by user").to_string(),
+            DownloadError::InvalidRemotePath(e) => {
+                crate::tr!(format!("远端路径无效: {e}"), format!("Invalid remote path: {e}"))
+            }
+            DownloadError::InvalidLocalPath(e) => {
+                crate::tr!(format!("本地路径无效: {e}"), format!("Invalid local path: {e}"))
+            }
+            DownloadError::RemoteNotAFile(e) => {
+                crate::tr!(format!("远端不是文件: {e}"), format!("Remote path is not a file: {e}"))
+            }
+            DownloadError::LocalLargerThanRemote { .. } => crate::tr!(
+                "本地文件大于远端文件，无法续传",
+                "Local file is larger than the remote file; cannot resume"
+            )
+            .to_string(),
+            DownloadError::ResumeBoundaryMismatch { offset } => crate::tr!(
+                format!("续传边界校验失败（offset={offset}），请清除断点后重新下载"),
+                format!("Resume boundary verification failed (offset={offset}); clear the checkpoint and download again")
+            ),
+            DownloadError::SizeMismatch { remote, local } => crate::tr!(
+                format!("下载完成后大小不一致（远端={remote}，本地={local}）"),
+                format!("Size mismatch after download (remote={remote}, local={local})")
+            ),
+            DownloadError::HashMismatch => crate::tr!(
+                "下载完成后校验不一致（SHA-256 不匹配）",
+                "Verification failed after download (SHA-256 mismatch)"
+            )
+            .to_string(),
+            DownloadError::ChunkVerifyMismatch { offset, len } => crate::tr!(
+                format!("块校验失败（offset={offset}，len={len}），将重下该块"),
+                format!("Chunk verification failed (offset={offset}, len={len}); downloading the chunk again")
+            ),
+            DownloadError::LocalIo(e) => {
+                crate::tr!(format!("本地文件写入失败: {e}"), format!("Failed to write local file: {e}"))
+            }
+            DownloadError::Connect(e) => crate::tr!(format!("连接失败: {e}"), format!("Connection failed: {e}")),
+            DownloadError::Sftp(e) => crate::tr!(format!("SFTP 错误: {e}"), format!("SFTP error: {e}")),
+        };
+        f.write_str(&text)
+    }
+}
+
+impl std::error::Error for DownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DownloadError::Connect(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<ConnectError> for DownloadError {
+    fn from(err: ConnectError) -> Self {
+        DownloadError::Connect(err)
+    }
 }
 
 pub fn resolve_local_path(local_path: &str, remote_file_name: &str) -> Result<String, DownloadError> {
     let trimmed = local_path.trim();
     if trimmed.is_empty() {
-        return Err(DownloadError::InvalidLocalPath("本地路径不能为空".into()));
+        return Err(DownloadError::InvalidLocalPath(
+            crate::tr!("本地路径不能为空", "Local path cannot be empty").into(),
+        ));
     }
     if trimmed.ends_with('/') || trimmed.ends_with('\\') {
         let base = trimmed.trim_end_matches(|c| c == '/' || c == '\\');
@@ -73,7 +126,9 @@ pub fn remote_file_name(remote_path: &str) -> Result<String, DownloadError> {
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| DownloadError::InvalidRemotePath("无法读取远端文件名".into()))?;
+        .ok_or_else(|| DownloadError::InvalidRemotePath(
+                crate::tr!("无法读取远端文件名", "Cannot read the remote file name").into(),
+            ))?;
     Ok(name.to_string())
 }
 
@@ -112,7 +167,10 @@ pub fn download_with_resume(
                         return Err(DownloadError::Connect(err));
                     }
                     let retry_count = increment_retry_count(&checkpoint)?;
-                    let message = format!("连接失败，{backoff_ms}ms 后重试: {err}");
+                    let message = crate::tr!(
+                        format!("连接失败，{backoff_ms}ms 后重试: {err}"),
+                        format!("Connection failed, retrying in {backoff_ms}ms: {err}")
+                    );
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
                     sleep_backoff(&cancel_flag, backoff_ms)?;
                     backoff_ms = next_backoff_ms(backoff_ms);
@@ -221,7 +279,10 @@ pub fn download_with_resume(
                 *abort_socket_holder
                     .lock()
                     .map_err(|e| DownloadError::Sftp(e.to_string()))? = None;
-                let message = format!("传输中断（{detail}），{backoff_ms}ms 后重连续传");
+                let message = crate::tr!(
+                    format!("传输中断（{detail}），{backoff_ms}ms 后重连续传"),
+                    format!("Transfer interrupted ({detail}), reconnecting to resume in {backoff_ms}ms")
+                );
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
                 sleep_backoff(&cancel_flag, backoff_ms)?;
                 backoff_ms = next_backoff_ms(backoff_ms);
@@ -250,7 +311,9 @@ fn transfer_chunks(
     }
     let remote_size = remote_stat.size.unwrap_or(0);
     if remote_size == 0 {
-        return Err(DownloadError::InvalidRemotePath("远端文件为空".into()));
+        return Err(DownloadError::InvalidRemotePath(
+            crate::tr!("远端文件为空", "Remote file is empty").into(),
+        ));
     }
 
     let file_name = remote_file_name(&actual_remote_path)?;
@@ -390,16 +453,23 @@ fn transfer_chunks(
 fn resolve_remote_file(sftp: &Sftp, remote_path: &str) -> Result<String, DownloadError> {
     let trimmed = remote_path.trim();
     if trimmed.is_empty() {
-        return Err(DownloadError::InvalidRemotePath("远端路径不能为空".into()));
+        return Err(DownloadError::InvalidRemotePath(
+            crate::tr!("远端路径不能为空", "Remote path cannot be empty").into(),
+        ));
     }
     let path = Path::new(trimmed);
     match sftp.stat(path) {
         Ok(stat) if stat.is_dir() => Err(DownloadError::RemoteNotAFile(
-            "请填写远端文件路径，不支持下载整个目录".into(),
+            crate::tr!(
+                "请填写远端文件路径，不支持下载整个目录",
+                "Please enter a remote file path; downloading a whole directory is not supported"
+            )
+            .into(),
         )),
         Ok(_) => Ok(trimmed.to_string()),
-        Err(e) if is_sftp_not_found(&e) => Err(DownloadError::InvalidRemotePath(format!(
-            "远端文件不存在: {trimmed}"
+        Err(e) if is_sftp_not_found(&e) => Err(DownloadError::InvalidRemotePath(crate::tr!(
+            format!("远端文件不存在: {trimmed}"),
+            format!("Remote file does not exist: {trimmed}")
         ))),
         // InvalidRemotePath 是永久错误；超时等抖动必须走可重试的 Sftp 分支，不能直接放弃下载。
         Err(e) => {
@@ -434,7 +504,9 @@ fn read_remote_chunk<F: FnMut(u64)>(
             .read(&mut buffer[read_total..])
             .map_err(|e| DownloadError::Sftp(e.to_string()))?;
         if read_bytes == 0 {
-            return Err(DownloadError::Sftp("读取远端数据时意外结束".into()));
+            return Err(DownloadError::Sftp(
+                crate::tr!("读取远端数据时意外结束", "Remote data ended unexpectedly while reading").into(),
+            ));
         }
         read_total += read_bytes;
         on_partial_progress(offset + read_total as u64);
@@ -501,8 +573,11 @@ fn verify_download_integrity(
             cp.failure_reason = Some("verify_read_failed".into());
             cp.status = CheckpointStatus::Failed;
             let _ = save_download_checkpoint(&cp);
-            return Err(DownloadError::Sftp(format!(
-                "传完后校验时读取远端失败，可点「开始下载」重试校验: {detail}"
+            return Err(DownloadError::Sftp(crate::tr!(
+                format!("传完后校验时读取远端失败，可点「开始下载」重试校验: {detail}"),
+                format!(
+                    "Failed to read the remote file for final verification; click \"Start download\" to retry verification: {detail}"
+                )
             )));
         }
         Err(err) => return Err(err),
@@ -725,7 +800,13 @@ fn sha256_remote_file(
             .read(&mut buffer[..to_read])
             .map_err(|e| DownloadError::Sftp(e.to_string()))?;
         if read_bytes == 0 {
-            return Err(DownloadError::Sftp("读取远端文件用于校验时意外结束".into()));
+            return Err(DownloadError::Sftp(
+                crate::tr!(
+                    "读取远端文件用于校验时意外结束",
+                    "Remote file ended unexpectedly while reading for verification"
+                )
+                .into(),
+            ));
         }
         hasher.update(&buffer[..read_bytes]);
         remaining -= read_bytes as u64;

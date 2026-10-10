@@ -2,6 +2,7 @@ mod activity;
 mod checkpoint;
 mod download_checkpoint;
 mod history;
+mod i18n;
 mod profiles;
 mod retry;
 mod secrets;
@@ -260,7 +261,7 @@ fn build_auth(request: &ConnectionRequest) -> Result<AuthMethod, String> {
                 .password
                 .clone()
                 .filter(|p| !p.is_empty())
-                .ok_or_else(|| "请填写密码".to_string())?;
+                .ok_or_else(|| crate::tr!("请填写密码", "Please enter a password").to_string())?;
             Ok(AuthMethod::Password(password))
         }
         "key" => {
@@ -268,13 +269,13 @@ fn build_auth(request: &ConnectionRequest) -> Result<AuthMethod, String> {
                 .key_path
                 .clone()
                 .filter(|p| !p.is_empty())
-                .ok_or_else(|| "请选择私钥文件".to_string())?;
+                .ok_or_else(|| crate::tr!("请选择私钥文件", "Please choose a private key file").to_string())?;
             Ok(AuthMethod::PrivateKey {
                 key_path,
                 passphrase: request.key_passphrase.clone().filter(|p| !p.is_empty()),
             })
         }
-        _ => Err("未知认证方式".into()),
+        _ => Err(crate::tr!("未知认证方式", "Unknown authentication method").into()),
     }
 }
 
@@ -345,23 +346,40 @@ fn send_desktop_notification(app: &AppHandle, title: &str, body: &str) {
 fn format_upload_failure(err: &UploadError, remote_path: &str, retry_count: u32) -> String {
     let body = match err {
         UploadError::HashMismatch => {
-            "SHA-256 校验未通过，远端文件已删除，请重新上传".to_string()
+            crate::tr!(
+                "SHA-256 校验未通过，远端文件已删除，请重新上传",
+                "SHA-256 verification failed; the remote file was deleted, please upload again"
+            )
+            .to_string()
         }
         UploadError::InvalidRemotePath(msg) => {
-            format!("远端路径错误：{remote_path} — {msg}")
+            crate::tr!(
+                format!("远端路径错误：{remote_path} — {msg}"),
+                format!("Remote path error: {remote_path} — {msg}")
+            )
         }
         UploadError::RemoteLargerThanLocal { remote, local } => {
-            format!(
-                "远端路径错误：{remote_path} — 远端文件（{remote} 字节）大于本地文件（{local} 字节）"
+            crate::tr!(
+                format!(
+                    "远端路径错误：{remote_path} — 远端文件（{remote} 字节）大于本地文件（{local} 字节）"
+                ),
+                format!(
+                    "Remote path error: {remote_path} — remote file ({remote} bytes) is larger than the local file ({local} bytes)"
+                )
             )
         }
         UploadError::ResumeBoundaryMismatch { offset } => {
-            format!(
-                "远端路径错误：{remote_path} — 续传边界校验失败（offset={offset}），建议清除断点后重试"
+            crate::tr!(
+                format!(
+                    "远端路径错误：{remote_path} — 续传边界校验失败（offset={offset}），建议清除断点后重试"
+                ),
+                format!(
+                    "Remote path error: {remote_path} — resume boundary verification failed (offset={offset}); clear the checkpoint and retry"
+                )
             )
         }
         UploadError::Sftp(detail) => {
-            if detail.contains("远端路径错误") || detail.starts_with("远端路径「") {
+            if sftp::is_remote_path_message(detail) {
                 detail.clone()
             } else {
                 format_remote_sftp_error(detail, remote_path)
@@ -369,19 +387,29 @@ fn format_upload_failure(err: &UploadError, remote_path: &str, retry_count: u32)
         }
         _ => err.to_string(),
     };
-    format!("{body}（已累计自动重试 {retry_count} 次）")
+    crate::tr!(
+        format!("{body}（已累计自动重试 {retry_count} 次）"),
+        format!("{body} (auto-retried {retry_count} times)")
+    )
 }
 
 fn format_download_failure(err: &DownloadError, remote_path: &str, retry_count: u32) -> String {
     let body = match err {
         DownloadError::HashMismatch => {
-            "SHA-256 校验未通过，本地文件已删除，请重新下载".to_string()
+            crate::tr!(
+                "SHA-256 校验未通过，本地文件已删除，请重新下载",
+                "SHA-256 verification failed; the local file was deleted, please download again"
+            )
+            .to_string()
         }
         DownloadError::InvalidRemotePath(msg) | DownloadError::RemoteNotAFile(msg) => {
-            format!("远端路径错误：{remote_path} — {msg}")
+            crate::tr!(
+                format!("远端路径错误：{remote_path} — {msg}"),
+                format!("Remote path error: {remote_path} — {msg}")
+            )
         }
         DownloadError::Sftp(detail) => {
-            if detail.contains("远端路径错误") || detail.starts_with("远端路径「") {
+            if sftp::is_remote_path_message(detail) {
                 detail.clone()
             } else {
                 format_remote_sftp_error(detail, remote_path)
@@ -389,14 +417,21 @@ fn format_download_failure(err: &DownloadError, remote_path: &str, retry_count: 
         }
         _ => err.to_string(),
     };
-    format!("{body}（已累计自动重试 {retry_count} 次）")
+    crate::tr!(
+        format!("{body}（已累计自动重试 {retry_count} 次）"),
+        format!("{body} (auto-retried {retry_count} times)")
+    )
 }
 
 fn completed_verify_summary(strict_chunk_verify: bool) -> String {
     if strict_chunk_verify {
-        "校验通过 · 逐块校验 + SHA-256 一致".to_string()
+        crate::tr!(
+            "校验通过 · 逐块校验 + SHA-256 一致",
+            "Verified · per-chunk check + SHA-256 match"
+        )
+        .to_string()
     } else {
-        "校验通过 · SHA-256 一致".to_string()
+        crate::tr!("校验通过 · SHA-256 一致", "Verified · SHA-256 match").to_string()
     }
 }
 
@@ -430,10 +465,14 @@ struct CreateRemoteDirRequest {
 #[tauri::command(async)]
 fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing, String> {
     if request.host.trim().is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if request.parent_path.trim().is_empty() {
-        return Err("请先进入要创建目录的父路径".into());
+        return Err(crate::tr!(
+            "请先进入要创建目录的父路径",
+            "Open the parent directory first before creating a folder"
+        )
+        .into());
     }
 
     let conn = ConnectionRequest {
@@ -452,10 +491,10 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
 #[tauri::command(async)]
 fn list_remote_dir(request: ListRemoteDirRequest) -> Result<RemoteDirListing, String> {
     if request.host.trim().is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if request.username.trim().is_empty() {
-        return Err("请填写用户名".into());
+        return Err(crate::tr!("请填写用户名", "Please enter a username").into());
     }
 
     let conn = ConnectionRequest {
@@ -583,7 +622,7 @@ fn run_remote_command(
     request: RunCommandRequest,
 ) -> Result<CommandOutcome, String> {
     if request.template.trim().is_empty() {
-        return Err("命令为空".into());
+        return Err(crate::tr!("命令为空", "Command is empty").into());
     }
     let config = build_connection_config(&request.connection)?;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -591,7 +630,7 @@ fn run_remote_command(
     {
         let mut state = runtime.lock().map_err(|e| e.to_string())?;
         if state.cancel_flag.is_some() {
-            return Err("已有命令在执行".into());
+            return Err(crate::tr!("已有命令在执行", "A command is already running").into());
         }
         state.cancel_flag = Some(cancel.clone());
         state.abort_socket = Some(abort_socket.clone());
@@ -607,7 +646,7 @@ fn run_remote_command(
         },
     );
     if let Err(err) = &result {
-        activity::error(activity::Category::Command, format!("命令未能执行：{err}"));
+        activity::error(activity::Category::Command, crate::tr!(format!("命令未能执行：{err}"), format!("Command could not run: {err}")));
     }
     if let Ok(mut state) = runtime.lock() {
         *state = CommandRuntime::default();
@@ -630,6 +669,12 @@ fn cancel_remote_command(runtime: State<'_, Mutex<CommandRuntime>>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// 前端在启动和用户切换语言时调用，后续生成的错误信息与日志随之切换。
+#[tauri::command]
+fn set_language(language: String) {
+    i18n::set_english(language == "en");
 }
 
 #[tauri::command]
@@ -665,15 +710,15 @@ fn list_upload_history() -> Result<Vec<history::UploadHistoryEntry>, String> {
 #[tauri::command(async)]
 fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe, String> {
     if request.host.trim().is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if request.remote_path.trim().is_empty() {
-        return Err("请填写远端路径".into());
+        return Err(crate::tr!("请填写远端路径", "Please enter a remote path").into());
     }
 
     let local_path = PathBuf::from(&request.local_path);
     if !local_path.is_file() {
-        return Err("本地文件不存在".into());
+        return Err(crate::tr!("本地文件不存在", "Local file does not exist").into());
     }
 
     let local_size = std::fs::metadata(&local_path)
@@ -731,7 +776,11 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
     }) {
         (
             "verify_retry",
-            "传输已完成，仅需重试最终校验，无需从头重传".into(),
+            crate::tr!(
+                "传输已完成，仅需重试最终校验，无需从头重传",
+                "Transfer already complete; only the final verification will be retried, no full re-upload"
+            )
+            .into(),
         )
     } else if checkpoint.as_ref().is_some_and(|cp| {
         cp.failure_reason.as_deref() == Some("hash_mismatch")
@@ -741,31 +790,51 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
     }) {
         (
             "full_reupload",
-            "上次校验未通过，将删除远端文件并从头重传".into(),
+            crate::tr!(
+                "上次校验未通过，将删除远端文件并从头重传",
+                "Last verification failed; the remote file will be deleted and uploaded again from scratch"
+            )
+            .into(),
         )
     } else if verified_bytes > 0 && verified_bytes < local_size {
         (
             "resume",
-            format!(
-                "将从已验证的 {} 字节处续传（约 {:.1} MB）",
-                verified_bytes,
-                verified_bytes as f64 / 1024.0 / 1024.0
+            crate::tr!(
+                format!(
+                    "将从已验证的 {} 字节处续传（约 {:.1} MB）",
+                    verified_bytes,
+                    verified_bytes as f64 / 1024.0 / 1024.0
+                ),
+                format!(
+                    "Will resume from {} already verified",
+                    activity::format_bytes(verified_bytes)
+                )
             ),
         )
     } else if remote_exists {
         (
             "overwrite",
-            format!(
-                "远端已有文件（{} 字节），将覆盖重传",
-                remote_size
+            crate::tr!(
+                format!("远端已有文件（{} 字节），将覆盖重传", remote_size),
+                format!(
+                    "Remote file already exists ({}); it will be overwritten",
+                    activity::format_bytes(remote_size)
+                )
             ),
         )
     } else {
-        ("new", "远端无此文件，将新建上传".into())
+        (
+            "new",
+            crate::tr!(
+                "远端无此文件，将新建上传",
+                "Remote file does not exist; a new upload will be created"
+            )
+            .into(),
+        )
     };
 
     let message = if let Some(parent_msg) = parent_hint {
-        format!("{message}。{parent_msg}")
+        crate::tr!(format!("{message}。{parent_msg}"), format!("{message}. {parent_msg}"))
     } else {
         message
     };
@@ -784,13 +853,13 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
 #[tauri::command(async)]
 fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownloadProbe, String> {
     if request.host.trim().is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if request.remote_path.trim().is_empty() {
-        return Err("请填写远端文件路径".into());
+        return Err(crate::tr!("请填写远端文件路径", "Please enter a remote file path").into());
     }
     if request.local_path.trim().is_empty() {
-        return Err("请填写本地保存路径".into());
+        return Err(crate::tr!("请填写本地保存路径", "Please enter a local save path").into());
     }
 
     let conn = ConnectionRequest {
@@ -809,15 +878,23 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
     let remote_path = request.remote_path.trim();
     let remote_stat = sftp
         .stat(std::path::Path::new(remote_path))
-        .map_err(|e| format!("远端路径错误：{remote_path} — 无法访问：{e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                format!("远端路径错误：{remote_path} — 无法访问：{e}"),
+                format!("Remote path error: {remote_path} — cannot access: {e}")
+            )
+        })?;
     if !remote_stat.is_file() {
-        return Err(format!(
-            "远端路径错误：{remote_path} — 请填写服务器上的文件路径，不能是目录"
+        return Err(crate::tr!(
+            format!("远端路径错误：{remote_path} — 请填写服务器上的文件路径，不能是目录"),
+            format!(
+                "Remote path error: {remote_path} — enter a file path on the server, not a directory"
+            )
         ));
     }
     let remote_size = remote_stat.size.unwrap_or(0);
     if remote_size == 0 {
-        return Err("远端文件为空".into());
+        return Err(crate::tr!("远端文件为空", "Remote file is empty").into());
     }
 
     let file_name = remote_file_name(remote_path).map_err(|e| e.to_string())?;
@@ -853,7 +930,11 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
     }) {
         (
             "verify_retry",
-            "传输已完成，仅需重试最终校验，无需从头重下".into(),
+            crate::tr!(
+                "传输已完成，仅需重试最终校验，无需从头重下",
+                "Transfer already complete; only the final verification will be retried, no full re-download"
+            )
+            .into(),
         )
     } else if checkpoint.as_ref().is_some_and(|cp| {
         cp.failure_reason.as_deref() == Some("hash_mismatch")
@@ -863,27 +944,47 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
     }) {
         (
             "full_redownload",
-            "上次校验未通过，将删除本地文件并从头重下".into(),
+            crate::tr!(
+                "上次校验未通过，将删除本地文件并从头重下",
+                "Last verification failed; the local file will be deleted and downloaded again from scratch"
+            )
+            .into(),
         )
     } else if verified_bytes > 0 && verified_bytes < remote_size {
         (
             "resume",
-            format!(
-                "将从已验证的 {} 字节处续传（约 {:.1} MB）",
-                verified_bytes,
-                verified_bytes as f64 / 1024.0 / 1024.0
+            crate::tr!(
+                format!(
+                    "将从已验证的 {} 字节处续传（约 {:.1} MB）",
+                    verified_bytes,
+                    verified_bytes as f64 / 1024.0 / 1024.0
+                ),
+                format!(
+                    "Will resume from {} already verified",
+                    activity::format_bytes(verified_bytes)
+                )
             ),
         )
     } else if local_exists {
         (
             "overwrite",
-            format!(
-                "本地已有文件（{} 字节），将覆盖重下",
-                local_size
+            crate::tr!(
+                format!("本地已有文件（{} 字节），将覆盖重下", local_size),
+                format!(
+                    "Local file already exists ({}); it will be overwritten",
+                    activity::format_bytes(local_size)
+                )
             ),
         )
     } else {
-        ("new", "本地无此文件，将新建下载".into())
+        (
+            "new",
+            crate::tr!(
+                "本地无此文件，将新建下载",
+                "Local file does not exist; a new download will be created"
+            )
+            .into(),
+        )
     };
 
     Ok(RemoteDownloadProbe {
@@ -901,10 +1002,10 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
 #[tauri::command(async)]
 fn test_connection(request: ConnectionRequest) -> Result<String, String> {
     if request.host.trim().is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     if request.username.trim().is_empty() {
-        return Err("请填写用户名".into());
+        return Err(crate::tr!("请填写用户名", "Please enter a username").into());
     }
 
     let config = build_connection_config(&request)?;
@@ -917,7 +1018,7 @@ fn test_connection(request: ConnectionRequest) -> Result<String, String> {
 fn check_host_key(request: HostKeyRequest) -> Result<HostKeyInfo, String> {
     let host = request.host.trim();
     if host.is_empty() {
-        return Err("请填写主机".into());
+        return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
     let (session, _) = open_handshake(host, request.port).map_err(|e| e.to_string())?;
     inspect_host_key(&session, host, request.port).map_err(|e| e.to_string())
@@ -937,7 +1038,7 @@ fn cancel_upload(
 ) -> Result<(), String> {
     let state = runtime.lock().map_err(|e| e.to_string())?;
     if !state.is_running {
-        return Err("当前没有进行中的上传".into());
+        return Err(crate::tr!("当前没有进行中的上传", "No upload is in progress").into());
     }
 
     if let Some(flag) = &state.cancel_flag {
@@ -958,7 +1059,7 @@ fn cancel_upload(
             uploaded_bytes: 0,
             total_bytes: 0,
             status: "cancelling".into(),
-            message: "正在取消，正在中断连接...".into(),
+            message: crate::tr!("正在取消，正在中断连接...", "Cancelling, closing the connection...").into(),
             retry_count: 0,
             verify_summary: None,
         },
@@ -1006,16 +1107,16 @@ fn start_upload(
 ) -> Result<(), String> {
     let mut state = runtime.lock().map_err(|e| e.to_string())?;
     if state.is_running {
-        return Err("已有上传任务在进行中".into());
+        return Err(crate::tr!("已有上传任务在进行中", "An upload is already in progress").into());
     }
 
     let local_path = PathBuf::from(&request.local_path);
     if !local_path.is_file() {
-        return Err("本地文件不存在".into());
+        return Err(crate::tr!("本地文件不存在", "Local file does not exist").into());
     }
 
     if request.remote_path.trim().is_empty() {
-        return Err("请填写远端路径".into());
+        return Err(crate::tr!("请填写远端路径", "Please enter a remote path").into());
     }
 
     let resolved_remote_path = sftp::resolve_remote_path(&request.remote_path, &local_path)
@@ -1073,16 +1174,24 @@ fn start_upload(
     if should_resume {
         let cp = existing_checkpoint.as_ref().unwrap();
         if cp.file_size != file_size {
-            return Err(format!(
-                "本地文件大小已变化（断点记录 {} 字节，当前 {} 字节），请清除断点后重新上传",
-                cp.file_size, file_size
+            return Err(crate::tr!(
+                format!(
+                    "本地文件大小已变化（断点记录 {} 字节，当前 {} 字节），请清除断点后重新上传",
+                    cp.file_size, file_size
+                ),
+                format!(
+                    "Local file size changed (checkpoint {} bytes, now {} bytes); clear the checkpoint and upload again",
+                    cp.file_size, file_size
+                )
             ));
         }
         if let Some(saved_mtime) = cp.local_mtime {
             if saved_mtime != local_mtime {
-                return Err(
-                    "本地文件已修改（修改时间变化），请清除断点后重新上传".into(),
-                );
+                return Err(crate::tr!(
+                    "本地文件已修改（修改时间变化），请清除断点后重新上传",
+                    "Local file was modified (modification time changed); clear the checkpoint and upload again"
+                )
+                .into());
             }
         }
     }
@@ -1147,8 +1256,11 @@ fn start_upload(
     let port_for_history = request.port;
 
     let worker = thread::spawn(move || {
-        activity::info(activity::Category::Transfer, format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path));
-        let milestones = Arc::new(ProgressMilestones::new("上传"));
+        activity::info(activity::Category::Transfer, crate::tr!(
+                format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path),
+                format!("Upload started {} → {}:{}", local_path_string, host_for_history, remote_path)
+            ));
+        let milestones = Arc::new(ProgressMilestones::new("上传", "Uploaded"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_uploaded_bytes));
         let stall_timeout = Duration::from_secs(UPLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = UPLOAD_STALL_TIMEOUT_SECS;
@@ -1175,9 +1287,15 @@ fn start_upload(
                             message: {
                                 activity::warn(
                                     activity::Category::Network,
-                                    format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                    crate::tr!(
+                                        format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                        format!("No progress for {stall_secs} seconds, disconnecting to reconnect")
+                                    ),
                                 );
-                                format!("传输超过 {stall_secs} 秒无响应，正在中断并重连...")
+                                crate::tr!(
+                                    format!("传输超过 {stall_secs} 秒无响应，正在中断并重连..."),
+                                    format!("Transfer had no response for {stall_secs} seconds, reconnecting...")
+                                )
                             },
                             retry_count,
                             verify_summary: None,
@@ -1206,7 +1324,10 @@ fn start_upload(
                         sync_transfer_heartbeat(&heartbeat, uploaded, status);
                         milestones.observe(uploaded, total, status);
                         let retry_hint = if retry_count > 0 {
-                            format!(" · 重试 {retry_count} 次")
+                            crate::tr!(
+                                format!(" · 重试 {retry_count} 次"),
+                                format!(" · {retry_count} retries")
+                            )
                         } else {
                             String::new()
                         };
@@ -1216,7 +1337,10 @@ fn start_upload(
                                 uploaded_bytes: uploaded,
                                 total_bytes: total,
                                 status: status.to_string(),
-                                message: format!("已上传 {uploaded} / {total} 字节{retry_hint}"),
+                                message: crate::tr!(
+                                    format!("已上传 {uploaded} / {total} 字节{retry_hint}"),
+                                    format!("Uploaded {uploaded} / {total} bytes{retry_hint}")
+                                ),
                                 retry_count,
                                 verify_summary: None,
                             },
@@ -1236,7 +1360,10 @@ fn start_upload(
                         if let Ok(cp) = checkpoint.lock() {
                             let _ = save_checkpoint(&cp);
                         }
-                        let retry_message = format!("{message}（第 {retry_count} 次重试）");
+                        let retry_message = crate::tr!(
+                            format!("{message}（第 {retry_count} 次重试）"),
+                            format!("{message} (retry #{retry_count})")
+                        );
                         activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(
                             "upload-retry",
@@ -1277,11 +1404,17 @@ fn start_upload(
                     let _ = save_checkpoint(&cp);
                     let _ = clear_checkpoint();
                     let retry_hint = if cp.retry_count > 0 {
-                        format!("（共重试 {} 次）", cp.retry_count)
+                        crate::tr!(
+                            format!("（共重试 {} 次）", cp.retry_count),
+                            format!(" ({} retries in total)", cp.retry_count)
+                        )
                     } else {
                         String::new()
                     };
-                    let message = format!("上传完成{retry_hint}");
+                    let message = crate::tr!(
+                        format!("上传完成{retry_hint}"),
+                        format!("Upload complete{retry_hint}")
+                    );
                     activity::success(
                         activity::Category::Verify,
                         completed_verify_summary(strict_chunk_verify_summary.load(Ordering::Relaxed)),
@@ -1320,16 +1453,26 @@ fn start_upload(
             Err(UploadError::Cancelled) => {
                 if let Ok(cp) = checkpoint_for_thread.lock() {
                     let _ = save_checkpoint(&cp);
-                    let message = format!(
-                        "上传已取消，可稍后继续（已重试 {} 次）",
-                        cp.retry_count
+                    let message = crate::tr!(
+                        format!("上传已取消，可稍后继续（已重试 {} 次）", cp.retry_count),
+                        format!(
+                            "Upload cancelled, you can continue later ({} retries so far)",
+                            cp.retry_count
+                        )
                     );
                     activity::info(
                         activity::Category::Transfer,
-                        format!(
-                            "上传已取消，断点保存在 {} / {}",
-                            activity::format_bytes(cp.verified_bytes),
-                            activity::format_bytes(cp.file_size)
+                        crate::tr!(
+                            format!(
+                                "上传已取消，断点保存在 {} / {}",
+                                activity::format_bytes(cp.verified_bytes),
+                                activity::format_bytes(cp.file_size)
+                            ),
+                            format!(
+                                "Upload cancelled, checkpoint saved at {} / {}",
+                                activity::format_bytes(cp.verified_bytes),
+                                activity::format_bytes(cp.file_size)
+                            )
                         ),
                     );
                     record_upload_result(
@@ -1361,9 +1504,15 @@ fn start_upload(
                     cp.status = CheckpointStatus::Failed;
                     let _ = save_checkpoint(&cp);
                     let message = if cp.failure_reason.as_deref() == Some("verify_read_failed") {
-                        format!(
-                            "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始上传」重试（已重试 {} 次）",
-                            cp.retry_count
+                        crate::tr!(
+                            format!(
+                                "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始上传」重试（已重试 {} 次）",
+                                cp.retry_count
+                            ),
+                            format!(
+                                "Network dropped during final verification; all chunks already verified, click \"Start upload\" to retry ({} retries so far)",
+                                cp.retry_count
+                            )
                         )
                     } else {
                         format_upload_failure(&err, &cp.remote_path, cp.retry_count)
@@ -1380,7 +1529,11 @@ fn start_upload(
                         cp.retry_count,
                         Some(message.clone()),
                     );
-                    send_desktop_notification(&app, "ResiliSSH 上传失败", &message);
+                    send_desktop_notification(
+                        &app,
+                        crate::tr!("ResiliSSH 上传失败", "ResiliSSH Upload failed"),
+                        &message,
+                    );
                     let _ = app.emit(
                         "upload-progress",
                         UploadProgressEvent {
@@ -1418,7 +1571,7 @@ fn cancel_download(
 ) -> Result<(), String> {
     let state = runtime.lock().map_err(|e| e.to_string())?;
     if !state.is_running {
-        return Err("当前没有进行中的下载".into());
+        return Err(crate::tr!("当前没有进行中的下载", "No download is in progress").into());
     }
 
     if let Some(flag) = &state.cancel_flag {
@@ -1439,7 +1592,7 @@ fn cancel_download(
             downloaded_bytes: 0,
             total_bytes: 0,
             status: "cancelling".into(),
-            message: "正在取消，正在中断连接...".into(),
+            message: crate::tr!("正在取消，正在中断连接...", "Cancelling, closing the connection...").into(),
             retry_count: 0,
             verify_summary: None,
         },
@@ -1485,14 +1638,14 @@ fn start_download(
     // 先快速检查、立即放锁：续传前要连服务器核对远端文件（弱网下可能几十秒），
     // 若全程持锁，关窗检查、取消等需要同一把锁的命令都会被卡住。
     if runtime.lock().map_err(|e| e.to_string())?.is_running {
-        return Err("已有下载任务在进行中".into());
+        return Err(crate::tr!("已有下载任务在进行中", "A download is already in progress").into());
     }
 
     if request.remote_path.trim().is_empty() {
-        return Err("请填写远端文件路径".into());
+        return Err(crate::tr!("请填写远端文件路径", "Please enter a remote file path").into());
     }
     if request.local_path.trim().is_empty() {
-        return Err("请填写本地保存路径".into());
+        return Err(crate::tr!("请填写本地保存路径", "Please enter a local save path").into());
     }
 
     let remote_path = request.remote_path.trim().to_string();
@@ -1562,17 +1715,29 @@ fn start_download(
         let sftp = session.sftp().map_err(|e| e.to_string())?;
         let stat = sftp
             .stat(std::path::Path::new(&cp.remote_path))
-            .map_err(|e| format!("无法读取远端文件: {e}"))?;
+            .map_err(|e| {
+                crate::tr!(format!("无法读取远端文件: {e}"), format!("Cannot read remote file: {e}"))
+            })?;
         let remote_size = stat.size.unwrap_or(0);
         if cp.file_size != remote_size {
-            return Err(format!(
-                "远端文件大小已变化（断点记录 {} 字节，当前 {} 字节），请清除断点后重新下载",
-                cp.file_size, remote_size
+            return Err(crate::tr!(
+                format!(
+                    "远端文件大小已变化（断点记录 {} 字节，当前 {} 字节），请清除断点后重新下载",
+                    cp.file_size, remote_size
+                ),
+                format!(
+                    "Remote file size changed (checkpoint {} bytes, now {} bytes); clear the checkpoint and download again",
+                    cp.file_size, remote_size
+                )
             ));
         }
         if let Some(saved_mtime) = cp.remote_mtime {
             if stat.mtime != Some(saved_mtime) {
-                return Err("远端文件已修改（修改时间变化），请清除断点后重新下载".into());
+                return Err(crate::tr!(
+                    "远端文件已修改（修改时间变化），请清除断点后重新下载",
+                    "Remote file was modified (modification time changed); clear the checkpoint and download again"
+                )
+                .into());
             }
         }
     }
@@ -1625,7 +1790,7 @@ fn start_download(
     // 防止两次并发的开始请求覆盖彼此的断点文件。
     let mut state = runtime.lock().map_err(|e| e.to_string())?;
     if state.is_running {
-        return Err("已有下载任务在进行中".into());
+        return Err(crate::tr!("已有下载任务在进行中", "A download is already in progress").into());
     }
 
     save_download_checkpoint(&*checkpoint.lock().map_err(|e| e.to_string())?)?;
@@ -1654,8 +1819,11 @@ fn start_download(
     let port_for_history = request.port;
 
     let worker = thread::spawn(move || {
-        activity::info(activity::Category::Transfer, format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string));
-        let milestones = Arc::new(ProgressMilestones::new("下载"));
+        activity::info(activity::Category::Transfer, crate::tr!(
+                format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string),
+                format!("Download started {}:{} → {}", host_for_history, remote_path, local_path_string)
+            ));
+        let milestones = Arc::new(ProgressMilestones::new("下载", "Downloaded"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_downloaded_bytes));
         let stall_timeout = Duration::from_secs(DOWNLOAD_STALL_TIMEOUT_SECS);
         let stall_secs = DOWNLOAD_STALL_TIMEOUT_SECS;
@@ -1682,9 +1850,15 @@ fn start_download(
                             message: {
                                 activity::warn(
                                     activity::Category::Network,
-                                    format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                    crate::tr!(
+                                        format!("超过 {stall_secs} 秒没有任何进度，主动断开并重连"),
+                                        format!("No progress for {stall_secs} seconds, disconnecting to reconnect")
+                                    ),
                                 );
-                                format!("传输超过 {stall_secs} 秒无响应，正在中断并重连...")
+                                crate::tr!(
+                                    format!("传输超过 {stall_secs} 秒无响应，正在中断并重连..."),
+                                    format!("Transfer had no response for {stall_secs} seconds, reconnecting...")
+                                )
                             },
                             retry_count,
                             verify_summary: None,
@@ -1713,7 +1887,10 @@ fn start_download(
                         sync_transfer_heartbeat(&heartbeat, downloaded, status);
                         milestones.observe(downloaded, total, status);
                         let retry_hint = if retry_count > 0 {
-                            format!(" · 重试 {retry_count} 次")
+                            crate::tr!(
+                                format!(" · 重试 {retry_count} 次"),
+                                format!(" · {retry_count} retries")
+                            )
                         } else {
                             String::new()
                         };
@@ -1723,7 +1900,10 @@ fn start_download(
                                 downloaded_bytes: downloaded,
                                 total_bytes: total,
                                 status: status.to_string(),
-                                message: format!("已下载 {downloaded} / {total} 字节{retry_hint}"),
+                                message: crate::tr!(
+                                    format!("已下载 {downloaded} / {total} 字节{retry_hint}"),
+                                    format!("Downloaded {downloaded} / {total} bytes{retry_hint}")
+                                ),
                                 retry_count,
                                 verify_summary: None,
                             },
@@ -1743,7 +1923,10 @@ fn start_download(
                         if let Ok(cp) = checkpoint.lock() {
                             let _ = save_download_checkpoint(&cp);
                         }
-                        let retry_message = format!("{message}（第 {retry_count} 次重试）");
+                        let retry_message = crate::tr!(
+                            format!("{message}（第 {retry_count} 次重试）"),
+                            format!("{message} (retry #{retry_count})")
+                        );
                         activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(
                             "download-retry",
@@ -1784,11 +1967,17 @@ fn start_download(
                     let _ = save_download_checkpoint(&cp);
                     let _ = clear_download_checkpoint();
                     let retry_hint = if cp.retry_count > 0 {
-                        format!("（共重试 {} 次）", cp.retry_count)
+                        crate::tr!(
+                            format!("（共重试 {} 次）", cp.retry_count),
+                            format!(" ({} retries in total)", cp.retry_count)
+                        )
                     } else {
                         String::new()
                     };
-                    let message = format!("下载完成{retry_hint}");
+                    let message = crate::tr!(
+                        format!("下载完成{retry_hint}"),
+                        format!("Download complete{retry_hint}")
+                    );
                     activity::success(
                         activity::Category::Verify,
                         completed_verify_summary(strict_chunk_verify_summary.load(Ordering::Relaxed)),
@@ -1827,16 +2016,26 @@ fn start_download(
             Err(DownloadError::Cancelled) => {
                 if let Ok(cp) = checkpoint_for_thread.lock() {
                     let _ = save_download_checkpoint(&cp);
-                    let message = format!(
-                        "下载已取消，可稍后继续（已重试 {} 次）",
-                        cp.retry_count
+                    let message = crate::tr!(
+                        format!("下载已取消，可稍后继续（已重试 {} 次）", cp.retry_count),
+                        format!(
+                            "Download cancelled, you can continue later ({} retries so far)",
+                            cp.retry_count
+                        )
                     );
                     activity::info(
                         activity::Category::Transfer,
-                        format!(
-                            "下载已取消，断点保存在 {} / {}",
-                            activity::format_bytes(cp.verified_bytes),
-                            activity::format_bytes(cp.file_size)
+                        crate::tr!(
+                            format!(
+                                "下载已取消，断点保存在 {} / {}",
+                                activity::format_bytes(cp.verified_bytes),
+                                activity::format_bytes(cp.file_size)
+                            ),
+                            format!(
+                                "Download cancelled, checkpoint saved at {} / {}",
+                                activity::format_bytes(cp.verified_bytes),
+                                activity::format_bytes(cp.file_size)
+                            )
                         ),
                     );
                     record_download_result(
@@ -1868,9 +2067,15 @@ fn start_download(
                     cp.status = CheckpointStatus::Failed;
                     let _ = save_download_checkpoint(&cp);
                     let message = if cp.failure_reason.as_deref() == Some("verify_read_failed") {
-                        format!(
-                            "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始下载」重试（已重试 {} 次）",
-                            cp.retry_count
+                        crate::tr!(
+                            format!(
+                                "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始下载」重试（已重试 {} 次）",
+                                cp.retry_count
+                            ),
+                            format!(
+                                "Network dropped during final verification; all chunks already verified, click \"Start download\" to retry ({} retries so far)",
+                                cp.retry_count
+                            )
                         )
                     } else {
                         format_download_failure(&err, &cp.remote_path, cp.retry_count)
@@ -1887,7 +2092,11 @@ fn start_download(
                         cp.retry_count,
                         Some(message.clone()),
                     );
-                    send_desktop_notification(&app, "ResiliSSH 下载失败", &message);
+                    send_desktop_notification(
+                        &app,
+                        crate::tr!("ResiliSSH 下载失败", "ResiliSSH Download failed"),
+                        &message,
+                    );
                     let _ = app.emit(
                         "download-progress",
                         DownloadProgressEvent {
@@ -1922,7 +2131,9 @@ fn start_download(
 /// 把进度折算成里程碑写进活动日志：每 10% 一条，不逐块刷屏；
 /// 首个进度（续传起点）只作为基准，不会一口气补记之前已完成的里程碑。
 struct ProgressMilestones {
-    verb: &'static str,
+    /// 中英文动词分开存：里程碑在传输过程中逐条生成，需按生成时刻的界面语言取用。
+    verb_zh: &'static str,
+    verb_en: &'static str,
     last_decile: AtomicU64,
     verifying_logged: AtomicBool,
 }
@@ -1932,9 +2143,10 @@ const MILESTONE_UNSET: u64 = u64::MAX;
 const MILESTONE_STEPS: u64 = 10;
 
 impl ProgressMilestones {
-    fn new(verb: &'static str) -> Self {
+    fn new(verb_zh: &'static str, verb_en: &'static str) -> Self {
         Self {
-            verb,
+            verb_zh,
+            verb_en,
             last_decile: AtomicU64::new(MILESTONE_UNSET),
             verifying_logged: AtomicBool::new(false),
         }
@@ -1945,7 +2157,10 @@ impl ProgressMilestones {
             if !self.verifying_logged.swap(true, Ordering::Relaxed) {
                 activity::info(
                     activity::Category::Verify,
-                    "数据已全部传完，开始全文件 SHA-256 校验",
+                    crate::tr!(
+                        "数据已全部传完，开始全文件 SHA-256 校验",
+                        "All data transferred, starting full-file SHA-256 verification"
+                    ),
                 );
             }
             return;
@@ -1963,12 +2178,21 @@ impl ProgressMilestones {
             self.last_decile.store(decile, Ordering::Relaxed);
             activity::info(
                 activity::Category::Transfer,
-                format!(
-                    "已{} {}%（{} / {}）",
-                    self.verb,
-                    decile * MILESTONE_STEPS,
-                    activity::format_bytes(transferred),
-                    activity::format_bytes(total)
+                crate::tr!(
+                    format!(
+                        "已{} {}%（{} / {}）",
+                        self.verb_zh,
+                        decile * MILESTONE_STEPS,
+                        activity::format_bytes(transferred),
+                        activity::format_bytes(total)
+                    ),
+                    format!(
+                        "{} {}% ({} / {})",
+                        self.verb_en,
+                        decile * MILESTONE_STEPS,
+                        activity::format_bytes(transferred),
+                        activity::format_bytes(total)
+                    )
                 ),
             );
         }
@@ -2024,6 +2248,7 @@ pub fn run() {
             clear_saved_download_checkpoint,
             list_saved_profiles,
             get_profile_secrets,
+            set_language,
             list_activity_log,
             clear_activity_log,
             update_connection_profile_extras,

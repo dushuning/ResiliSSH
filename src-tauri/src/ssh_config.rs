@@ -28,7 +28,7 @@ pub fn resolve_host(alias: &str) -> Result<Option<SshHostEntry>, String> {
 }
 
 fn ssh_config_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
+    let home = dirs::home_dir().ok_or_else(|| crate::tr!("无法定位用户主目录", "Cannot locate the home directory").to_string())?;
     Ok(home.join(".ssh").join("config"))
 }
 
