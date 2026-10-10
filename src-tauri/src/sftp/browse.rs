@@ -86,6 +86,29 @@ pub fn expand_remote_paths(config: &ConnectionConfig, paths: &[String]) -> Resul
     Ok(out)
 }
 
+/// 批量传输开始前统计哪些目标文件已存在，用于一次性确认。按目录列举而不是逐个 stat：
+/// 弱网下每次 stat 都是一个往返，几百个文件要等几十秒；同一目录的文件只需一次列举。
+/// 目录不存在或读不了时视为其中的文件都不存在（之后传输时会按需创建目录）。
+pub fn remote_paths_exist(config: &ConnectionConfig, paths: &[String]) -> Result<Vec<bool>, String> {
+    let (session, _) = connect_session(config).map_err(|e| e.to_string())?;
+    let sftp = session.sftp().map_err(|e| e.to_string())?;
+    let mut listings: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let (dir, name) = path.rsplit_once('/').unwrap_or((".", path.as_str()));
+            let dir = if dir.is_empty() { "/" } else { dir };
+            let names = listings.entry(dir.to_string()).or_insert_with(|| {
+                sftp.readdir(Path::new(dir))
+                    .map(|entries| entries.iter().map(|(p, _)| entry_name(p)).collect())
+                    .unwrap_or_default()
+            });
+            names.contains(name)
+        })
+        .collect())
+}
+
 fn trim_trailing_slash(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() { "/" } else { trimmed }

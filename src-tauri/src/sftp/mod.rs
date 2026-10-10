@@ -12,7 +12,8 @@ mod tunnel;
 mod upload;
 
 pub use browse::{
-    create_remote_directory, expand_remote_paths, list_remote_directory, RemoteDirListing,
+    create_remote_directory, expand_remote_paths, list_remote_directory, remote_paths_exist,
+    RemoteDirListing,
 };
 pub use client::{
     abort_socket, connect_session, open_handshake, test_connection, AuthMethod, ConnectionConfig,

@@ -30,6 +30,7 @@ use profiles::{
 use sftp::{
     abort_socket, bytes_needed, connect_session, create_remote_directory, download_with_resume,
     expand_remote_paths as expand_sftp_remote_paths, format_remote_sftp_error, inspect_host_key,
+    remote_paths_exist as sftp_remote_paths_exist,
     list_remote_directory, local_free_bytes, local_sha256,
     open_handshake, remote_free_bytes, remote_sha256, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target, staging_path,
@@ -500,6 +501,7 @@ struct ListRemoteDirRequest {
 }
 
 #[derive(Debug, Deserialize)]
+/// 连接参数 + 一组远端路径；展开文件夹、批量检查是否存在都用它。
 struct ExpandRemotePathsRequest {
     host: String,
     port: u16,
@@ -557,6 +559,29 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     };
     let config = build_connection_config(&conn)?;
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
+}
+
+/// 批量上传前统计远端已有多少同名文件（只连接一次），供一次性确认。
+#[tauri::command(async)]
+fn remote_paths_exist(request: ExpandRemotePathsRequest) -> Result<Vec<bool>, String> {
+    let conn = ConnectionRequest {
+        host: request.host,
+        port: request.port,
+        username: request.username,
+        auth_type: request.auth_type,
+        password: request.password,
+        key_path: request.key_path,
+        key_passphrase: request.key_passphrase,
+        jump: request.jump,
+    };
+    let config = build_connection_config(&conn)?;
+    sftp_remote_paths_exist(&config, &request.paths)
+}
+
+/// 批量下载前统计本地已有多少同名文件。
+#[tauri::command]
+fn local_paths_exist(paths: Vec<String>) -> Vec<bool> {
+    paths.iter().map(|p| std::path::Path::new(p).exists()).collect()
 }
 
 /// 下载时把选中的远端文件夹递归展开成文件列表（逐个目录列举，弱网下可能要几秒，所以是 async）。
@@ -2573,6 +2598,8 @@ pub fn run() {
             set_language,
             expand_local_paths,
             expand_remote_paths,
+            remote_paths_exist,
+            local_paths_exist,
             local_file_digests,
             save_text_file,
             list_activity_log,

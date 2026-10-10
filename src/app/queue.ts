@@ -1,12 +1,14 @@
 // 批量传输：把多个文件逐个交给单文件流程执行，并汇总结果。
 import { t } from "../i18n";
+import { invoke } from "@tauri-apps/api/core";
 import { clarifyTransferError } from "./backendText";
 import { showCommandResult } from "./command";
-import { prepareConnection } from "./connection";
-import { hostInput, localPathInput, postCommandInput, queueChip, remotePathInput, resultFiles } from "./dom";
+import { connectionPayload, prepareConnection } from "./connection";
+import { showConfirm } from "./dialogs";
+import { forceOverwriteInput, hostInput, localPathInput, postCommandInput, queueChip, remotePathInput, resultFiles } from "./dom";
 import { asDir, describeError, fileNameOf } from "./format";
 import { setSelectedDownloads, setSelectedUploads } from "./paths";
-import { hideVerifySummary } from "./progress";
+import { hideVerifySummary, setStatus } from "./progress";
 import { state } from "./state";
 import { finishSuccessfulRun, setTransferring, showResult, startOneDownload, startOneUpload, verificationModeText } from "./transfer";
 import { QueueItem, QueueItemStatus, RunStats, RunStepResult, TransferDirection, UploadStart } from "./types";
@@ -46,6 +48,11 @@ export async function startQueueFlow() {
     }),
     index: 0,
   };
+  if (!(await confirmBatch(queue.items, download))) {
+    setStatus(download ? t("已取消批量下载") : t("已取消批量上传"));
+    return;
+  }
+  // 设置后，逐个文件的预检不再弹确认框（见 confirmUploadAction / confirmDownloadAction）。
   state.activeQueue = queue;
 
   try {
@@ -115,6 +122,44 @@ export async function startQueueFlow() {
     baseInput.value = baseDir;
   }
   await finishQueue(queue.items, template, queueStartedAt, direction, { relDirs, sizes });
+}
+
+
+/**
+ * 批量开始前只确认一次：重新上传整个 dist/ 时，若逐个文件询问「是否替换」，几百个文件就要点几百次。
+ * 先统计目标端已有多少同名文件，让用户一次看清会发生什么；全是新文件时不打扰。
+ */
+async function confirmBatch(items: QueueItem[], download: boolean): Promise<boolean> {
+  const targets = items.map((item) => `${item.target}${fileNameOf(item.source)}`);
+  let existing: number | null = null;
+  try {
+    const flags = download
+      ? await invoke<boolean[]>("local_paths_exist", { paths: targets })
+      : await invoke<boolean[]>("remote_paths_exist", { request: { ...connectionPayload(), paths: targets } });
+    existing = flags.filter(Boolean).length;
+  } catch (error) {
+    // 统计失败不影响传输本身，退回到不带数字的笼统确认。
+    console.warn("batch existence check failed", error);
+  }
+  const force = forceOverwriteInput.checked;
+  if (existing === 0 && !force) return true;
+
+  const total = items.length;
+  const fresh = existing === null ? 0 : total - existing;
+  let body: string;
+  if (existing === null) {
+    body = download
+      ? t("将下载 {total} 个文件。本地已有的同名文件会被覆盖。", { total })
+      : t("将上传 {total} 个文件。远端已有的同名文件会在新文件校验通过后被替换。", { total });
+  } else {
+    body = download
+      ? t("将下载 {total} 个文件：新建 {fresh} 个，覆盖本地已有的 {existing} 个。", { total, fresh, existing })
+      : t("将上传 {total} 个文件：新建 {fresh} 个，替换远端已有的 {existing} 个（新文件校验通过后才替换，此前旧文件保持不变）。", { total, fresh, existing });
+  }
+  body += "\n\n" + (force
+    ? t("已勾选「强制从头覆盖」：所有文件都会从头重新传输，不续传。")
+    : t("与目标端完全相同的文件会自动跳过。"));
+  return showConfirm(download ? t("批量下载") : t("批量上传"), body, { ok: t("开始") });
 }
 
 

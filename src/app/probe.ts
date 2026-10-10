@@ -250,6 +250,7 @@ export async function probeRemoteDownload(): Promise<RemoteDownloadProbe> {
 
 export async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise<boolean> {
   showDownloadProbeResult(probe);
+  if (state.activeQueue) return true;
 
   if (probe.action === "verify_retry" || probe.action === "resume" || probe.action === "new") {
     return true;
@@ -299,6 +300,8 @@ export async function probeRemoteUpload(): Promise<RemoteUploadProbe> {
 
 export async function confirmUploadAction(probe: RemoteUploadProbe): Promise<boolean> {
   showProbeResult(probe);
+  // 批量传输已在开始前统一确认过（见 confirmBatch），逐个文件不再询问。
+  if (state.activeQueue) return true;
 
   if (probe.action === "verify_retry" || probe.action === "resume" || probe.action === "new") {
     return true;

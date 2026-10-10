@@ -516,3 +516,17 @@ fn e2e_legacy_checkpoint_resumes_in_place() {
     assert!(resumed_from > 0);
     assert_same_file(&local, &remote);
 }
+
+#[test]
+fn e2e_remote_paths_exist_lists_each_directory_once() {
+    let _guard = serial();
+    let Some(env) = env("exists") else { return };
+    let dir = env.work.join("remote/site");
+    std::fs::create_dir_all(dir.join("js")).unwrap();
+    std::fs::write(dir.join("index.html"), b"x").unwrap();
+    std::fs::write(dir.join("js/app.js"), b"y").unwrap();
+    let path = |p: &str| dir.join(p).to_string_lossy().to_string();
+    let paths = [path("index.html"), path("about.html"), path("js/app.js"), path("css/site.css")];
+    let exists = crate::sftp::remote_paths_exist(&env.config, &paths).expect("check");
+    assert_eq!(exists, vec![true, false, true, false]);
+}
