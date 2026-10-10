@@ -202,11 +202,14 @@ export function showWaitingSpeedText(elapsedMs: number) {
   details.push(t("已等待 {secs}s", { secs }));
   const prefix = state.isReconnecting ? t("重连中...") : t("等待响应...");
   showProgressSpeed(`${prefix} (${details.join(" · ")})`, true);
+  // 卡住时没有可信的速度，总进度里的剩余时间也必须去掉，否则会停在卡住前的乐观数字上。
+  updateQueueChip(null);
 }
 
 
 /** 刚进入重连时的副文本 */
 export function showReconnectingSpeedText() {
+  updateQueueChip(null);
   const delayHint = formatRetryDelayHint();
   const details: string[] = [];
   if (state.retryCount > 0) details.push(t("第 {retryCount} 次重试", { retryCount: state.retryCount }));
