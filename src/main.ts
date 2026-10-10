@@ -1002,7 +1002,11 @@ function openConfirmDialog() {
   });
 }
 
-function showConfirm(title: string, body: string): Promise<boolean> {
+function showConfirm(
+  title: string,
+  body: string,
+  labels: { ok?: string; cancel?: string } = {},
+): Promise<boolean> {
   if (confirmResolver) {
     const stale = confirmResolver;
     confirmResolver = null;
@@ -1011,6 +1015,9 @@ function showConfirm(title: string, body: string): Promise<boolean> {
 
   confirmTitle.textContent = title;
   confirmBody.textContent = body;
+  // 按钮文案默认「确定 / 取消」；需要更明确的动作时（如「继续传输 / 稍后」）由调用方指定。
+  confirmOk.textContent = labels.ok ?? t("确定");
+  confirmCancel.textContent = labels.cancel ?? t("取消");
   openConfirmDialog();
 
   return new Promise((resolve) => {
@@ -3792,6 +3799,50 @@ void listen("transfer-close-requested", async () => {
   await getCurrentWindow().close();
 });
 
+/**
+ * 启动顺序有依赖：恢复断点时要按 host/user 匹配已保存的服务器，所以先加载服务器列表；
+ * 是否提示继续传输，又要等确认后端当前没有正在进行的任务之后才能决定。
+ */
+async function startupSequence() {
+  const settle = (task: Promise<unknown>) => task.catch(() => {});
+  await settle(loadProfiles());
+  await settle(restoreActiveCheckpoint());
+  await settle(syncTransferStateOnStartup());
+  await offerResumeOnLaunch();
+}
+
+/**
+ * 启动时发现未完成的传输就主动询问是否继续：应用崩溃或电脑重启后，
+ * 用户往往不记得还有传了一半的文件，等他去历史页翻就晚了。
+ */
+async function offerResumeOnLaunch() {
+  if (isTransferring) return;
+  const pending: [TransferDirection, UploadCheckpoint | DownloadCheckpoint][] = [];
+  if (activeUploadCheckpoint) pending.push(["upload", activeUploadCheckpoint]);
+  if (activeDownloadCheckpoint) pending.push(["download", activeDownloadCheckpoint]);
+  if (pending.length === 0) return;
+
+  const [direction, cp] = pending[0];
+  const transferred = getTransferredBytes(cp);
+  const name = fileNameOf(direction === "download" ? cp.remote_path : cp.local_path);
+  const percent = cp.file_size > 0 ? Math.floor((transferred / cp.file_size) * 100) : 0;
+  const more = pending.length > 1 ? t("\n\n另有 1 个未完成的传输，可在「历史」页查看。") : "";
+  const resume = await showConfirm(
+    t("有未完成的传输"),
+    t("「{name}」已{verb} {percent}%（{done} / {total}），要现在继续吗？", {
+      name,
+      verb: direction === "download" ? t("下载") : t("上传"),
+      percent,
+      done: formatBytes(transferred),
+      total: formatBytes(cp.file_size),
+    }) + more,
+    { ok: t("继续传输"), cancel: t("稍后") },
+  );
+  if (!resume) return;
+  await resumePendingTransfer(direction);
+  transferBtn.click();
+}
+
 async function syncTransferStateOnStartup() {
   try {
     const state = await invoke<{ upload_running: boolean; download_running: boolean }>(
@@ -3882,11 +3933,9 @@ showTransferView("compose");
 updateConnectionSummary();
 updateModeHint();
 updateTransferDirectionUI();
-void loadProfiles();
 void loadHosts();
-void restoreActiveCheckpoint();
 void loadHistory();
-void syncTransferStateOnStartup();
+void startupSequence();
 void getVersion()
   .then((version) => {
     appVersion.textContent = `v${version}`;

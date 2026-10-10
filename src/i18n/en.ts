@@ -348,4 +348,8 @@ export const en: Record<string, string> = {
   "开始后将直接完成，不会重新上传；如需重传请勾选「强制从头覆盖」": "Starting will finish immediately without re-uploading. Tick “Overwrite from scratch” to upload anyway",
   "远端磁盘空间不足": "Not enough space on the server",
   "请清理服务器空间或换一个目录后再试": "Free up space on the server or choose another folder, then try again",
+  "\n\n另有 1 个未完成的传输，可在「历史」页查看。": "\n\nThere is 1 more unfinished transfer in History.",
+  "有未完成的传输": "Unfinished transfer",
+  "「{name}」已{verb} {percent}%（{done} / {total}），要现在继续吗？": "“{name}” is {percent}% done ({done} / {total}). Resume now?",
+  "稍后": "Later",
 };
