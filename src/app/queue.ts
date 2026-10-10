@@ -47,6 +47,10 @@ export async function startQueueFlow() {
       };
     }),
     index: 0,
+    totalBytes: sources.every((source) => sizes.has(source))
+      ? sources.reduce((sum, source) => sum + (sizes.get(source) ?? 0), 0)
+      : 0,
+    doneBytes: 0,
   };
   if (!(await confirmBatch(queue.items, download))) {
     setStatus(download ? t("已取消批量下载") : t("已取消批量上传"));
@@ -58,6 +62,8 @@ export async function startQueueFlow() {
   try {
     for (let i = 0; i < queue.items.length; i++) {
       const item = queue.items[i];
+      // 上一个文件已结束（成功、跳过或失败都算），计入总进度；放在循环开头，continue 的分支也不会漏算。
+      if (i > 0) queue.doneBytes += sizes.get(queue.items[i - 1].source) ?? 0;
       queue.index = i;
       if (download) {
         remotePathInput.value = item.source;

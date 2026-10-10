@@ -418,4 +418,5 @@ export const en: Record<string, string> = {
   "{message}\n\n将从头重新下载，是否继续？": "{message}\n\nDownload again from scratch?",
   "替换本地文件": "Replace local file",
   "{message}\n\n本地已有同名文件，是否下载并替换它？": "{message}\n\nA file with this name already exists locally. Download and replace it?",
+  "全部约 {eta}": "all done in about {eta}",
 };

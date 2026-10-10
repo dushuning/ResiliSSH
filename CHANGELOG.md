@@ -12,6 +12,7 @@
 - Jump hosts (like `ssh -J`): pick another saved server under “Via” to reach internal servers through a bastion. Multi-hop chains (up to 3), `ProxyJump` from `~/.ssh/config` on import, host keys confirmed hop by hop, and the usual unlimited reconnect/resume. A jump host that forbids forwarding is reported instead of retried forever.
 
 ### Changed
+- Batch transfers show overall progress — bytes done of the total and an estimate for the whole batch — next to “3 / 238”.
 - Batch transfers ask once before starting, with a count of new files and files that will replace existing ones, instead of asking for every existing file (re-uploading a `dist/` folder used to mean hundreds of prompts).
 
 ### Fixed

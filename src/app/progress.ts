@@ -22,8 +22,7 @@ export function beginRunVisuals() {
   blockMap.reset();
   blockMap.setVerifiedPerBlock(isReliableMode());
   if (state.activeQueue) {
-    queueChip.textContent = t("第 {p1} / {length} 个", { p1: state.activeQueue.index + 1, length: state.activeQueue.items.length });
-    queueChip.classList.remove("hidden");
+    updateQueueChip(null);
   } else {
     queueChip.classList.add("hidden");
     renderQueueResultFiles(null);
@@ -331,6 +330,30 @@ export function recordSpeedSample(bytes: number) {
 }
 
 
+/**
+ * 批量传输的总进度：只看「第 3 / 238 个」无法知道整体还要多久。剩余时间按当前速度估算，
+ * 与单文件的估算一致；队列里有文件大小未知时只显示个数。
+ */
+export function updateQueueChip(speedBps: number | null) {
+  const queue = state.activeQueue;
+  if (!queue) {
+    queueChip.classList.add("hidden");
+    return;
+  }
+  const parts = [t("第 {p1} / {length} 个", { p1: queue.index + 1, length: queue.items.length })];
+  if (queue.totalBytes > 0) {
+    const processed = Math.min(queue.totalBytes, queue.doneBytes + state.progressTransferredBytes);
+    parts.push(`${formatBytes(processed)} / ${formatBytes(queue.totalBytes)}`);
+    if (speedBps && speedBps > 0 && processed < queue.totalBytes) {
+      const eta = formatEtaSeconds((queue.totalBytes - processed) / speedBps);
+      if (eta) parts.push(t("全部约 {eta}", { eta }));
+    }
+  }
+  queueChip.textContent = parts.join(" · ");
+  queueChip.classList.remove("hidden");
+}
+
+
 export function refreshSpeedDisplay() {
   if (!state.isTransferring) return;
 
@@ -354,6 +377,7 @@ export function refreshSpeedDisplay() {
     return;
   }
 
+  updateQueueChip(speed);
   let speedText = `${formatBytes(speed)}/s`;
   const transferred = state.speedSamples[state.speedSamples.length - 1]?.bytes ?? 0;
   const total = state.progressTotalBytes;

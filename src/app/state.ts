@@ -1,5 +1,5 @@
 // 运行时可变状态的唯一来源：各模块通过 state.xxx 读写，避免模块间各自持有副本。
-import { ConnectionProfile, DownloadCheckpoint, PageId, QueueItem, RemoteDirListing, RemoteDownloadProbe, RemoteUploadProbe, RunReceipt, RunStepResult, TransferDirection, TransferView, UploadCheckpoint, UploadHistoryEntry } from "./types";
+import { ActiveQueue, ConnectionProfile, DownloadCheckpoint, PageId, RemoteDirListing, RemoteDownloadProbe, RemoteUploadProbe, RunReceipt, RunStepResult, TransferDirection, TransferView, UploadCheckpoint, UploadHistoryEntry } from "./types";
 
 /**
  * 运行时可变状态：集中在一个对象里，各模块通过 state.xxx 读写。
@@ -61,7 +61,7 @@ export const state = {
   downloadRelDirs: new Map<string, string>(),
   downloadSizes: new Map<string, number>(),
   /** 队列执行中的状态；为 null 表示当前是普通单文件传输。 */
-  activeQueue: null as { items: QueueItem[]; index: number } | null,
+  activeQueue: null as ActiveQueue | null,
   resolveQueueStep: null as ((result: RunStepResult) => void) | null,
   probeDebounceTimer: null as number | null,
   backgroundProbeGeneration: 0,

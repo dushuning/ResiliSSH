@@ -281,6 +281,16 @@ export type UploadStart = "started" | "declined" | "identical";
 export type ResultKind = "ok" | "warn" | "error" | "paused";
 
 
+export interface ActiveQueue {
+  items: QueueItem[];
+  index: number;
+  /** 全部文件的总字节数；有文件大小未知时为 0，此时只显示个数，不显示可能误导的总量。 */
+  totalBytes: number;
+  /** 已结束（成功、跳过或失败）的文件字节数之和。 */
+  doneBytes: number;
+}
+
+
 export interface ReceiptFile {
   local: string;
   remote: string;

@@ -90,7 +90,12 @@ export function updateRemoteBrowsePickButton() {
 export async function applyRemoteDownloadPicks(picked: string[]) {
   if (picked.length === 0) return;
   if (!picked.some((path) => remoteBrowsePicked.get(path))) {
-    setSelectedDownloads(picked);
+    // 带上列表里已知的大小，批量下载才能显示总进度。
+    const sizes = new Map(state.remoteBrowseCurrent?.entries.map((e) => [e.path, e.size]) ?? []);
+    setSelectedDownloads(
+      picked,
+      picked.map((path) => ({ path, rel_dir: "", size: sizes.get(path) ?? 0 })),
+    );
     closeRemoteBrowseOverlay();
     return;
   }

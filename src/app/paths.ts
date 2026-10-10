@@ -340,7 +340,8 @@ export async function pickLocalPaths() {
     clearProbeResult();
     scheduleBackgroundProbe();
   } else {
-    setSelectedUploads(Array.isArray(selected) ? selected : [selected]);
+    // 与拖入、选文件夹走同一条路：由后端展开并带回文件大小，批量传输才能显示总进度。
+    await selectLocalPathsExpanded(Array.isArray(selected) ? selected : [selected]);
   }
 }
 
