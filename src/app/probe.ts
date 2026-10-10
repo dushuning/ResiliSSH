@@ -89,18 +89,22 @@ export function analyzeProbeState(
   if (action === "identical") {
     return {
       kind: "info",
-      title: t("远端已是最新"),
+      title: download ? t("本地已是最新") : t("远端已是最新"),
       detail: probe.message,
-      hint: t("开始后将直接完成，不会重新上传；如需重传请勾选「强制从头覆盖」"),
+      hint: download
+        ? t("开始后将直接完成，不会重新下载；如需重下请勾选「强制从头覆盖」")
+        : t("开始后将直接完成，不会重新上传；如需重传请勾选「强制从头覆盖」"),
       showClear: false,
     };
   }
   if (action === "insufficient_space") {
     return {
       kind: "error",
-      title: t("远端磁盘空间不足"),
+      title: download ? t("本地磁盘空间不足") : t("远端磁盘空间不足"),
       detail: probe.message,
-      hint: t("请清理服务器空间或换一个目录后再试"),
+      hint: download
+        ? t("请清理本地空间或换一个保存位置后再试")
+        : t("请清理服务器空间或换一个目录后再试"),
       showClear: false,
     };
   }

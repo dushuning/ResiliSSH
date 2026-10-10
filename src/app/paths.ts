@@ -13,12 +13,32 @@ import { setStatus } from "./progress";
 import { RECENT_DIR_LIMIT, currentProfile, saveProfileExtras } from "./servers";
 import { state } from "./state";
 import { isDownloadMode, showTransferView } from "./transfer";
-import { LocalEntry } from "./types";
+import { ExpandedPaths, LocalEntry } from "./types";
 
 export function isQueueSelection(): boolean {
-  if (isDownloadMode()) return state.selectedDownloads.length > 1;
-  // 文件夹里只有一个文件时也要走队列：它需要放进远端的子目录。
+  // 文件夹里只有一个文件时也要走队列：它需要放进目标端的子目录。
+  if (isDownloadMode()) return state.selectedDownloads.length > 1 || state.downloadRelDirs.size > 0;
   return state.selectedUploads.length > 1 || state.uploadRelDirs.size > 0;
+}
+
+
+/**
+ * 文件夹展开后需要提醒用户的情况：超过上限被截断，或有子目录读不了。
+ * 两种情况都意味着「不是整个文件夹都会传」，静默处理会让用户误以为全部送达。
+ */
+export function reportExpansionWarnings(expanded: ExpandedPaths) {
+  const notes: string[] = [];
+  if (expanded.truncated) {
+    notes.push(t("文件太多，只取了前 {count} 个", { count: expanded.entries.length }));
+  }
+  if (expanded.unreadable_dirs.length > 0) {
+    notes.push(
+      t("{count} 个文件夹无法读取，其中的文件不会传输（详见日志）", {
+        count: expanded.unreadable_dirs.length,
+      }),
+    );
+  }
+  if (notes.length > 0) setStatus(notes.join("；"), "retry");
 }
 
 
@@ -39,10 +59,7 @@ export function setSelectedUploads(paths: string[], entries: LocalEntry[] = []) 
 export async function selectLocalPathsExpanded(paths: string[]) {
   if (paths.length === 0) return;
   try {
-    const expanded = await invoke<{ entries: LocalEntry[]; truncated: boolean }>(
-      "expand_local_paths",
-      { paths },
-    );
+    const expanded = await invoke<ExpandedPaths>("expand_local_paths", { paths });
     if (expanded.entries.length === 0) {
       setStatus(t("所选文件夹里没有可上传的文件"), "error");
       return;
@@ -51,21 +68,21 @@ export async function selectLocalPathsExpanded(paths: string[]) {
       expanded.entries.map((e) => e.path),
       expanded.entries,
     );
-    if (expanded.truncated) {
-      setStatus(t("文件太多，只取了前 {count} 个", { count: expanded.entries.length }), "retry");
-    }
+    reportExpansionWarnings(expanded);
   } catch (error) {
     setStatus(describeError(error), "error");
   }
 }
 
 
-export function setSelectedDownloads(paths: string[]) {
+export function setSelectedDownloads(paths: string[], entries: LocalEntry[] = []) {
   state.selectedDownloads = paths.filter(Boolean);
+  state.downloadRelDirs = new Map(entries.filter((e) => e.rel_dir).map((e) => [e.path, e.rel_dir]));
+  state.downloadSizes = new Map(entries.map((e) => [e.path, e.size]));
   remotePathInput.value = state.selectedDownloads[0] ?? "";
   // 多个文件只能下载到目录里，否则会互相覆盖成同一个本地文件。
   const local = localPathInput.value.trim();
-  if (state.selectedDownloads.length > 1 && local && !local.endsWith("/")) {
+  if (isQueueSelection() && local && !local.endsWith("/")) {
     localPathInput.value = `${local}/`;
   }
   updateDropZoneState();
@@ -242,17 +259,27 @@ export function previewResolvedPath(): string | null {
 export function updateResolvedPathHint() {
   // 所有改动远端路径的入口（浏览选择、复用历史、恢复断点）都会走到这里，顺带同步收藏星标。
   updateBookmarkButton();
+  // 路径被程序直接改写（复用历史、恢复断点、手动输入）时，退回单文件选择。
   if (isDownloadMode() && state.selectedDownloads[0] !== remotePathInput.value.trim()) {
     const remote = remotePathInput.value.trim();
     state.selectedDownloads = remote ? [remote] : [];
+    state.downloadRelDirs = new Map();
+    state.downloadSizes = new Map();
   }
   if (isQueueSelection() && isDownloadMode()) {
     const dir = localPathInput.value.trim();
-    resolvedPathHint.textContent = t("将依次下载 {count} 个文件到：{dir}", {
-      count: state.selectedDownloads.length,
-      dir: dir ? asDir(dir) : "…",
-    });
-    resolvedPathHint.title = state.selectedDownloads.join("\n");
+    const totalSize = [...state.downloadSizes.values()].reduce((sum, size) => sum + size, 0);
+    resolvedPathHint.textContent =
+      t("将依次下载 {count} 个文件到：{dir}", {
+        count: state.selectedDownloads.length,
+        dir: dir ? asDir(dir) : "…",
+      }) + (totalSize > 0 ? ` · ${formatBytes(totalSize)}` : "");
+    resolvedPathHint.title = state.selectedDownloads
+      .map((p) => {
+        const rel = state.downloadRelDirs.get(p);
+        return rel ? `${rel}/${fileNameOf(p)}` : fileNameOf(p);
+      })
+      .join("\n");
     resolvedPathHint.classList.remove("hidden");
     return;
   }

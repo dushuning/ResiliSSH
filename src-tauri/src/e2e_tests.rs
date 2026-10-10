@@ -306,3 +306,30 @@ fn e2e_preflight_hash_and_free_space() {
     let missing = remote_free_bytes(&session, &sftp, &pending.to_string_lossy());
     assert!(missing.is_some_and(|f| f > 0), "free space via df on nearest existing dir");
 }
+
+#[test]
+fn e2e_expand_remote_folder_keeps_structure() {
+    let _guard = serial();
+    let Some(env) = env("expand") else { return };
+    let dist = env.work.join("remote/dist");
+    std::fs::create_dir_all(dist.join("js/vendor")).unwrap();
+    std::fs::write(dist.join("index.html"), b"<html>").unwrap();
+    std::fs::write(dist.join("js/app.js"), b"app").unwrap();
+    std::fs::write(dist.join("js/vendor/lib.js"), b"lib").unwrap();
+    std::fs::write(dist.join(".DS_Store"), b"junk").unwrap();
+    // 指向目录树之外的符号链接不能被跟随，否则会把无关内容下载下来。
+    std::os::unix::fs::symlink(env.work.join("local"), dist.join("outside")).unwrap();
+
+    let expanded = crate::sftp::expand_remote_paths(&env.config, &[format!("{}/", dist.display())])
+        .expect("expand");
+    let got: Vec<(String, String)> = expanded
+        .entries
+        .iter()
+        .map(|e| (e.rel_dir.clone(), e.path.rsplit('/').next().unwrap().to_string()))
+        .collect();
+    let want = [("dist", "index.html"), ("dist/js", "app.js"), ("dist/js/vendor", "lib.js")];
+    assert_eq!(got, want.map(|(d, f)| (d.to_string(), f.to_string())));
+    assert_eq!(expanded.entries[0].size, 6);
+    assert!(!expanded.truncated);
+    assert!(expanded.unreadable_dirs.is_empty());
+}

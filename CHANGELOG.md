@@ -12,8 +12,8 @@
 - Bookmarked and recent remote folders per server.
 - Post-transfer command with safely shell-quoted variables (`{remote_dir}` `{file_name}` `{remote_path}` `{files}`).
 - Multi-file upload queue; the post-transfer command runs once after all files succeed.
-- Batch download (multi-select in the remote browser) and folder upload that keeps the directory structure.
-- Preflight before upload: refuse early when the remote disk lacks space; skip files whose SHA-256 already matches.
+- Batch download (multi-select files and folders in the remote browser) and folder upload; both keep the directory structure. Folders that cannot be read are reported instead of silently skipped.
+- Preflight before every transfer: refuse early when the destination disk (remote for uploads, local for downloads) lacks space; skip files whose SHA-256 already matches.
 - Offer to resume unfinished transfers on launch.
 - Per-server option to not store the password in the Keychain (kept in memory for the current session only).
 - English UI and language setting; backend messages follow the UI language.

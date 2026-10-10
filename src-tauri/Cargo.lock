@@ -3329,6 +3329,7 @@ version = "1.0.0"
 dependencies = [
  "dirs",
  "keyring",
+ "libc",
  "log",
  "serde",
  "serde_json",

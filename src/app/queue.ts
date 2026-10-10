@@ -30,11 +30,11 @@ export async function startQueueFlow() {
   const queueStartedAt = Date.now();
   const template = postCommandInput.value.trim();
   const sources = download ? [...state.selectedDownloads] : [...state.selectedUploads];
-  const relDirs = new Map(state.uploadRelDirs);
-  const sizes = new Map(state.uploadSizes);
+  const relDirs = new Map(download ? state.downloadRelDirs : state.uploadRelDirs);
+  const sizes = new Map(download ? state.downloadSizes : state.uploadSizes);
   const queue = {
     items: sources.map<QueueItem>((source) => {
-      const rel = download ? "" : (relDirs.get(source) ?? "");
+      const rel = relDirs.get(source) ?? "";
       return {
         source,
         target: rel ? `${baseDir}${rel}/` : baseDir,
@@ -79,7 +79,7 @@ export async function startQueueFlow() {
         continue;
       }
       if (started === "identical") {
-        // 与远端完全一致视为已送达：计入成功，队列结束后的命令照常执行。
+        // 两端完全一致视为已送达：计入成功，队列结束后的命令照常执行。
         state.resolveQueueStep = null;
         item.status = "done";
         item.remote = state.runRemotePath;
@@ -134,17 +134,15 @@ export async function finishQueue(
   // 选择只保留没成功的文件：之后点「重试 / 继续传输」不会把已完成的文件再传一遍。
   const remaining = items.filter((i) => i.status !== "done").map((i) => i.source);
   const keep = remaining.length > 0 ? remaining : items.map((i) => i.source);
+  const keepEntries = keep.map((path) => ({
+    path,
+    rel_dir: selection.relDirs.get(path) ?? "",
+    size: selection.sizes.get(path) ?? 0,
+  }));
   if (download) {
-    setSelectedDownloads(keep);
+    setSelectedDownloads(keep, keepEntries);
   } else {
-    setSelectedUploads(
-      keep,
-      keep.map((path) => ({
-        path,
-        rel_dir: selection.relDirs.get(path) ?? "",
-        size: selection.sizes.get(path) ?? 0,
-      })),
-    );
+    setSelectedUploads(keep, keepEntries);
   }
 
   if (done.length === total) {

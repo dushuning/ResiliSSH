@@ -147,7 +147,14 @@ export interface RemoteDownloadProbe {
   remote_size: number;
   local_size: number;
   verified_bytes: number;
-  action: "new" | "resume" | "overwrite" | "full_redownload" | "verify_retry";
+  action:
+    | "new"
+    | "resume"
+    | "overwrite"
+    | "full_redownload"
+    | "verify_retry"
+    | "identical"
+    | "insufficient_space";
   message: string;
 }
 
@@ -206,10 +213,19 @@ export type PageId = "transfer" | "servers" | "history" | "logs" | "settings";
 
 export type TransferView = "compose" | "run" | "result";
 
+/** 展开后的待传文件。上传时 path 是本地路径，下载时是远端路径；rel_dir 是相对所选文件夹的目录。 */
 export interface LocalEntry {
   path: string;
   rel_dir: string;
   size: number;
+}
+
+
+export interface ExpandedPaths {
+  entries: LocalEntry[];
+  truncated: boolean;
+  /** 读不了的子目录：其中的文件不在 entries 里，必须提醒用户。 */
+  unreadable_dirs: string[];
 }
 
 

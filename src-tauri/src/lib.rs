@@ -28,7 +28,8 @@ use profiles::{
 };
 use sftp::{
     abort_socket, bytes_needed, connect_session, create_remote_directory, download_with_resume,
-    format_remote_sftp_error, inspect_host_key, list_remote_directory, local_sha256,
+    expand_remote_paths as expand_sftp_remote_paths, format_remote_sftp_error, inspect_host_key,
+    list_remote_directory, local_free_bytes, local_sha256,
     open_handshake, remote_free_bytes, remote_sha256, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
@@ -452,6 +453,18 @@ struct ListRemoteDirRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExpandRemotePathsRequest {
+    host: String,
+    port: u16,
+    username: String,
+    auth_type: String,
+    password: Option<String>,
+    key_path: Option<String>,
+    key_passphrase: Option<String>,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateRemoteDirRequest {
     host: String,
     port: u16,
@@ -490,6 +503,35 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     };
     let config = build_connection_config(&conn)?;
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
+}
+
+/// 下载时把选中的远端文件夹递归展开成文件列表（逐个目录列举，弱网下可能要几秒，所以是 async）。
+#[tauri::command(async)]
+fn expand_remote_paths(request: ExpandRemotePathsRequest) -> Result<local_files::ExpandedPaths, String> {
+    let conn = ConnectionRequest {
+        host: request.host,
+        port: request.port,
+        username: request.username,
+        auth_type: request.auth_type,
+        password: request.password,
+        key_path: request.key_path,
+        key_passphrase: request.key_passphrase,
+    };
+    let config = build_connection_config(&conn)?;
+    let expanded = expand_sftp_remote_paths(&config, &request.paths)?;
+    if !expanded.unreadable_dirs.is_empty() {
+        activity::warn(
+            activity::Category::Permission,
+            crate::tr!(
+                format!("以下远端目录无法读取，其中的文件不会下载：{}", expanded.unreadable_dirs.join("、")),
+                format!(
+                    "These remote folders could not be read; their files will not be downloaded: {}",
+                    expanded.unreadable_dirs.join(", ")
+                )
+            ),
+        );
+    }
+    Ok(expanded)
 }
 
 #[tauri::command(async)]
@@ -728,30 +770,22 @@ fn upload_preflight(
     remote_size: u64,
     verified_bytes: u64,
 ) -> Option<(&'static str, String)> {
-    // 大小一致且没有进行中的续传，才值得比对哈希；正在续传的文件远端大小本来就不同。
-    let resuming = verified_bytes > 0 && verified_bytes < local_size;
-    if remote_size == local_size && local_size > 0 && !resuming {
-        if let (Some(remote), Some(local)) =
-            (remote_sha256(session, remote_path), local_sha256(local_path))
-        {
-            if remote == local {
-                activity::info(
-                    activity::Category::Verify,
-                    crate::tr!(
-                        format!("远端 {remote_path} 与本地文件 SHA-256 一致，无需上传"),
-                        format!("{remote_path} already matches the local file (SHA-256); skipping upload")
-                    ),
-                );
-                return Some((
-                    "identical",
-                    crate::tr!(
-                        "远端已有完全相同的文件（SHA-256 一致），无需上传",
-                        "The server already has an identical file (SHA-256 match); no upload needed"
-                    )
-                    .into(),
-                ));
-            }
-        }
+    if files_identical(session, remote_path, local_path, local_size, remote_size, verified_bytes) {
+        activity::info(
+            activity::Category::Verify,
+            crate::tr!(
+                format!("远端 {remote_path} 与本地文件 SHA-256 一致，无需上传"),
+                format!("{remote_path} already matches the local file (SHA-256); skipping upload")
+            ),
+        );
+        return Some((
+            "identical",
+            crate::tr!(
+                "远端已有完全相同的文件（SHA-256 一致），无需上传",
+                "The server already has an identical file (SHA-256 match); no upload needed"
+            )
+            .into(),
+        ));
     }
 
     let free = remote_free_bytes(session, sftp, remote_path)?;
@@ -766,6 +800,75 @@ fn upload_preflight(
             ),
             format!(
                 "Not enough space on the server: {} free in {dir}, {} needed",
+                activity::format_bytes(free),
+                activity::format_bytes(needed)
+            )
+        );
+        activity::error(activity::Category::Transfer, message.clone());
+        return Some(("insufficient_space", message));
+    }
+    None
+}
+
+/// 两端是否已是同一个文件。大小一致且没有进行中的续传才值得比对哈希——正在续传的文件
+/// 两端大小本来就不同；任何一端算不出哈希（如服务器不允许执行命令）都按「不同」处理，照常传输。
+fn files_identical(
+    session: &ssh2::Session,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    source_size: u64,
+    target_size: u64,
+    verified_bytes: u64,
+) -> bool {
+    let resuming = verified_bytes > 0 && verified_bytes < source_size;
+    if source_size == 0 || target_size != source_size || resuming {
+        return false;
+    }
+    matches!(
+        (remote_sha256(session, remote_path), local_sha256(local_path)),
+        (Some(remote), Some(local)) if remote == local
+    )
+}
+
+/// 下载预检，与 upload_preflight 对称：本地已是同一个文件则无需下载；本地磁盘不够则现在就拦下。
+fn download_preflight(
+    session: &ssh2::Session,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    remote_size: u64,
+    local_size: u64,
+    verified_bytes: u64,
+) -> Option<(&'static str, String)> {
+    if files_identical(session, remote_path, local_path, remote_size, local_size, verified_bytes) {
+        activity::info(
+            activity::Category::Verify,
+            crate::tr!(
+                format!("本地 {} 与远端文件 SHA-256 一致，无需下载", local_path.display()),
+                format!("{} already matches the remote file (SHA-256); skipping download", local_path.display())
+            ),
+        );
+        return Some((
+            "identical",
+            crate::tr!(
+                "本地已有完全相同的文件（SHA-256 一致），无需下载",
+                "An identical file already exists locally (SHA-256 match); no download needed"
+            )
+            .into(),
+        ));
+    }
+
+    let free = local_free_bytes(local_path)?;
+    let needed = bytes_needed(remote_size, local_size.max(verified_bytes));
+    if free < needed {
+        let dir = local_path.parent().map_or_else(|| "/".into(), |d| d.display().to_string());
+        let message = crate::tr!(
+            format!(
+                "本地磁盘空间不足：{dir} 剩余 {}，还需要 {}",
+                activity::format_bytes(free),
+                activity::format_bytes(needed)
+            ),
+            format!(
+                "Not enough local disk space: {} free in {dir}, {} needed",
                 activity::format_bytes(free),
                 activity::format_bytes(needed)
             )
@@ -1005,7 +1108,17 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         .unwrap_or(0);
 
     let local_exists = local_size > 0;
-    let (action, message) = if checkpoint.as_ref().is_some_and(|cp| {
+    let preflight = download_preflight(
+        &session,
+        remote_path,
+        std::path::Path::new(&resolved_local_path),
+        remote_size,
+        local_size,
+        verified_bytes,
+    );
+    let (action, message) = if let Some(preflight) = preflight {
+        preflight
+    } else if checkpoint.as_ref().is_some_and(|cp| {
         cp.failure_reason.as_deref() == Some("verify_read_failed")
             && cp.downloaded_bytes >= cp.file_size
     }) {
@@ -2331,6 +2444,7 @@ pub fn run() {
             get_profile_secrets,
             set_language,
             expand_local_paths,
+            expand_remote_paths,
             list_activity_log,
             clear_activity_log,
             update_connection_profile_extras,

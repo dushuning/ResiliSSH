@@ -53,6 +53,9 @@ export const state = {
   uploadSizes: new Map<string, number>(),
   /** 批量下载时选中的远端文件；remotePathInput 始终保存第一个，单文件逻辑不受影响。 */
   selectedDownloads: [] as string[],
+  /** 文件夹下载时每个远端文件相对所选文件夹的目录，用于在本地还原目录结构；与 uploadRelDirs 对称。 */
+  downloadRelDirs: new Map<string, string>(),
+  downloadSizes: new Map<string, number>(),
   /** 队列执行中的状态；为 null 表示当前是普通单文件传输。 */
   activeQueue: null as { items: QueueItem[]; index: number } | null,
   resolveQueueStep: null as ((result: RunStepResult) => void) | null,

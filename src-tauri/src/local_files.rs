@@ -6,9 +6,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 单次最多展开的文件数：防止误把整个家目录拖进来，生成一个几十万项的队列。
-const MAX_EXPANDED_FILES: usize = 10_000;
+pub(crate) const MAX_EXPANDED_FILES: usize = 10_000;
 /// 这些是系统或编辑器生成的杂项，上传到服务器没有意义。
 const IGNORED_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", ".localized"];
+
+/// 远端文件夹展开（下载）沿用同一份忽略列表，两个方向对「杂项文件」的判断保持一致。
+pub(crate) fn is_ignored_name(name: &str) -> bool {
+    IGNORED_NAMES.contains(&name)
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LocalEntry {
@@ -24,11 +29,14 @@ pub struct ExpandedPaths {
     pub entries: Vec<LocalEntry>,
     /// 超过上限被截断时为 true，界面需要提醒用户。
     pub truncated: bool,
+    /// 无权限等原因读不了的子目录。不能静默跳过：用户会以为整个文件夹都传完了。
+    pub unreadable_dirs: Vec<String>,
 }
 
 pub fn expand_local_paths(paths: &[String]) -> ExpandedPaths {
     let mut entries = Vec::new();
     let mut truncated = false;
+    let mut unreadable_dirs = Vec::new();
     for raw in paths {
         let path = PathBuf::from(raw);
         // symlink_metadata：不跟随符号链接，避免链接成环或把树外的内容带进来。
@@ -40,7 +48,7 @@ pub fn expand_local_paths(paths: &[String]) -> ExpandedPaths {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            walk(&path, &root_name, &mut entries, &mut truncated);
+            walk(&path, &root_name, &mut entries, &mut truncated, &mut unreadable_dirs);
         }
         if entries.len() >= MAX_EXPANDED_FILES {
             truncated = true;
@@ -48,13 +56,13 @@ pub fn expand_local_paths(paths: &[String]) -> ExpandedPaths {
         }
     }
     entries.truncate(MAX_EXPANDED_FILES);
-    ExpandedPaths { entries, truncated }
+    ExpandedPaths { entries, truncated, unreadable_dirs }
 }
 
 fn push_file(entries: &mut Vec<LocalEntry>, path: &Path, rel_dir: String, size: u64) {
     let ignored = path
         .file_name()
-        .is_some_and(|n| IGNORED_NAMES.contains(&n.to_string_lossy().as_ref()));
+        .is_some_and(|n| is_ignored_name(&n.to_string_lossy()));
     if !ignored {
         entries.push(LocalEntry {
             path: path.to_string_lossy().to_string(),
@@ -64,8 +72,21 @@ fn push_file(entries: &mut Vec<LocalEntry>, path: &Path, rel_dir: String, size: 
     }
 }
 
-fn walk(dir: &Path, rel_dir: &str, entries: &mut Vec<LocalEntry>, truncated: &mut bool) {
-    let Ok(read) = fs::read_dir(dir) else { return };
+fn walk(
+    dir: &Path,
+    rel_dir: &str,
+    entries: &mut Vec<LocalEntry>,
+    truncated: &mut bool,
+    unreadable_dirs: &mut Vec<String>,
+) {
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) => {
+            log::warn!("cannot read local dir {}: {e}", dir.display());
+            unreadable_dirs.push(dir.to_string_lossy().to_string());
+            return;
+        }
+    };
     // 排序让上传顺序稳定、可预期（与 Finder 中看到的顺序一致）。
     let mut children: Vec<_> = read.flatten().collect();
     children.sort_by_key(|e| e.file_name());
@@ -79,7 +100,7 @@ fn walk(dir: &Path, rel_dir: &str, entries: &mut Vec<LocalEntry>, truncated: &mu
         if meta.is_file() {
             push_file(entries, &child.path(), rel_dir.to_string(), meta.len());
         } else if meta.is_dir() {
-            walk(&child.path(), &format!("{rel_dir}/{name}"), entries, truncated);
+            walk(&child.path(), &format!("{rel_dir}/{name}"), entries, truncated, unreadable_dirs);
         }
     }
 }
@@ -117,6 +138,7 @@ mod tests {
             ]
         );
         assert!(!result.truncated);
+        assert!(result.unreadable_dirs.is_empty());
         fs::remove_dir_all(&root).ok();
     }
 }

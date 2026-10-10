@@ -16,11 +16,11 @@ import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseR
 import { describeError, fileNameOf, formatBytes } from "./app/format";
 import { clearCheckpointFor, loadHistory, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
 import { showPage } from "./app/nav";
-import { isQueueSelection, openPathMenu, pickLocalFolders, pickLocalPaths, setSelectedDownloads, setupDragDrop, toggleBookmark, updateDropZoneState, updateResolvedPathHint } from "./app/paths";
+import { isQueueSelection, openPathMenu, pickLocalFolders, pickLocalPaths, setupDragDrop, toggleBookmark, updateDropZoneState, updateResolvedPathHint } from "./app/paths";
 import { clearProbeResult, invalidateProbeOnEdit, runBackgroundProbe, updateTransferStatePanel } from "./app/probe";
 import { refreshLiveVisuals, setBadge, setProgressState, setStatus, showReconnectingSpeedText, showTransferStatus, syncMapLegend, updateProgressDetail } from "./app/progress";
 import { startQueueFlow } from "./app/queue";
-import { applyRemoteBrowseSelection, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
+import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
 import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, startNewServer } from "./app/servers";
 import { applyThemePreference, initLanguagePreference, initThemePreference } from "./app/settings";
 import { state } from "./app/state";
@@ -224,9 +224,7 @@ remoteBrowseSelectDirBtn.addEventListener("click", () => {
     const picked = [...remoteBrowseList.querySelectorAll<HTMLElement>(".remote-browse-item.selected")]
       .map((row) => row.dataset.path ?? "")
       .filter((path) => remoteBrowsePicked.has(path));
-    if (picked.length === 0) return;
-    setSelectedDownloads(picked);
-    closeRemoteBrowseOverlay();
+    void applyRemoteDownloadPicks(picked);
     return;
   }
   const path = state.remoteBrowseCurrent?.path ?? remoteBrowsePath.value.trim();

@@ -30,8 +30,8 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 ## Features
 
 **Transfer**
-- Upload and download files one at a time or in **batches** — drag in several files or a **whole folder** (structure kept), or multi-select remote files to download
-- **Preflight**: refuses early if the server is out of space; skips files that are already identical (SHA-256)
+- Upload and download files one at a time or in **batches** — drag in several files or a **whole folder**, or multi-select remote files and folders to download (folder structure is kept both ways)
+- **Preflight**: refuses early if the destination disk (server or local) is out of space; skips files that are already identical (SHA-256) in either direction
 - Block-level resume with integrity check at the resume boundary
 - Two modes: *Reliable* (read back every block) and *Fast* (verify once at the end)
 - A live **block map** shows what was resumed, what's verified, where the connection dropped

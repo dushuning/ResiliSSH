@@ -24,6 +24,8 @@ log = "0.4"
 dirs = "6"
 keyring = { version = "3", features = ["apple-native"] }
 tauri-plugin-log = "2"
+# 查询本地磁盘剩余空间（statvfs）。已是 ssh2 的间接依赖，显式声明不引入新代码。
+libc = "0.2"
 
 [profile.release]
 panic = "abort"

@@ -10,7 +10,7 @@ import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, 
 import { describeError, formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
 import { isQueueSelection, updateResolvedPathHint } from "./paths";
-import { clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showProbeResult, updateTransferStatePanel } from "./probe";
+import { clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
 import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showProgressSpeed, showReconnectingSpeedText, showTransferStatus, showVerifySummary, showWaitingSpeedText, startProgressWatchdog, stopProgressWatchdog, updateProgress, updateProgressDetail } from "./progress";
 import { updateRemoteBrowseModeUi } from "./remoteBrowse";
 import { state } from "./state";
@@ -224,13 +224,25 @@ export async function invokeStartDownload(forceOverwrite: boolean) {
 
 export async function startDownloadFlow() {
   await prepareConnection();
-  await startOneDownload();
+  const outcome = await startOneDownload();
+  if (outcome === "identical") await finishIdenticalTransfer("download");
 }
 
 
 /** 预检、确认、启动一个下载；与 startOneUpload 对称，批量下载逐个调用它。 */
 export async function startOneDownload(): Promise<UploadStart> {
   const probe = await probeRemoteDownload();
+  // 本地磁盘不够时直接拦下，理由与上传相同。
+  if (probe.action === "insufficient_space") {
+    showDownloadProbeResult(probe);
+    throw new Error(probe.message);
+  }
+  if (probe.action === "identical" && !forceOverwriteInput.checked) {
+    showDownloadProbeResult(probe);
+    state.runRemotePath = probe.resolved_remote_path;
+    state.runPostCommandTemplate = postCommandInput.value.trim();
+    return "identical";
+  }
   const confirmed = await confirmDownloadAction(probe);
   if (!confirmed) return "declined";
 
@@ -274,25 +286,27 @@ export async function invokeStartUpload(forceOverwrite: boolean) {
 export async function startUploadFlow() {
   await prepareConnection();
   const outcome = await startOneUpload();
-  if (outcome === "identical") await finishIdenticalUpload();
+  if (outcome === "identical") await finishIdenticalTransfer("upload");
 }
 
 
 /**
- * 远端已有完全相同的文件：不传输，直接按「已送达」收尾。
- * 传完后命令照常执行——文件确实已在服务器上且校验一致，部署流程不应因为「没变化」而中断。
+ * 目标端已有完全相同的文件：不传输，直接按「已送达」收尾。
+ * 传完后命令照常执行——文件确实已就位且校验一致，部署流程不应因为「没变化」而中断。
  */
-export async function finishIdenticalUpload() {
-  state.runDirection = "upload";
+export async function finishIdenticalTransfer(direction: TransferDirection) {
+  const download = direction === "download";
+  state.runDirection = direction;
   beginRunVisuals();
   showTransferView("run");
-  const size = state.lastProbe?.local_size ?? 0;
+  const probe = state.lastProbe;
+  const size = probe ? (download ? probe.remote_size : probe.local_size) : 0;
   blockMap.update(size, size);
   blockMap.setPhase("completed");
   showVerifySummary(t("远端 SHA-256 与本地一致"));
   await finishSuccessfulRun(
-    t("远端已是最新"),
-    t("远端已有完全相同的文件，无需上传"),
+    download ? t("本地已是最新") : t("远端已是最新"),
+    download ? t("本地已有完全相同的文件，无需下载") : t("远端已有完全相同的文件，无需上传"),
     { elapsedMs: 0, movedBytes: 0, retries: 0 },
     [state.runRemotePath],
   );

@@ -6,12 +6,12 @@ import { connectionPayload, ensureCredentialsLoaded, prepareConnection, validate
 import { CONFIRM_ANIM_MS } from "./constants";
 import { browseRemoteBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseHint, remoteBrowseList, remoteBrowseNewDirName, remoteBrowseNewDirRow, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseStatus, remoteBrowseTitle, remoteBrowseUpBtn, remotePathInput } from "./dom";
 import { describeError, formatBytes } from "./format";
-import { updateResolvedPathHint } from "./paths";
+import { reportExpansionWarnings, setSelectedDownloads, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
 import { setStatus } from "./progress";
 import { state } from "./state";
 import { isDownloadMode } from "./transfer";
-import { RemoteDirEntry, RemoteDirListing } from "./types";
+import { ExpandedPaths, RemoteDirEntry, RemoteDirListing } from "./types";
 
 export function updateRemoteBrowseModeUi() {
   const download = isDownloadMode();
@@ -19,7 +19,7 @@ export function updateRemoteBrowseModeUi() {
   remoteBrowseSelectDirBtn.classList.toggle("hidden", download);
   remoteBrowseSelectDirBtn.textContent = t("选择此目录");
   remoteBrowseHint.textContent = download
-    ? t("双击文件夹进入；单击文件可多选，双击文件只选这一个")
+    ? t("双击文件夹进入；单击文件或文件夹可多选（文件夹会连同子目录一起下载），双击文件只选这一个")
     : t("双击文件夹进入；双击文件选中");
 }
 
@@ -65,15 +65,57 @@ export function setRemoteBrowseStatus(message: string, kind: "normal" | "error" 
 }
 
 
-/** 下载模式下在当前目录勾选的远端文件；切换目录时清空，避免把不同目录的同名文件下到同一处互相覆盖。 */
-export const remoteBrowsePicked = new Set<string>();
+/**
+ * 下载模式下在当前目录勾选的远端条目（路径 → 是否文件夹）；切换目录时清空，
+ * 避免把不同目录的同名文件下到同一处互相覆盖。
+ */
+export const remoteBrowsePicked = new Map<string, boolean>();
 
 
 export function updateRemoteBrowsePickButton() {
   if (!isDownloadMode()) return;
   const count = remoteBrowsePicked.size;
+  const hasDir = [...remoteBrowsePicked.values()].some(Boolean);
   remoteBrowseSelectDirBtn.classList.toggle("hidden", count === 0);
-  remoteBrowseSelectDirBtn.textContent = t("选择 {count} 个文件", { count });
+  remoteBrowseSelectDirBtn.textContent = hasDir
+    ? t("选择 {count} 项", { count })
+    : t("选择 {count} 个文件", { count });
+}
+
+
+/**
+ * 确认下载选择。含文件夹时先让后端在服务器上递归展开：文件夹本身不能直接下载，
+ * 队列需要的是逐个文件及其相对目录，才能在本地还原同样的结构。
+ */
+export async function applyRemoteDownloadPicks(picked: string[]) {
+  if (picked.length === 0) return;
+  if (!picked.some((path) => remoteBrowsePicked.get(path))) {
+    setSelectedDownloads(picked);
+    closeRemoteBrowseOverlay();
+    return;
+  }
+  remoteBrowseSelectDirBtn.disabled = true;
+  setRemoteBrowseStatus(t("正在列出文件夹内容…"));
+  try {
+    await prepareConnection();
+    const expanded = await invoke<ExpandedPaths>("expand_remote_paths", {
+      request: { ...connectionPayload(), paths: picked },
+    });
+    if (expanded.entries.length === 0) {
+      setRemoteBrowseStatus(t("所选文件夹里没有可下载的文件"), "error");
+      return;
+    }
+    setSelectedDownloads(
+      expanded.entries.map((e) => e.path),
+      expanded.entries,
+    );
+    closeRemoteBrowseOverlay();
+    reportExpansionWarnings(expanded);
+  } catch (error) {
+    setRemoteBrowseStatus(describeError(error), "error");
+  } finally {
+    remoteBrowseSelectDirBtn.disabled = false;
+  }
 }
 
 
@@ -115,10 +157,10 @@ export function renderRemoteBrowseListing(listing: RemoteDirListing) {
 
     row.append(icon, name, meta);
     row.addEventListener("click", () => {
-      // 下载模式：单击文件切换多选，双击仍是「只要这一个」的快捷方式。
-      if (!entry.is_dir && isDownloadMode()) {
+      // 下载模式：单击文件或文件夹切换多选；双击文件夹仍是进入，双击文件是「只要这一个」。
+      if (isDownloadMode()) {
         if (remoteBrowsePicked.has(entry.path)) remoteBrowsePicked.delete(entry.path);
-        else remoteBrowsePicked.add(entry.path);
+        else remoteBrowsePicked.set(entry.path, entry.is_dir);
         row.classList.toggle("selected", remoteBrowsePicked.has(entry.path));
         updateRemoteBrowsePickButton();
         return;

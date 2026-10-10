@@ -80,6 +80,28 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// 本地目标文件所在文件系统的可用字节数（普通用户可用的部分），用于下载前预检。
+/// 目标及其上级目录可能还不存在（下载会自动创建），所以对最近一个已存在的上级目录查询。
+pub fn local_free_bytes(local_file: &Path) -> Option<u64> {
+    let dir = local_file
+        .ancestors()
+        .skip(1)
+        .take(MAX_ANCESTOR_LOOKUP)
+        .find(|p| p.is_dir())?;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: c_path 是以 NUL 结尾的有效路径，vfs 指向足够大的未初始化缓冲区；
+    // 只有返回 0（成功）时才读取它，此时内核已完整填写该结构体。
+    let vfs = unsafe {
+        if libc::statvfs(c_path.as_ptr(), vfs.as_mut_ptr()) != 0 {
+            return None;
+        }
+        vfs.assume_init()
+    };
+    #[allow(clippy::unnecessary_cast)] // 字段宽度因平台而异（macOS 上 f_bavail 是 u32）。
+    available_bytes(vfs.f_frsize as u64, vfs.f_bsize as u64, vfs.f_bavail as u64)
+}
+
 /// 在服务器上直接算 SHA-256：只回传 64 个字符，不必把整个文件读回本地，弱网下也很快。
 /// Linux 一般有 sha256sum，macOS/BSD 是 shasum -a 256；都没有或无执行权限时返回 None。
 pub fn remote_sha256(session: &Session, remote_path: &str) -> Option<String> {
@@ -167,6 +189,12 @@ mod tests {
         let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on\nmy disk 100 40 60 40% /Volumes/my disk\n";
         assert_eq!(parse_df_available_kb(spaced), Some(60));
         assert_eq!(parse_df_available_kb("df: /nope: No such file or directory"), None);
+    }
+
+    #[test]
+    fn local_free_space_found_for_missing_subdirectory() {
+        let missing = std::env::temp_dir().join("resiliss-no-such-dir/a/b/file.bin");
+        assert!(local_free_bytes(&missing).is_some_and(|free| free > 0));
     }
 
     #[test]
