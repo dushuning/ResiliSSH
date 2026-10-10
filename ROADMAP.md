@@ -10,7 +10,7 @@
 ### v1.0.0 — 2026-07
 Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-256 verification, saved connections, history, dark mode.
 
-### Unreleased (next: v1.1.0)
+### v1.1.0 — 2026-10
 - **Security:** host key verification with fingerprint confirmation; passwords in the macOS Keychain
 - **Reliability:** unlimited reconnect for network errors only; non-blocking UI; connect timeout; keepalive during hashing; verify-only resume; diagnostic log file
 - **Interface:** sidebar layout, block map, activity log, history with resumable transfers

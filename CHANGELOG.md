@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-10
+
 ### Added
 - Host key verification: unknown servers require fingerprint confirmation; changed keys are refused. Trusted keys are stored in the app's own `known_hosts`; `~/.ssh/known_hosts` is read, never modified.
 - Passwords and key passphrases are stored in the macOS Keychain (existing plaintext entries in `profiles.json` are migrated automatically) and read only when needed.
@@ -66,4 +68,6 @@
 - macOS（Apple Silicon / Intel）
 - 构建：`npm run app` → `ResiliSSH.app` / `.dmg`
 
+[Unreleased]: https://github.com/dushuning/ResiliSSH/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/dushuning/ResiliSSH/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dushuning/ResiliSSH/releases/tag/v1.0.0
