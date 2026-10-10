@@ -34,6 +34,7 @@ interface ConnectionProfile {
   created_at: number;
   bookmarks: string[];
   post_commands: string[];
+  remember_secrets: boolean;
 }
 
 interface CommandOutcome {
@@ -220,6 +221,8 @@ const profileNameInput = document.querySelector<HTMLInputElement>("#profileName"
 const connectionSummary = document.querySelector<HTMLSpanElement>("#connectionSummary")!;
 const connectionStatus = document.querySelector<HTMLDivElement>("#connectionStatus")!;
 const authHint = document.querySelector<HTMLParagraphElement>("#authHint")!;
+const rememberSecretsInput = document.querySelector<HTMLInputElement>("#rememberSecrets")!;
+const rememberRow = document.querySelector<HTMLLabelElement>("#rememberRow")!;
 const saveProfileBtn = document.querySelector<HTMLButtonElement>("#saveProfileBtn")!;
 const deleteProfileBtn = document.querySelector<HTMLButtonElement>("#deleteProfileBtn")!;
 const hostSelect = document.querySelector<HTMLSelectElement>("#hostSelect")!;
@@ -448,6 +451,7 @@ const TRANSFER_LOCK_SELECTORS = [
   'input[name="transferMode"]',
   "#newServerBtn",
   ".server-item",
+  "#rememberSecrets",
   "#bookmarkBtn",
   "#pathMenuBtn",
   "#postCommand",
@@ -678,7 +682,7 @@ function getConnectionReadiness(): ConnectionReadiness {
   const missingKey = !needsPassword && !keyPathInput.value.trim();
 
   // 已保存的服务器密码在钥匙串里、连接时才读取，此时输入框为空不代表缺密码。
-  if (missingPassword && !profileSelected) issues.push(t("缺密码"));
+  if (missingPassword && !profileRemembersSecrets()) issues.push(t("缺密码"));
   if (missingKey) issues.push(t("缺私钥"));
   if (!profileSelected && (missingPassword || missingKey)) {
     issues.unshift(t("未选连接"));
@@ -716,10 +720,31 @@ function updateConnectionSummary() {
   updateBookmarkButton();
 }
 
+/** 「记住密码」只在需要输入秘密（密码登录或填了私钥口令）时显示，私钥免口令时不打扰用户。 */
 function updateAuthHintVisibility() {
-  // 钥匙串说明只在需要填密码/口令时有意义；私钥免口令时不打扰用户。
   const needsSecret = authTypeSelect.value === "password" || Boolean(keyPassphraseInput.value);
+  rememberRow.classList.toggle("hidden", !needsSecret);
   authHint.classList.toggle("hidden", !needsSecret);
+  authHint.textContent = rememberSecretsInput.checked
+    ? t("密码与私钥口令保存在 macOS 钥匙串中，不会写入配置文件")
+    : t("不保存密码：只在本次运行中使用，下次选择该服务器时需要重新输入");
+}
+
+/**
+ * 不记住密码的服务器，本次运行中输入过的密码/口令暂存在内存里：切到别的服务器再切回来不必重输，
+ * 退出应用即丢失，正是「仅本次使用」的含义。
+ */
+const sessionSecrets = new Map<string, { password: string; passphrase: string }>();
+
+function rememberForSession() {
+  const id = profileSelect.value;
+  if (!id || profileRemembersSecrets()) return;
+  sessionSecrets.set(id, { password: passwordInput.value, passphrase: keyPassphraseInput.value });
+}
+
+/** 选中的已保存服务器是否把密码存在钥匙串里；未保存的连接视为否。 */
+function profileRemembersSecrets(): boolean {
+  return currentProfile()?.remember_secrets ?? false;
 }
 
 function validateConnectionBeforeTransfer(): void {
@@ -2539,6 +2564,23 @@ async function applyProfile(profile: ConnectionProfile) {
   updateConnectionSummary();
 
   restorePostCommand();
+  rememberSecretsInput.checked = profile.remember_secrets;
+  updateAuthHintVisibility();
+  if (!profile.remember_secrets) {
+    const cached = sessionSecrets.get(profile.id);
+    if (cached) {
+      passwordInput.value = cached.password;
+      keyPassphraseInput.value = cached.passphrase;
+      updateConnectionSummary();
+      setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "ok");
+      return;
+    }
+    setConnectionStatus(
+      t("「{name}」设置为不保存密码，请输入密码后连接", { name: profile.name }),
+      "normal",
+    );
+    return;
+  }
   // 用户主动选择服务器时才读钥匙串：此时弹出系统授权框是可预期的。
   const secrets = await loadProfileSecrets(profile.id);
   if (profileSelect.value !== profile.id) return; // 读取期间用户已切到别的服务器
@@ -2573,7 +2615,8 @@ async function loadProfileSecrets(id: string): Promise<ProfileSecrets> {
  */
 async function ensureCredentialsLoaded() {
   const id = profileSelect.value;
-  if (!id) return;
+  // 设置为不记住密码的服务器，钥匙串里本来就没有，读取只会白白触发授权弹窗。
+  if (!id || !profileRemembersSecrets()) return;
   const needsPassword = authTypeSelect.value === "password" && !passwordInput.value;
   const needsPassphrase = authTypeSelect.value === "key" && !keyPassphraseInput.value;
   if (!needsPassword && !needsPassphrase) return;
@@ -2666,6 +2709,7 @@ function startNewServer() {
   usernameInput.value = "";
   passwordInput.value = "";
   keyPassphraseInput.value = "";
+  rememberSecretsInput.checked = true;
   setConnectionStatus("");
   updateAuthFields();
   updateConnectionSummary();
@@ -2808,6 +2852,7 @@ function setupDragDrop() {
 }
 
 authTypeSelect.addEventListener("change", updateAuthFields);
+rememberSecretsInput.addEventListener("change", updateAuthHintVisibility);
 
 profileSelect.addEventListener("change", async () => {
   const id = profileSelect.value;
@@ -2838,13 +2883,16 @@ saveProfileBtn.addEventListener("click", async () => {
         key_path: keyPathInput.value.trim() || null,
         password: passwordInput.value || null,
         key_passphrase: keyPassphraseInput.value || null,
+        remember_secrets: rememberSecretsInput.checked,
       },
     });
     await loadProfiles();
     profileSelect.value = saved.id;
     profileNameInput.value = saved.name;
-    const stored =
-      authTypeSelect.value === "password" && passwordInput.value
+    rememberForSession();
+    const stored = !rememberSecretsInput.checked
+      ? t("，密码不保存（仅本次使用）")
+      : authTypeSelect.value === "password" && passwordInput.value
         ? t("，密码已保存")
         : keyPassphraseInput.value
           ? t("，私钥口令已保存")
@@ -2893,6 +2941,7 @@ hostSelect.addEventListener("change", () => {
 
 [passwordInput, keyPathInput, keyPassphraseInput].forEach((input) => {
   input.addEventListener("input", () => {
+    rememberForSession();
     updateConnectionSummary();
     updateAuthHintVisibility();
   });

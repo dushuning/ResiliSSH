@@ -258,7 +258,11 @@ export function appTemplate(appName: string): string {
                 <input id="password" type="password" />
               </div>
             </div>
-            <p class="hint" id="authHint">${t("密码与私钥口令保存在 macOS 钥匙串中，不会写入配置文件")}</p>
+            <label class="checkbox remember-row" id="rememberRow">
+              <input type="checkbox" id="rememberSecrets" checked />
+              <span>${t("在钥匙串中记住密码与口令")}</span>
+            </label>
+            <p class="hint" id="authHint"></p>
             <div class="connection-status" id="connectionStatus"></div>
             <div class="editor-actions">
               <button class="btn btn-danger-text" id="deleteProfileBtn" type="button">${t("删除")}</button>

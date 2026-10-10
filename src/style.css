@@ -1448,7 +1448,8 @@ input[type="radio"] {
   color: var(--text-tertiary);
 }
 
-.server-editor .hint {
+.server-editor .hint,
+.remember-row {
   padding-left: 90px;
 }
 

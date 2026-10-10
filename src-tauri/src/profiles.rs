@@ -27,6 +27,14 @@ pub struct ConnectionProfile {
     /// 常用的「传完后执行」命令，如重启服务；按服务器保存，因为命令依赖目标机环境。
     #[serde(default)]
     pub post_commands: Vec<String>,
+    /// 是否把密码/口令存进钥匙串。关闭时只在本次运行中使用用户输入的值，
+    /// 下次选中该服务器不访问钥匙串，直接要求重新输入。旧配置默认视为开启（与之前行为一致）。
+    #[serde(default = "default_true")]
+    pub remember_secrets: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +142,8 @@ pub struct SaveProfileRequest {
     pub key_path: Option<String>,
     pub password: Option<String>,
     pub key_passphrase: Option<String>,
+    #[serde(default = "default_true")]
+    pub remember_secrets: bool,
 }
 
 fn expand_key_path(path: &str) -> String {
@@ -195,21 +205,22 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         .map(|p| p.id.clone())
         .unwrap_or_else(new_id);
 
+    let remember = request.remember_secrets;
     // 表单留空表示「沿用已保存的值」，所以回退到该连接现有的钥匙串条目。
-    let password = non_empty(request.password).or_else(|| {
+    // 不记住密码时不去读钥匙串：用户既然选择不保存，就不该再触发授权弹窗。
+    let fallback = |kind: SecretKind| {
         existing
             .as_ref()
-            .and_then(|p| load_secret(&p.id, SecretKind::Password))
-            .filter(|p| !p.is_empty())
-    });
-    let key_passphrase = non_empty(request.key_passphrase).or_else(|| {
-        existing
-            .as_ref()
-            .and_then(|p| load_secret(&p.id, SecretKind::KeyPassphrase))
-            .filter(|p| !p.is_empty())
-    });
+            .filter(|p| remember && p.remember_secrets)
+            .and_then(|p| load_secret(&p.id, kind))
+            .filter(|v| !v.is_empty())
+    };
+    let password = non_empty(request.password).or_else(|| fallback(SecretKind::Password));
+    let key_passphrase =
+        non_empty(request.key_passphrase).or_else(|| fallback(SecretKind::KeyPassphrase));
 
-    if matches!(auth_kind, AuthKind::Password) && password.is_none() {
+    // 只有要记住密码时才要求必须填写；不记住时允许先保存服务器，连接时再输入。
+    if remember && matches!(auth_kind, AuthKind::Password) && password.is_none() {
         return Err(crate::tr!(
             "密码登录保存时请填写密码",
             "Please enter a password to save a password-login connection"
@@ -230,8 +241,10 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
     });
 
     // 先写钥匙串再写 JSON：钥匙串失败时整个保存失败，绝不退回明文落盘。
-    persist_secret(&profile_id, SecretKind::Password, password.as_deref())?;
-    persist_secret(&profile_id, SecretKind::KeyPassphrase, key_passphrase.as_deref())?;
+    // 不记住时传 None，persist_secret 会删除之前存过的条目，避免「取消勾选」后旧密码仍留在钥匙串里。
+    let stored = |value: &Option<String>| if remember { value.clone() } else { None };
+    persist_secret(&profile_id, SecretKind::Password, stored(&password).as_deref())?;
+    persist_secret(&profile_id, SecretKind::KeyPassphrase, stored(&key_passphrase).as_deref())?;
 
     let profile = ConnectionProfile {
         id: profile_id,
@@ -246,6 +259,7 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         created_at,
         bookmarks,
         post_commands,
+        remember_secrets: remember,
     };
 
     store.profiles.retain(|p| p.name != profile.name);
@@ -332,5 +346,7 @@ mod tests {
             "auth_kind":"password","key_path":null,"created_at":0}"#;
         let profile: ConnectionProfile = serde_json::from_str(json).unwrap();
         assert!(profile.bookmarks.is_empty() && profile.post_commands.is_empty());
+        // 旧配置里存过密码的用户不应在升级后突然失去「记住密码」。
+        assert!(profile.remember_secrets);
     }
 }
