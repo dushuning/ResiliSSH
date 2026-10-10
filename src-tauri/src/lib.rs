@@ -4,6 +4,7 @@ mod download_checkpoint;
 mod history;
 mod i18n;
 mod local_files;
+mod power;
 #[cfg(test)]
 mod e2e_tests;
 mod profiles;
@@ -1592,6 +1593,8 @@ fn start_upload(
         );
 
         let strict_chunk_verify_summary = strict_chunk_verify.clone();
+        // 持有到本线程结束：包括断线后的无限重连等待，期间同样不该让电脑睡过去。
+        let _sleep_guard = power::SleepGuard::acquire("upload");
         let result = upload_with_resume(
             config,
             PathBuf::from(&local_path_string).as_path(),
@@ -2158,6 +2161,7 @@ fn start_download(
         );
 
         let strict_chunk_verify_summary = strict_chunk_verify.clone();
+        let _sleep_guard = power::SleepGuard::acquire("download");
         let result = download_with_resume(
             config,
             &remote_path,

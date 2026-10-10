@@ -50,6 +50,7 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 - Bookmarked and recent remote folders per server
 - History with one-click reuse; unfinished transfers listed with a *Resume* button, and offered again on launch
 - **Activity log**: every connect, auth, reconnect, permission error and verification step, filterable and copyable
+- Keeps the Mac from idle-sleeping while a transfer runs (closing the lid still sleeps)
 - macOS notifications, light/dark theme, English and Chinese UI
 
 <table>
