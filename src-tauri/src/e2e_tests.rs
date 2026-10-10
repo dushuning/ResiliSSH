@@ -99,6 +99,7 @@ fn upload_checkpoint(local: &Path, remote: &str, env: &Env, size: u64) -> Upload
         auth_kind: AuthKind::PrivateKey,
         file_size: size,
         status: CheckpointStatus::InProgress,
+        staged: true,
         ..Default::default()
     }
 }
@@ -439,4 +440,79 @@ fn e2e_jump_tunnel_releases_resources_after_disconnect() {
     std::thread::sleep(SETTLE);
     let after = open_fds();
     assert!(after <= before + TOLERANCE, "fds grew from {before} to {after} after {CYCLES} jump connections");
+}
+
+/// 部署场景的关键保证：上传中途（含被取消、断线）目标路径上始终是完整的旧文件，
+/// 只有校验通过后才一步换成新文件，并沿用旧文件的权限。
+#[test]
+fn e2e_staged_upload_never_exposes_partial_file() {
+    use std::os::unix::fs::PermissionsExt;
+    const EXECUTABLE: u32 = 0o755;
+    let _guard = serial();
+    let Some(env) = env("staged") else { return };
+    let local = env.work.join("local/run.sh");
+    std::fs::write(&local, sample_bytes(FILE_SIZE, 51)).unwrap();
+    let remote = env.work.join("remote/run.sh");
+    let old = sample_bytes(2 * MB as usize, 52);
+    std::fs::write(&remote, &old).unwrap();
+    std::fs::set_permissions(&remote, std::fs::Permissions::from_mode(EXECUTABLE)).unwrap();
+    let remote_str = remote.to_string_lossy().to_string();
+    let part = PathBuf::from(crate::sftp::staging_path(&remote_str));
+    let cp = Arc::new(Mutex::new(upload_checkpoint(&local, &remote_str, &env, FILE_SIZE as u64)));
+
+    let (first, _) = upload(&env, &local, &remote_str, true, &cp, Some(CANCEL_AT));
+    assert!(matches!(first, Err(UploadError::Cancelled)), "first run should be cancelled");
+    assert_eq!(std::fs::read(&remote).unwrap(), old, "target must still be the old file mid-upload");
+    assert!(part.exists(), "progress must live in the staging file");
+
+    let (second, resumed_from) = upload(&env, &local, &remote_str, true, &cp, None);
+    second.expect("resumed staged upload should succeed");
+    assert!(resumed_from > 0, "second run must resume from the staging file");
+    assert_same_file(&local, &remote);
+    assert!(!part.exists(), "staging file must be gone after the replace");
+    let mode = std::fs::metadata(&remote).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, EXECUTABLE, "replaced file must keep the old file's permissions");
+}
+
+/// 弱网下「改名成功但回复丢失」后会重试替换：第二次必须识别为已完成，而不是报错或重传；
+/// 临时文件被外部删掉、目标又不完整时，必须作为永久错误停止，而不是无限重试。
+#[test]
+fn e2e_promote_is_idempotent() {
+    let _guard = serial();
+    let Some(env) = env("promote") else { return };
+    let remote = env.work.join("remote/app.tar");
+    let remote_str = remote.to_string_lossy().to_string();
+    let part = crate::sftp::staging_path(&remote_str);
+    let data = sample_bytes(MB as usize, 61);
+    std::fs::write(&part, &data).unwrap();
+    let (session, _) = crate::sftp::connect_session(&env.config).expect("connect");
+    let size = data.len() as u64;
+    crate::sftp::promote_staged_file(&session, &part, &remote_str, size).expect("first promote");
+    crate::sftp::promote_staged_file(&session, &part, &remote_str, size).expect("repeat promote is a no-op");
+    assert_eq!(std::fs::read(&remote).unwrap(), data);
+    let missing = crate::sftp::promote_staged_file(&session, &part, &remote_str, size + 1);
+    assert!(matches!(missing, Err(UploadError::InvalidRemotePath(_))), "{missing:?}");
+}
+
+/// 升级前留下的断点（没有 staged 标记）数据就在目标文件里，必须按原方式续传完。
+#[test]
+fn e2e_legacy_checkpoint_resumes_in_place() {
+    let _guard = serial();
+    let Some(env) = env("legacy") else { return };
+    let local = env.work.join("local/old.bin");
+    std::fs::write(&local, sample_bytes(FILE_SIZE, 71)).unwrap();
+    let remote = env.work.join("remote/old.bin");
+    let remote_str = remote.to_string_lossy().to_string();
+    let mut legacy = upload_checkpoint(&local, &remote_str, &env, FILE_SIZE as u64);
+    legacy.staged = false;
+    let cp = Arc::new(Mutex::new(legacy));
+
+    let (first, _) = upload(&env, &local, &remote_str, true, &cp, Some(CANCEL_AT));
+    assert!(matches!(first, Err(UploadError::Cancelled)));
+    assert!(remote.exists(), "legacy uploads write the target directly");
+    assert!(!PathBuf::from(crate::sftp::staging_path(&remote_str)).exists());
+    let (second, resumed_from) = upload(&env, &local, &remote_str, true, &cp, None);
+    second.expect("legacy resume should succeed");
+    assert!(resumed_from > 0);
+    assert_same_file(&local, &remote);
 }

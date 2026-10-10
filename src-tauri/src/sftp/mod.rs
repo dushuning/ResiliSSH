@@ -26,7 +26,9 @@ pub use remote_command::{run_remote_command, CommandContext, CommandOutcome};
 pub use download::{
     download_with_resume, remote_file_name, resolve_local_path, DownloadCallbacks, DownloadError,
 };
+#[cfg(test)]
+pub(crate) use upload::promote_staged_file;
 pub use upload::{
     format_remote_sftp_error, remote_parent_status, resolve_remote_path, resolve_upload_target,
-    upload_with_resume, UploadCallbacks, UploadError,
+    staging_path, upload_with_resume, UploadCallbacks, UploadError,
 };

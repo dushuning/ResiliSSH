@@ -6,6 +6,7 @@ use super::transfer_common::{
     HASH_READ_BUFFER_SIZE, hex_encode,
 };
 use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
+use super::preflight::shell_quote;
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};
@@ -314,6 +315,100 @@ pub fn remote_parent_status(sftp: &Sftp, remote_file: &str) -> Option<String> {
 }
 
 
+/// 临时文件后缀。放在目标同目录（rename 在同一文件系统内才是原子的），并以点开头，
+/// 避免出现在常规的目录列表里被误当成正式文件。
+const STAGING_SUFFIX: &str = ".resiliss-part";
+/// 权限位（含 setuid/setgid/sticky），不含文件类型位。
+const PERMISSION_BITS: u32 = 0o7777;
+
+/// 目标文件对应的临时文件路径：`/opt/app/app.jar` → `/opt/app/.app.jar.resiliss-part`。
+pub fn staging_path(final_path: &str) -> String {
+    match final_path.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
+        None => format!(".{final_path}{STAGING_SUFFIX}"),
+    }
+}
+
+/// 临时文件已不在、目标已是完整大小：说明上次的改名其实成功了，只是回复在断线中丢失。
+fn already_promoted(sftp: &Sftp, final_path: &str, size: u64) -> bool {
+    sftp.stat(Path::new(final_path)).ok().and_then(|st| st.size) == Some(size)
+}
+
+/// 校验通过后把临时文件换成正式文件。可重复调用：弱网下改名的回复可能丢失，重连后再调一次
+/// 必须能识别「其实已经换好了」，绝不能因此误判而从头重传或删掉新文件。
+pub(crate) fn promote_staged_file(
+    session: &Session,
+    part: &str,
+    final_path: &str,
+    size: u64,
+) -> Result<(), UploadError> {
+    let sftp = session.sftp().map_err(|e| UploadError::Sftp(e.to_string()))?;
+    match sftp.stat(Path::new(part)) {
+        Ok(_) => {}
+        Err(e) if is_sftp_not_found(&e) => {
+            if already_promoted(&sftp, final_path, size) {
+                log::info!("staged file already promoted to {final_path}");
+                return Ok(());
+            }
+            // 归为永久错误：临时文件被外部删掉了，无限重试也找不回来。
+            return Err(UploadError::InvalidRemotePath(crate::tr!(
+                format!("校验通过的临时文件 {part} 不见了（可能被其他程序删除），请重新上传"),
+                format!("The verified temporary file {part} has disappeared (possibly deleted by another program); upload again")
+            )));
+        }
+        Err(e) => return Err(UploadError::Sftp(e.to_string())),
+    }
+
+    let existing = sftp.stat(Path::new(final_path)).ok();
+    // 覆盖已有文件时沿用它的权限（如脚本的可执行位），否则替换后会变成新建文件的默认权限。
+    if let Some(mode) = existing.as_ref().and_then(|st| st.perm).map(|perm| perm & PERMISSION_BITS) {
+        let attrs = FileStat { size: None, uid: None, gid: None, perm: Some(mode), atime: None, mtime: None };
+        if let Err(e) = sftp.setstat(Path::new(part), attrs) {
+            log::warn!("cannot copy permissions {mode:o} from {final_path} to staged file: {e}");
+        }
+    }
+    let rename = |sftp: &Sftp| {
+        sftp.rename(Path::new(part), Path::new(final_path), None)
+            .map_err(|e| UploadError::Sftp(format_remote_sftp_error(&e.to_string(), final_path)))
+    };
+    // 目标不存在时 SFTP 改名本身就是原子的。
+    if existing.is_none() {
+        return rename(&sftp);
+    }
+    // OpenSSH 的 SFTP 改名不会覆盖已有文件；在服务器上执行 mv（即 rename(2)）可原子替换，
+    // 读这个文件的进程要么看到旧版本、要么看到新版本，不会看到半截。
+    if replace_with_mv(session, part, final_path) {
+        return Ok(());
+    }
+    // mv 失败也可能是「其实已执行成功、只是结果没传回来」：此时再删目标就会删掉新文件。
+    match sftp.stat(Path::new(part)) {
+        Ok(_) => {}
+        Err(e) if is_sftp_not_found(&e) && already_promoted(&sftp, final_path, size) => return Ok(()),
+        Err(e) => return Err(UploadError::Sftp(e.to_string())),
+    }
+    // 只开放 SFTP、不能执行命令的服务器：先删后改名。中间极短时间目标不存在，但仍不会出现半截文件。
+    log::warn!("atomic replace unavailable, falling back to unlink + rename for {final_path}");
+    sftp.unlink(Path::new(final_path))
+        .map_err(|e| UploadError::Sftp(format_remote_sftp_error(&e.to_string(), final_path)))?;
+    rename(&sftp)
+}
+
+fn replace_with_mv(session: &Session, part: &str, final_path: &str) -> bool {
+    let command = format!("mv -f -- {} {}", shell_quote(part), shell_quote(final_path));
+    let Ok(mut channel) = session.channel_session() else { return false };
+    if channel.exec(&command).is_err() {
+        return false;
+    }
+    let mut output = String::new();
+    let _ = channel.read_to_string(&mut output);
+    let _ = channel.wait_close();
+    let ok = channel.exit_status().is_ok_and(|code| code == 0);
+    if !ok {
+        log::warn!("remote mv failed for {final_path}: {}", output.trim());
+    }
+    ok
+}
+
 pub fn upload_with_resume(
     config: ConnectionConfig,
     local_path: &Path,
@@ -336,6 +431,12 @@ pub fn upload_with_resume(
         cp.remote_path = resolved_remote_path.clone();
         cp.status = CheckpointStatus::InProgress;
     }
+
+    // 数据写到哪里：新传输写临时文件，校验通过后再替换目标；旧版断点继续直接写目标。
+    let staged = checkpoint.lock().map(|cp| cp.staged).unwrap_or(false);
+    let write_path = if staged { staging_path(&resolved_remote_path) } else { resolved_remote_path.clone() };
+    // 已校验通过、只差替换这一步。替换失败（多为断网）时只重试替换，不重传数据。
+    let mut verified_complete = false;
 
     let mut backoff_ms = INITIAL_BACKOFF_MS;
     let mut session: Option<Session> = None;
@@ -390,58 +491,52 @@ pub fn upload_with_resume(
         }
 
         let active_session = session.as_mut().unwrap();
-        let transfer_result = transfer_chunks(
-            active_session,
-            local_path,
-            &resolved_remote_path,
-            local_size,
-            &cancel_flag,
-            &force_overwrite,
-            &strict_chunk_verify,
-            &checkpoint,
-            &callbacks,
-        );
+        let transfer_result = if verified_complete {
+            promote_staged_file(active_session, &write_path, &resolved_remote_path, local_size).map(|()| true)
+        } else {
+            transfer_chunks(
+                active_session,
+                local_path,
+                &write_path,
+                local_size,
+                &cancel_flag,
+                &force_overwrite,
+                &strict_chunk_verify,
+                &checkpoint,
+                &callbacks,
+            )
+        };
 
         match transfer_result {
-            Ok(done) => {
-                if done {
-                    let retry_count = if should_skip_full_file_hash(
-                        &strict_chunk_verify,
-                        &checkpoint,
+            // 替换完成（只有 staged 上传会走到这里）。
+            Ok(true) if verified_complete => {
+                finish_upload(&checkpoint, &callbacks, local_size, current_retry_count(&checkpoint))?;
+                return Ok(());
+            }
+            Ok(true) => {
+                let retry_count = if should_skip_full_file_hash(&strict_chunk_verify, &checkpoint, local_size)? {
+                    log::info!("all {local_size} bytes chunk-verified, skip full-file SHA-256 read");
+                    current_retry_count(&checkpoint)
+                } else {
+                    (callbacks.on_progress)(local_size, local_size, "verifying", current_retry_count(&checkpoint));
+                    verify_upload_integrity(
+                        active_session,
+                        local_path,
+                        &write_path,
                         local_size,
-                    )? {
-                        log::info!(
-                            "all {local_size} bytes chunk-verified, skip full-file SHA-256 read"
-                        );
-                        current_retry_count(&checkpoint)
-                    } else {
-                        (callbacks.on_progress)(
-                            local_size,
-                            local_size,
-                            "verifying",
-                            current_retry_count(&checkpoint),
-                        );
-                        verify_upload_integrity(
-                            active_session,
-                            local_path,
-                            &resolved_remote_path,
-                            local_size,
-                            &cancel_flag,
-                            &checkpoint,
-                        )?
-                    };
-
-                    {
-                        let mut cp = checkpoint
-                            .lock()
-                            .map_err(|e| UploadError::Sftp(e.to_string()))?;
-                        cp.uploaded_bytes = local_size;
-                        cp.status = CheckpointStatus::Completed;
-                    }
-                    (callbacks.on_progress)(local_size, local_size, "completed", retry_count);
-                    log::info!("upload completed and verified, retries={retry_count}");
-                    return Ok(());
+                        &cancel_flag,
+                        &checkpoint,
+                    )?
+                };
+                if staged {
+                    verified_complete = true;
+                    log::info!("staged upload verified, replacing {resolved_remote_path}");
+                    continue;
                 }
+                finish_upload(&checkpoint, &callbacks, local_size, retry_count)?;
+                return Ok(());
+            }
+            Ok(false) => {
                 backoff_ms = INITIAL_BACKOFF_MS;
             }
             Err(UploadError::Cancelled) => {
@@ -495,6 +590,22 @@ pub fn upload_with_resume(
             }
         }
     }
+}
+
+fn finish_upload(
+    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
+    callbacks: &UploadCallbacks,
+    local_size: u64,
+    retry_count: u32,
+) -> Result<(), UploadError> {
+    {
+        let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
+        cp.uploaded_bytes = local_size;
+        cp.status = CheckpointStatus::Completed;
+    }
+    (callbacks.on_progress)(local_size, local_size, "completed", retry_count);
+    log::info!("upload completed and verified, retries={retry_count}");
+    Ok(())
 }
 
 fn verify_upload_integrity(

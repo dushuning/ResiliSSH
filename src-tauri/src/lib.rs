@@ -31,7 +31,7 @@ use sftp::{
     expand_remote_paths as expand_sftp_remote_paths, format_remote_sftp_error, inspect_host_key,
     list_remote_directory, local_free_bytes, local_sha256,
     open_handshake, remote_free_bytes, remote_sha256, remote_file_name, remote_parent_status,
-    resolve_local_path, resolve_remote_path, resolve_upload_target,
+    resolve_local_path, resolve_remote_path, resolve_upload_target, staging_path,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
     MAX_JUMP_HOPS,
     run_remote_command as run_sftp_remote_command, CommandContext, CommandOutcome, DownloadCallbacks,
@@ -823,6 +823,7 @@ fn upload_preflight(
     remote_path: &str,
     local_size: u64,
     remote_size: u64,
+    reusable_bytes: u64,
     verified_bytes: u64,
 ) -> Option<(&'static str, String)> {
     if files_identical(session, remote_path, local_path, local_size, remote_size, verified_bytes) {
@@ -845,7 +846,7 @@ fn upload_preflight(
 
     let free = remote_free_bytes(session, sftp, remote_path)?;
     let dir = remote_path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
-    let needed = bytes_needed(local_size, remote_size.max(verified_bytes));
+    let needed = bytes_needed(local_size, reusable_bytes.max(verified_bytes));
     if free < needed {
         let message = crate::tr!(
             format!(
@@ -980,15 +981,25 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
     let remote_exists = remote_size > 0;
 
     let checkpoint = load_checkpoint().ok().flatten();
-    let verified_bytes = checkpoint
-        .as_ref()
-        .filter(|cp| {
-            cp.local_path == request.local_path
-                && remote_paths_compatible(&cp.remote_path, &actual_remote_path, &request.remote_path)
-                && cp.host == request.host
-                && cp.port == request.port
-                && cp.username == request.username
-        })
+    let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
+        cp.local_path == request.local_path
+            && remote_paths_compatible(&cp.remote_path, &actual_remote_path, &request.remote_path)
+            && cp.host == request.host
+            && cp.port == request.port
+            && cp.username == request.username
+    });
+    // 新传输先写临时文件；只有旧版本留下的断点仍直接写在目标文件里（见 UploadCheckpoint::staged）。
+    let staged = matching_checkpoint.map_or(true, |cp| cp.staged);
+    // 已在远端、可续传或可就地复用的字节：staged 时在临时文件里，目标文件本身要等替换时才释放空间。
+    let reusable_bytes = if staged {
+        sftp.stat(std::path::Path::new(&staging_path(&actual_remote_path)))
+            .ok()
+            .and_then(|st| st.size)
+            .unwrap_or(0)
+    } else {
+        remote_size
+    };
+    let verified_bytes = matching_checkpoint
         .map(|cp| {
             if cp.verified_bytes > 0 {
                 cp.verified_bytes
@@ -1005,6 +1016,7 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
         &actual_remote_path,
         local_size,
         remote_size,
+        reusable_bytes,
         verified_bytes,
     );
 
@@ -1031,8 +1043,8 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
         (
             "full_reupload",
             crate::tr!(
-                "上次校验未通过，将删除远端文件并从头重传",
-                "Last verification failed; the remote file will be deleted and uploaded again from scratch"
+                "上次校验未通过，将从头重传；远端原文件在新文件校验通过前保持不变",
+                "Last verification failed; the file will be uploaded again from scratch, and the existing remote file stays untouched until the new one is verified"
             )
             .into(),
         )
@@ -1048,6 +1060,20 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
                 format!(
                     "Will resume from {} already verified",
                     activity::format_bytes(verified_bytes)
+                )
+            ),
+        )
+    } else if remote_exists && staged {
+        (
+            "overwrite",
+            crate::tr!(
+                format!(
+                    "远端已有文件（{}），传完并校验通过后才会替换，期间旧文件保持不变",
+                    activity::format_bytes(remote_size)
+                ),
+                format!(
+                    "Remote file already exists ({}); it is replaced only after the upload is verified, until then the old file stays untouched",
+                    activity::format_bytes(remote_size)
                 )
             ),
         )
@@ -1481,6 +1507,11 @@ fn start_upload(
         retry_count: initial_retry_count,
         failure_reason: None,
         status: CheckpointStatus::InProgress,
+        // 新传输一律先写临时文件；续传旧断点时沿用它原来的方式（见 UploadCheckpoint::staged）。
+        staged: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .map_or(true, |cp| cp.staged),
     }));
 
     save_checkpoint(&*checkpoint.lock().map_err(|e| e.to_string())?)?;

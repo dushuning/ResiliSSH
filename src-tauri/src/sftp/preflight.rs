@@ -76,7 +76,7 @@ fn parse_df_available_kb(output: &str) -> Option<u64> {
     fields.get(pct.checked_sub(1)?)?.parse().ok()
 }
 
-fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 

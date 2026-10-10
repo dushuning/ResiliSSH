@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- Safe replace for uploads: data goes to a hidden `.name.resiliss-part` file in the same folder and replaces the target only after verification (atomic `mv` when the server allows commands, otherwise delete + rename). A failed or interrupted upload never leaves a half-written file at the target path, and the replaced file keeps its permissions. Checkpoints from earlier versions still resume in place.
 - Jump hosts (like `ssh -J`): pick another saved server under “Via” to reach internal servers through a bastion. Multi-hop chains (up to 3), `ProxyJump` from `~/.ssh/config` on import, host keys confirmed hop by hop, and the usual unlimited reconnect/resume. A jump host that forbids forwarding is reported instead of retried forever.
 
 ## [1.1.0] - 2026-10-10

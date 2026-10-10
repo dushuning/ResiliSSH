@@ -33,6 +33,10 @@ pub struct UploadCheckpoint {
     #[serde(default)]
     pub failure_reason: Option<String>,
     pub status: CheckpointStatus,
+    /// 是否先写同目录的临时文件、校验通过后再替换目标。旧版本留下的断点没有这个字段（false），
+    /// 它们的半截数据就在目标文件里，必须按原方式续传完，否则已传进度会丢失。
+    #[serde(default)]
+    pub staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +64,7 @@ impl Default for UploadCheckpoint {
             retry_count: 0,
             failure_reason: None,
             status: CheckpointStatus::InProgress,
+            staged: false,
         }
     }
 }
