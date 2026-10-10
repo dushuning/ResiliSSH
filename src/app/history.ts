@@ -2,7 +2,7 @@
 import { t } from "../i18n";
 import { icons } from "../ui/icons";
 import { invoke } from "@tauri-apps/api/core";
-import { updateAuthFields, updateConnectionSummary } from "./connection";
+import { connectionPayload, prepareConnection, updateAuthFields, updateConnectionSummary } from "./connection";
 import { showConfirm } from "./dialogs";
 import { authTypeSelect, historyList, hostInput, keyPathInput, localPathInput, navHistoryBadge, pendingList, pendingSection, portInput, profileSelect, remotePathInput, statusText, transferBtn, usernameInput } from "./dom";
 import { fileNameOf, formatBytes, formatTime } from "./format";
@@ -184,20 +184,35 @@ export async function clearCheckpointFor(direction: TransferDirection) {
   const confirmed = await showConfirm(
     t("清除断点"),
     download
-      ? t("确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。")
-      : t("确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。"),
+      ? t("确定清除下载断点？\n\n下次下载将从头开始，已下载的部分（临时文件）会一并删除；本地原有的同名文件不受影响。")
+      : t("确定清除上传断点？\n\n下次上传将从头开始，服务器上已传的部分（临时文件）会一并删除；远端原有的同名文件不受影响。"),
   );
   if (!confirmed) return;
 
   if (download) {
     await invoke("clear_saved_download_checkpoint");
     state.activeDownloadCheckpoint = null;
-  } else {
-    await invoke("clear_saved_checkpoint");
-    state.activeUploadCheckpoint = null;
+    updateTransferStatePanel();
+    setStatus(t("断点记录已清除"));
+    return;
   }
+  // 删除服务器上的临时文件需要连接；连接不成（如没有密码）也照常清除断点，只是提示残留位置。
+  let connection = null;
+  try {
+    await prepareConnection();
+    connection = connectionPayload();
+  } catch (error) {
+    console.warn("clear checkpoint without connection", error);
+  }
+  const outcome = await invoke<{ leftover: string | null }>("clear_saved_checkpoint", { request: connection });
+  state.activeUploadCheckpoint = null;
   updateTransferStatePanel();
-  setStatus(t("断点记录已清除"));
+  setStatus(
+    outcome.leftover
+      ? t("断点记录已清除，但服务器上的临时文件 {path} 未能删除，可手动删除", { path: outcome.leftover })
+      : t("断点记录已清除"),
+    outcome.leftover ? "retry" : "normal",
+  );
 }
 
 

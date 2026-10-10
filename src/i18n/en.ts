@@ -161,8 +161,6 @@ export const en: Record<string, string> = {
   " · 重连 {retry_count} 次": " · reconnected {retry_count}×",
   "复用": "Reuse",
   "清除断点": "Clear checkpoint",
-  "确定清除下载断点记录？\n\n清除后下次下载将从头开始，本地已下载的部分不会自动删除。": "Clear the download checkpoint?\n\nThe next download will start over. Data already downloaded locally is not deleted.",
-  "确定清除断点记录？\n\n清除后下次上传将从头开始，已传到远端的数据不会自动删除。": "Clear the checkpoint?\n\nThe next upload will start over. Data already on the server is not deleted.",
   "断点记录已清除": "Checkpoint cleared",
   "已加载「{name}」，密码已自动填入": "Loaded “{name}”; password filled in",
   "已加载「{name}」，请填写密码后点保存": "Loaded “{name}”; enter the password and click Save",
@@ -419,4 +417,7 @@ export const en: Record<string, string> = {
   "替换本地文件": "Replace local file",
   "{message}\n\n本地已有同名文件，是否下载并替换它？": "{message}\n\nA file with this name already exists locally. Download and replace it?",
   "全部约 {eta}": "all done in about {eta}",
+  "确定清除下载断点？\n\n下次下载将从头开始，已下载的部分（临时文件）会一并删除；本地原有的同名文件不受影响。": "Clear the download checkpoint?\n\nThe next download starts from the beginning and the partly downloaded temporary file is deleted. An existing local file with the same name is not touched.",
+  "确定清除上传断点？\n\n下次上传将从头开始，服务器上已传的部分（临时文件）会一并删除；远端原有的同名文件不受影响。": "Clear the upload checkpoint?\n\nThe next upload starts from the beginning and the partly uploaded temporary file on the server is deleted. An existing remote file with the same name is not touched.",
+  "断点记录已清除，但服务器上的临时文件 {path} 未能删除，可手动删除": "Checkpoint cleared, but the temporary file {path} on the server could not be removed; you can delete it manually",
 };

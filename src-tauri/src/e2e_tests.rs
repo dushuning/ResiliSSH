@@ -580,3 +580,63 @@ fn e2e_legacy_download_checkpoint_resumes_in_place() {
     assert!(resumed_from > 0);
     assert_same_file(&remote, &local);
 }
+
+fn connection_request(env: &Env) -> crate::ConnectionRequest {
+    crate::ConnectionRequest {
+        host: env.config.host.clone(),
+        port: env.config.port,
+        username: env.config.username.clone(),
+        auth_type: "key".into(),
+        password: None,
+        key_path: std::env::var("RESILISS_E2E_KEY").ok(),
+        key_passphrase: None,
+        jump: None,
+    }
+}
+
+/// 清除断点时，临时文件已无法续传，应一并删除；但绝不能碰目标文件，
+/// 也不能在当前连接是另一台服务器时乱删（只报告残留位置）。
+#[test]
+fn e2e_clearing_checkpoints_removes_staging_files() {
+    let _guard = serial();
+    let Some(env) = env("cleanup") else { return };
+    let remote = env.work.join("remote/app.jar");
+    let remote_str = remote.to_string_lossy().to_string();
+    let remote_part = PathBuf::from(crate::sftp::staging_path(&remote_str));
+    std::fs::write(&remote, b"current release").unwrap();
+    let local = env.work.join("local/app.jar");
+
+    // 当前连接是另一台服务器（用户名不同）：只报告，不删除。
+    std::fs::write(&remote_part, b"partial").unwrap();
+    crate::checkpoint::save_checkpoint(&upload_checkpoint(&local, &remote_str, &env, 100)).unwrap();
+    let mut other = connection_request(&env);
+    other.username = "someone-else".into();
+    let outcome = crate::clear_saved_checkpoint(Some(other)).expect("clear");
+    assert_eq!(outcome.leftover.as_deref(), Some(remote_part.to_string_lossy().as_ref()));
+    assert!(remote_part.exists(), "must not delete when connected to a different server");
+
+    // 同一台服务器：删除临时文件，目标文件不动。
+    crate::checkpoint::save_checkpoint(&upload_checkpoint(&local, &remote_str, &env, 100)).unwrap();
+    let outcome = crate::clear_saved_checkpoint(Some(connection_request(&env))).expect("clear");
+    assert!(outcome.leftover.is_none());
+    assert!(!remote_part.exists(), "staging file should be removed");
+    assert_eq!(std::fs::read(&remote).unwrap(), b"current release");
+    assert!(crate::checkpoint::load_checkpoint().unwrap().is_none());
+
+    // 旧版断点：半截数据就在目标文件里，绝不能删。
+    let mut legacy = upload_checkpoint(&local, &remote_str, &env, 100);
+    legacy.staged = false;
+    crate::checkpoint::save_checkpoint(&legacy).unwrap();
+    crate::clear_saved_checkpoint(Some(connection_request(&env))).expect("clear");
+    assert!(remote.exists(), "legacy checkpoints must never delete the target file");
+
+    // 下载：删除本地临时文件，本地已有的同名文件不动。
+    let local_str = local.to_string_lossy().to_string();
+    let local_part = PathBuf::from(crate::sftp::staging_path(&local_str));
+    std::fs::write(&local, b"old copy").unwrap();
+    std::fs::write(&local_part, b"partial").unwrap();
+    crate::download_checkpoint::save_download_checkpoint(&download_checkpoint(&env, &remote_str, &local_str, 100)).unwrap();
+    crate::clear_saved_download_checkpoint().expect("clear download");
+    assert!(!local_part.exists(), "local staging file should be removed");
+    assert_eq!(std::fs::read(&local).unwrap(), b"old copy");
+}

@@ -16,6 +16,7 @@
 - Batch transfers ask once before starting, with a count of new files and files that will replace existing ones, instead of asking for every existing file (re-uploading a `dist/` folder used to mean hundreds of prompts).
 
 ### Fixed
+- Clearing a checkpoint, or starting a different transfer that replaces it, now deletes the abandoned `.resiliss-part` temporary file (locally for downloads, on the server for uploads when connected to that server). If it cannot be removed, the checkpoint is still cleared and the leftover path is shown and logged.
 - “New” server and “Import from ~/.ssh/config” no longer carry over the previous server's authentication type and private key path.
 
 ## [1.1.0] - 2026-10-10

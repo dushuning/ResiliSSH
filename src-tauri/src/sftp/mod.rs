@@ -16,7 +16,8 @@ pub use browse::{
     RemoteDirListing,
 };
 pub use client::{
-    abort_socket, connect_session, open_handshake, test_connection, AuthMethod, ConnectionConfig,
+    abort_socket, connect_session, is_sftp_not_found, open_handshake, test_connection, AuthMethod,
+    ConnectionConfig,
     MAX_JUMP_HOPS,
 };
 pub use host_key::{inspect_host_key, trust_host_key, HostKeyInfo};

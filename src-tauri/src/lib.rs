@@ -5,6 +5,7 @@ mod history;
 mod i18n;
 mod local_files;
 mod power;
+mod staging_cleanup;
 #[cfg(test)]
 mod e2e_tests;
 mod profiles;
@@ -714,9 +715,42 @@ fn get_saved_checkpoint() -> Result<Option<UploadCheckpoint>, String> {
     load_checkpoint()
 }
 
-#[tauri::command]
-fn clear_saved_checkpoint() -> Result<(), String> {
-    clear_checkpoint()
+#[derive(Serialize)]
+struct ClearCheckpointOutcome {
+    /// 未能删除、仍留在服务器上的临时文件；界面据此提示用户手动处理。
+    leftover: Option<String>,
+}
+
+/// 清除上传断点，并删掉它在服务器上的临时文件（已无法续传）。只有当前连接正是断点所属的服务器时
+/// 才连过去删；否则或删除失败时仍清除断点，并把残留位置告诉用户。
+#[tauri::command(async)]
+fn clear_saved_checkpoint(request: Option<ConnectionRequest>) -> Result<ClearCheckpointOutcome, String> {
+    let checkpoint = load_checkpoint().ok().flatten();
+    clear_checkpoint()?;
+    let Some(cp) = checkpoint.filter(|cp| cp.staged) else {
+        return Ok(ClearCheckpointOutcome { leftover: None });
+    };
+    let same_server = request
+        .as_ref()
+        .is_some_and(|r| r.host == cp.host && r.port == cp.port && r.username == cp.username);
+    let leftover = match request.filter(|_| same_server).map(|r| build_connection_config(&r)) {
+        Some(Ok(config)) => staging_cleanup::remove_remote_staging(&config, &cp.remote_path),
+        Some(Err(e)) => {
+            let part = staging_path(&cp.remote_path);
+            staging_cleanup::report_remote_leftover(&format!("{}@{}:{}", cp.username, cp.host, cp.port), &part, &e);
+            Some(part)
+        }
+        None => {
+            let part = staging_path(&cp.remote_path);
+            staging_cleanup::report_remote_leftover(
+                &format!("{}@{}:{}", cp.username, cp.host, cp.port),
+                &part,
+                crate::tr!("当前选择的不是这台服务器", "the selected server is a different one"),
+            );
+            Some(part)
+        }
+    };
+    Ok(ClearCheckpointOutcome { leftover })
 }
 
 #[tauri::command]
@@ -724,9 +758,15 @@ fn get_saved_download_checkpoint() -> Result<Option<DownloadCheckpoint>, String>
     load_download_checkpoint()
 }
 
+/// 清除下载断点，并删掉本地的临时文件（已无法续传）。
 #[tauri::command]
 fn clear_saved_download_checkpoint() -> Result<(), String> {
-    clear_download_checkpoint()
+    let checkpoint = load_download_checkpoint().ok().flatten();
+    clear_download_checkpoint()?;
+    if let Some(cp) = checkpoint.filter(|cp| cp.staged) {
+        staging_cleanup::remove_local_staging(&cp.local_path);
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -1591,6 +1631,22 @@ fn start_upload(
             .map_or(true, |cp| cp.staged),
     }));
 
+    // 不续传时，旧断点即将被新断点覆盖，它在服务器上的临时文件再也续不上了：同一台服务器就在
+    // 传输线程里顺手删掉（新传输写同一路径时本来也会从头覆盖），不同服务器只能记日志提示。
+    let stale_remote_part = existing_checkpoint
+        .as_ref()
+        .filter(|cp| !should_resume && cp.staged)
+        .and_then(|cp| {
+            let same_server = cp.host == request.host && cp.port == request.port && cp.username == request.username;
+            if !same_server {
+                staging_cleanup::report_remote_leftover(
+                    &format!("{}@{}:{}", cp.username, cp.host, cp.port),
+                    &staging_path(&cp.remote_path),
+                    crate::tr!("已开始另一台服务器上的传输", "a transfer to another server was started"),
+                );
+            }
+            same_server.then(|| cp.remote_path.clone())
+        });
     save_checkpoint(&*checkpoint.lock().map_err(|e| e.to_string())?)?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1671,6 +1727,9 @@ fn start_upload(
         let strict_chunk_verify_summary = strict_chunk_verify.clone();
         // 持有到本线程结束：包括断线后的无限重连等待，期间同样不该让电脑睡过去。
         let _sleep_guard = power::SleepGuard::acquire("upload");
+        if let Some(stale) = stale_remote_part.as_deref() {
+            staging_cleanup::remove_remote_staging(&config, stale);
+        }
         let result = upload_with_resume(
             config,
             PathBuf::from(&local_path_string).as_path(),
@@ -2165,6 +2224,10 @@ fn start_download(
         return Err(crate::tr!("已有下载任务在进行中", "A download is already in progress").into());
     }
 
+    // 不续传时旧断点即将被覆盖，它的本地临时文件再也续不上了，直接删掉。
+    if let Some(cp) = existing_checkpoint.as_ref().filter(|cp| !should_resume && cp.staged) {
+        staging_cleanup::remove_local_staging(&cp.local_path);
+    }
     save_download_checkpoint(&*checkpoint.lock().map_err(|e| e.to_string())?)?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
