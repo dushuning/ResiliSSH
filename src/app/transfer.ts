@@ -12,6 +12,7 @@ import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from 
 import { isQueueSelection, updateResolvedPathHint } from "./paths";
 import { clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
 import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showProgressSpeed, showReconnectingSpeedText, showTransferStatus, showVerifySummary, showWaitingSpeedText, startProgressWatchdog, stopProgressWatchdog, updateProgress, updateProgressDetail } from "./progress";
+import { clearDockProgress } from "./dock";
 import { recordReceipt, syncReceiptVisibility } from "./receipt";
 import { updateRemoteBrowseModeUi } from "./remoteBrowse";
 import { state } from "./state";
@@ -50,6 +51,8 @@ export function setTransferFormLocked(locked: boolean) {
 
 export function setTransferring(running: boolean) {
   state.isTransferring = running;
+  // 批量中每个文件结束都会短暂置为 false，此时不清，免得 Dock 进度在文件之间闪烁；整批结束时由队列清除。
+  if (!running && !state.activeQueue) clearDockProgress();
   transferBtn.disabled = running;
   testConnBtn.disabled = running;
   setTransferFormLocked(running);

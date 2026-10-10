@@ -7,6 +7,7 @@ import { SPEED_REFRESH_MS, SPEED_SAMPLE_WINDOW_MS, SPEED_STALE_MS, UI_STALL_WARN
 import { blockMap, hostInput, legendDoneLabel, legendResumed, legendRetry, localPathInput, mapCaption, mapLegend, miniTransfer, miniTransferFill, miniTransferLabel, miniTransferPct, miniTransferSpeed, navTransferLive, progressBadge, progressDetail, progressPercent, progressSpeed, progressWrap, queueChip, remotePathInput, runSummary, statusText, verifySummary } from "./dom";
 import { fileNameOf, formatBytes, formatEtaSeconds, formatProgressPercent } from "./format";
 import { renderQueueResultFiles } from "./queue";
+import { updateDockProgress } from "./dock";
 import { clearReceipt } from "./receipt";
 import { state } from "./state";
 import { isDownloadMode, isReliableMode } from "./transfer";
@@ -266,6 +267,7 @@ export function updateProgress(transferred: number, total: number) {
   state.progressTransferredBytes = transferred;
   if (state.runStartBytes === null) state.runStartBytes = transferred;
   progressPercent.textContent = formatProgressPercent(transferred, total) || "0%";
+  updateDockProgress(transferred, total);
   blockMap.update(transferred, total);
   const perCell = blockMap.blocksPerCell;
   mapCaption.textContent =

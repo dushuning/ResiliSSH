@@ -8,6 +8,7 @@ import { showConfirm } from "./dialogs";
 import { forceOverwriteInput, hostInput, localPathInput, portInput, postCommandInput, queueChip, remotePathInput, resultFiles, usernameInput } from "./dom";
 import { asDir, describeError, fileNameOf } from "./format";
 import { setSelectedDownloads, setSelectedUploads } from "./paths";
+import { clearDockProgress } from "./dock";
 import { loadHistory } from "./history";
 import { hideVerifySummary, setStatus } from "./progress";
 import { state } from "./state";
@@ -126,6 +127,7 @@ export async function startQueueFlow() {
   } finally {
     state.resolveQueueStep = null;
     state.activeQueue = null;
+    clearDockProgress();
     queueChip.classList.add("hidden");
     baseInput.value = baseDir;
   }
