@@ -431,4 +431,7 @@ export const en: Record<string, string> = {
   "添加服务器": "Add server",
   "已从 ~/.ssh/config 填入「{alias}」，确认无误后点「保存」": "Filled in “{alias}” from ~/.ssh/config — check it, then click Save",
   "先添加一台服务器": "Add a server to get started",
+  "批量下载未全部成功": "Batch download did not fully succeed",
+  "批量上传未全部成功": "Batch upload did not fully succeed",
+  "成功 {done} 个，失败 {failed} 个": "{done} succeeded, {failed} failed",
 };

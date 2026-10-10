@@ -173,6 +173,30 @@ async function confirmBatch(items: QueueItem[], download: boolean): Promise<bool
 }
 
 
+/**
+ * 整批只发一条系统通知（逐个文件发会把通知中心刷屏）。与单文件一致：用户主动取消时不发。
+ */
+function notifyBatchResult(items: QueueItem[], direction: TransferDirection, cancelled: boolean) {
+  if (cancelled) return;
+  const download = direction === "download";
+  const total = items.length;
+  const done = items.filter((i) => i.status === "done").length;
+  const failed = items.filter((i) => i.status === "failed").length;
+  const allDone = done === total;
+  const title = allDone
+    ? download ? t("{total} 个文件全部下载完成", { total }) : t("{total} 个文件全部上传完成", { total })
+    : download ? t("批量下载未全部成功") : t("批量上传未全部成功");
+  const body = !allDone
+    ? t("成功 {done} 个，失败 {failed} 个", { done, failed })
+    : download
+      ? t("已保存到 {dir}", { dir: localPathInput.value.trim() })
+      : t("已传到 {p1}:{p2}", { p1: hostInput.value.trim(), p2: remotePathInput.value.trim() });
+  invoke("notify_batch_result", { title: `ResiliSSH · ${title}`, body }).catch((error) =>
+    console.warn("batch notification failed", error),
+  );
+}
+
+
 /** 批量的展示名：来自同一个文件夹时以文件夹为主（如「dist/」），否则写文件数。 */
 function batchLabel(items: QueueItem[], relDirs: Map<string, string>): string {
   const tops = new Set(items.map((i) => (relDirs.get(i.source) ?? "").split("/")[0]));
@@ -246,6 +270,7 @@ export async function finishQueue(
   const cancelled = items.some((i) => i.status === "cancelled");
   const total = items.length;
   await recordBatchHistory(items, direction, selection, stats, cancelled);
+  notifyBatchResult(items, direction, cancelled);
   renderQueueResultFiles(items);
   // 选择只保留没成功的文件：之后点「重试 / 继续传输」不会把已完成的文件再传一遍。
   const remaining = items.filter((i) => i.status !== "done").map((i) => i.source);

@@ -170,7 +170,7 @@ struct StartUploadRequest {
     strict_chunk_verify: Option<bool>,
     #[serde(default)]
     force_overwrite: Option<bool>,
-    /// 属于一次批量传输：逐个文件不写历史，由前端在批量结束时整体记一条。
+    /// 属于一次批量传输：逐个文件不写历史、不发通知，由前端在批量结束时整体处理。
     #[serde(default)]
     in_batch: bool,
 }
@@ -238,7 +238,7 @@ struct StartDownloadRequest {
     strict_chunk_verify: Option<bool>,
     #[serde(default)]
     force_overwrite: Option<bool>,
-    /// 属于一次批量传输：逐个文件不写历史，由前端在批量结束时整体记一条。
+    /// 属于一次批量传输：逐个文件不写历史、不发通知，由前端在批量结束时整体处理。
     #[serde(default)]
     in_batch: bool,
 }
@@ -566,6 +566,12 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     };
     let config = build_connection_config(&conn)?;
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
+}
+
+/// 批量传输结束时发一条汇总通知（批量中逐个文件不发，见 StartUploadRequest::in_batch）。
+#[tauri::command]
+fn notify_batch_result(app: AppHandle, title: String, body: String) {
+    send_desktop_notification(&app, &title, &body);
 }
 
 /// 批量传输结束时由前端整体记一条历史（逐个文件在批量中不记，见 StartUploadRequest::in_batch）。
@@ -1686,7 +1692,9 @@ fn start_upload(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
-    let record_history = !request.in_batch;
+    // 批量中的文件不逐个写历史、不逐个发通知：几百个文件会把历史挤满、把通知中心刷屏，
+    // 整批结束时由前端统一记一条历史、发一条汇总通知。
+    let report_per_file = !request.in_batch;
     let worker = thread::spawn(move || {
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path),
@@ -1860,7 +1868,7 @@ fn start_upload(
                         activity::Category::Transfer,
                         format!("{message} · {}", activity::format_bytes(cp.file_size)),
                     );
-                    if record_history {
+                    if report_per_file {
                         record_upload_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -1873,7 +1881,9 @@ fn start_upload(
                             Some(message.clone()),
                         );
                     }
-                    send_desktop_notification(&app, "ResiliSSH", &message);
+                    if report_per_file {
+                        send_desktop_notification(&app, "ResiliSSH", &message);
+                    }
                     let _ = app.emit(
                         "upload-progress",
                         UploadProgressEvent {
@@ -1914,7 +1924,7 @@ fn start_upload(
                             )
                         ),
                     );
-                    if record_history {
+                    if report_per_file {
                         record_upload_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -1959,7 +1969,7 @@ fn start_upload(
                         format_upload_failure(&err, &cp.remote_path, cp.retry_count)
                     };
                     activity::error(activity::classify_failure(&message), message.clone());
-                    if record_history {
+                    if report_per_file {
                         record_upload_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -1972,11 +1982,13 @@ fn start_upload(
                             Some(message.clone()),
                         );
                     }
-                    send_desktop_notification(
-                        &app,
-                        crate::tr!("ResiliSSH 上传失败", "ResiliSSH Upload failed"),
-                        &message,
-                    );
+                    if report_per_file {
+                        send_desktop_notification(
+                            &app,
+                            crate::tr!("ResiliSSH 上传失败", "ResiliSSH Upload failed"),
+                            &message,
+                        );
+                    }
                     let _ = app.emit(
                         "upload-progress",
                         UploadProgressEvent {
@@ -2273,7 +2285,9 @@ fn start_download(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
-    let record_history = !request.in_batch;
+    // 批量中的文件不逐个写历史、不逐个发通知：几百个文件会把历史挤满、把通知中心刷屏，
+    // 整批结束时由前端统一记一条历史、发一条汇总通知。
+    let report_per_file = !request.in_batch;
     let worker = thread::spawn(move || {
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string),
@@ -2443,7 +2457,7 @@ fn start_download(
                         activity::Category::Transfer,
                         format!("{message} · {}", activity::format_bytes(cp.file_size)),
                     );
-                    if record_history {
+                    if report_per_file {
                         record_download_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -2456,7 +2470,9 @@ fn start_download(
                             Some(message.clone()),
                         );
                     }
-                    send_desktop_notification(&app, "ResiliSSH", &message);
+                    if report_per_file {
+                        send_desktop_notification(&app, "ResiliSSH", &message);
+                    }
                     let _ = app.emit(
                         "download-progress",
                         DownloadProgressEvent {
@@ -2497,7 +2513,7 @@ fn start_download(
                             )
                         ),
                     );
-                    if record_history {
+                    if report_per_file {
                         record_download_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -2542,7 +2558,7 @@ fn start_download(
                         format_download_failure(&err, &cp.remote_path, cp.retry_count)
                     };
                     activity::error(activity::classify_failure(&message), message.clone());
-                    if record_history {
+                    if report_per_file {
                         record_download_result(
                             &cp.local_path,
                             &cp.remote_path,
@@ -2555,11 +2571,13 @@ fn start_download(
                             Some(message.clone()),
                         );
                     }
-                    send_desktop_notification(
-                        &app,
-                        crate::tr!("ResiliSSH 下载失败", "ResiliSSH Download failed"),
-                        &message,
-                    );
+                    if report_per_file {
+                        send_desktop_notification(
+                            &app,
+                            crate::tr!("ResiliSSH 下载失败", "ResiliSSH Download failed"),
+                            &message,
+                        );
+                    }
                     let _ = app.emit(
                         "download-progress",
                         DownloadProgressEvent {
@@ -2716,6 +2734,7 @@ pub fn run() {
             expand_remote_paths,
             remote_paths_exist,
             record_batch_history,
+            notify_batch_result,
             local_paths_exist,
             local_file_digests,
             save_text_file,
