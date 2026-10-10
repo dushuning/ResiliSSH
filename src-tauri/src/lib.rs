@@ -948,6 +948,7 @@ fn download_preflight(
     local_path: &std::path::Path,
     remote_size: u64,
     local_size: u64,
+    reusable_bytes: u64,
     verified_bytes: u64,
 ) -> Option<(&'static str, String)> {
     if files_identical(session, remote_path, local_path, remote_size, local_size, verified_bytes) {
@@ -969,7 +970,7 @@ fn download_preflight(
     }
 
     let free = local_free_bytes(local_path)?;
-    let needed = bytes_needed(remote_size, local_size.max(verified_bytes));
+    let needed = bytes_needed(remote_size, reusable_bytes.max(verified_bytes));
     if free < needed {
         let dir = local_path.parent().map_or_else(|| "/".into(), |d| d.display().to_string());
         let message = crate::tr!(
@@ -1227,15 +1228,21 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         .unwrap_or(0);
 
     let checkpoint = load_download_checkpoint().ok().flatten();
-    let verified_bytes = checkpoint
-        .as_ref()
-        .filter(|cp| {
-            local_paths_compatible(&cp.local_path, &resolved_local_path, &request.local_path)
-                && remote_paths_compatible(&cp.remote_path, remote_path, remote_path)
-                && cp.host == request.host
-                && cp.port == request.port
-                && cp.username == request.username
-        })
+    let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
+        local_paths_compatible(&cp.local_path, &resolved_local_path, &request.local_path)
+            && remote_paths_compatible(&cp.remote_path, remote_path, remote_path)
+            && cp.host == request.host
+            && cp.port == request.port
+            && cp.username == request.username
+    });
+    // 与上传对称：新下载先写临时文件，可续传的字节在临时文件里；旧版断点仍在正式文件里。
+    let staged = matching_checkpoint.map_or(true, |cp| cp.staged);
+    let reusable_bytes = if staged {
+        std::fs::metadata(staging_path(&resolved_local_path)).map(|m| m.len()).unwrap_or(0)
+    } else {
+        local_size
+    };
+    let verified_bytes = matching_checkpoint
         .map(|cp| {
             if cp.verified_bytes > 0 {
                 cp.verified_bytes
@@ -1252,6 +1259,7 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         std::path::Path::new(&resolved_local_path),
         remote_size,
         local_size,
+        reusable_bytes,
         verified_bytes,
     );
     let (action, message) = if let Some(preflight) = preflight {
@@ -1277,8 +1285,8 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         (
             "full_redownload",
             crate::tr!(
-                "上次校验未通过，将删除本地文件并从头重下",
-                "Last verification failed; the local file will be deleted and downloaded again from scratch"
+                "上次校验未通过，将从头重下；本地原文件在新文件校验通过前保持不变",
+                "Last verification failed; the file will be downloaded again from scratch, and the existing local file stays untouched until the new one is verified"
             )
             .into(),
         )
@@ -1294,6 +1302,20 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
                 format!(
                     "Will resume from {} already verified",
                     activity::format_bytes(verified_bytes)
+                )
+            ),
+        )
+    } else if local_exists && staged {
+        (
+            "overwrite",
+            crate::tr!(
+                format!(
+                    "本地已有同名文件（{}），下载并校验通过后才会替换，期间旧文件保持不变",
+                    activity::format_bytes(local_size)
+                ),
+                format!(
+                    "A local file with this name already exists ({}); it is replaced only after the download is verified, until then it stays untouched",
+                    activity::format_bytes(local_size)
                 )
             ),
         )
@@ -2129,6 +2151,11 @@ fn start_download(
         retry_count: initial_retry_count,
         failure_reason: None,
         status: CheckpointStatus::InProgress,
+        // 与上传对称：新下载先写临时文件；续传旧断点时沿用它原来的方式。
+        staged: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .map_or(true, |cp| cp.staged),
     }));
 
     // 联网核对期间锁是放开的，写断点、登记 worker 前必须重新持锁并复查，

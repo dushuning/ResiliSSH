@@ -43,6 +43,19 @@ fn lock_error<E: TransferError>(err: impl std::fmt::Display) -> E {
     E::sftp(err.to_string())
 }
 
+/// 临时文件后缀。放在目标同目录（rename 在同一文件系统内才是原子的），并以点开头，
+/// 避免出现在常规的目录列表里被误当成正式文件。
+const STAGING_SUFFIX: &str = ".resiliss-part";
+
+/// 目标文件对应的临时文件路径：`/opt/app/app.jar` → `/opt/app/.app.jar.resiliss-part`。
+/// 上传（远端路径）与下载（本地路径）共用同一命名，用户在两端看到的临时文件一致。
+pub fn staging_path(final_path: &str) -> String {
+    match final_path.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
+        None => format!(".{final_path}{STAGING_SUFFIX}"),
+    }
+}
+
 pub fn align_down(offset: u64) -> u64 {
     offset - (offset % CHUNK_SIZE)
 }
@@ -187,6 +200,12 @@ mod tests {
         assert_eq!(align_down(0), 0);
         assert_eq!(align_down(CHUNK_SIZE - 1), 0);
         assert_eq!(align_down(3 * CHUNK_SIZE + 7), 3 * CHUNK_SIZE);
+    }
+
+    #[test]
+    fn staging_path_is_hidden_sibling() {
+        assert_eq!(staging_path("/opt/app/app.jar"), "/opt/app/.app.jar.resiliss-part");
+        assert_eq!(staging_path("app.jar"), ".app.jar.resiliss-part");
     }
 
     #[test]

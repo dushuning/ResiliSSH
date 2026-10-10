@@ -25,6 +25,10 @@ pub struct DownloadCheckpoint {
     #[serde(default)]
     pub failure_reason: Option<String>,
     pub status: CheckpointStatus,
+    /// 是否先写同目录的临时文件、校验通过后再换成正式文件。旧版本留下的断点没有这个字段（false），
+    /// 它们的半截数据就在正式文件里，必须按原方式续传完。
+    #[serde(default)]
+    pub staged: bool,
 }
 
 pub fn checkpoint_path() -> PathBuf {

@@ -1,5 +1,6 @@
 use super::errors::is_permanent_sftp_error;
 use super::transfer_common::{
+    staging_path,
     align_down, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
     increment_retry_count, sha256_bytes, sha256_local_file, sha256_remote_file,
     should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
@@ -231,6 +232,11 @@ pub fn download_with_resume(
                         .lock()
                         .map(|cp| cp.file_size)
                         .unwrap_or(0);
+                    let final_local = checkpoint
+                        .lock()
+                        .map(|cp| cp.local_path.clone())
+                        .unwrap_or_default();
+                    let written = local_write_path(&final_local, &checkpoint);
                     let retry_count = if should_skip_full_file_hash(
                         &strict_chunk_verify,
                         &checkpoint,
@@ -238,10 +244,6 @@ pub fn download_with_resume(
                     )? {
                         current_retry_count(&checkpoint)
                     } else {
-                        let resolved_local = checkpoint
-                            .lock()
-                            .map(|cp| cp.local_path.clone())
-                            .unwrap_or_default();
                         let resolved_remote = checkpoint
                             .lock()
                             .map(|cp| cp.remote_path.clone())
@@ -254,7 +256,7 @@ pub fn download_with_resume(
                         );
                         verify_download_integrity(
                             active_session,
-                            Path::new(&resolved_local),
+                            Path::new(&written),
                             &resolved_remote,
                             remote_size,
                             &cancel_flag,
@@ -262,6 +264,9 @@ pub fn download_with_resume(
                         )?
                     };
 
+                    if written != final_local {
+                        promote_local_file(&written, &final_local, remote_size)?;
+                    }
                     {
                         let mut cp = checkpoint.lock().map_err(|e| DownloadError::Sftp(e.to_string()))?;
                         cp.downloaded_bytes = remote_size;
@@ -324,6 +329,34 @@ pub fn download_with_resume(
     }
 }
 
+/// 本次下载实际写入的本地文件：新下载为临时文件，旧版断点（staged=false）仍是正式文件本身。
+fn local_write_path(final_local: &str, checkpoint: &Mutex<DownloadCheckpoint>) -> String {
+    let staged = checkpoint.lock().map(|cp| cp.staged).unwrap_or(false);
+    if staged { staging_path(final_local) } else { final_local.to_string() }
+}
+
+/// 校验通过后把临时文件换成正式文件。本地 rename(2) 是原子的，已有同名文件会被直接替换，
+/// 正在打开旧文件的程序不受影响。
+fn promote_local_file(part: &str, final_path: &str, size: u64) -> Result<(), DownloadError> {
+    if let Err(e) = fs::metadata(part) {
+        // 已经换好（例如上一轮在改名后、更新断点前被中断）：正式文件已是完整大小即视为完成。
+        if e.kind() == std::io::ErrorKind::NotFound
+            && fs::metadata(final_path).is_ok_and(|m| m.len() == size)
+        {
+            return Ok(());
+        }
+        return Err(DownloadError::LocalIo(e.to_string()));
+    }
+    fs::rename(part, final_path).map_err(|e| {
+        DownloadError::LocalIo(crate::tr!(
+            format!("无法把下载好的文件改名为 {final_path}：{e}"),
+            format!("Could not rename the downloaded file to {final_path}: {e}")
+        ))
+    })?;
+    log::info!("download verified and moved into place: {final_path}");
+    Ok(())
+}
+
 fn transfer_chunks(
     session: &mut Session,
     remote_path: &str,
@@ -365,8 +398,12 @@ fn transfer_chunks(
         save_download_checkpoint(&cp).map_err(|e| DownloadError::Sftp(e))?;
     }
 
+    // 之后的本地读写都针对实际写入的文件：新下载写同目录的临时文件，校验通过后才换成正式文件，
+    // 下载途中「下载」文件夹里不会出现一个看起来完整、其实只有一半的文件。
+    let write_path = local_write_path(&resolved_local_path, checkpoint);
+
     // 与上传侧对称：只有文件不存在才算 0 字节，其他读元数据失败不能被当成「从头下载」。
-    let local_stat_size = match fs::metadata(&resolved_local_path) {
+    let local_stat_size = match fs::metadata(&write_path) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(DownloadError::LocalIo(e.to_string())),
@@ -385,7 +422,7 @@ fn transfer_chunks(
         .clone();
 
     let mut offset = resolve_download_offset(
-        Path::new(&resolved_local_path),
+        Path::new(&write_path),
         local_stat_size,
         remote_size,
         force_overwrite,
@@ -395,7 +432,7 @@ fn transfer_chunks(
     if offset > 0 {
         verify_resume_boundary(
             &sftp,
-            Path::new(&resolved_local_path),
+            Path::new(&write_path),
             &actual_remote_path,
             offset,
         )?;
@@ -412,7 +449,7 @@ fn transfer_chunks(
     (callbacks.on_progress)(offset, remote_size, "downloading", retry_count);
 
     let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
-    let mut truncate_first = offset == 0 && !Path::new(&resolved_local_path).exists();
+    let mut truncate_first = offset == 0 && !Path::new(&write_path).exists();
     let mut remote_file = open_remote_for_download(&sftp, &actual_remote_path)?;
 
     while offset < remote_size {
@@ -434,7 +471,7 @@ fn transfer_chunks(
         )?;
 
         write_local_chunk(
-            Path::new(&resolved_local_path),
+            Path::new(&write_path),
             offset,
             &chunk_buffer[..chunk_len],
             truncate_first,
@@ -452,7 +489,7 @@ fn transfer_chunks(
                 retry_count,
             );
             verify_written_chunk(
-                Path::new(&resolved_local_path),
+                Path::new(&write_path),
                 &chunk_buffer[..chunk_len],
                 chunk_start,
                 chunk_len as u64,
@@ -470,7 +507,7 @@ fn transfer_chunks(
         (callbacks.on_progress)(offset, remote_size, "downloading", retry_count);
     }
 
-    let final_size = fs::metadata(&resolved_local_path)
+    let final_size = fs::metadata(&write_path)
         .map(|m| m.len())
         .unwrap_or(0);
     if final_size != remote_size {

@@ -23,7 +23,7 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 
 ### Unreleased
 - **Jump hosts** (ProxyJump), multi-hop, imported from `~/.ssh/config`
-- **Safe replace**: upload to a temporary file, swap in after verification
+- **Safe replace**: uploads and downloads go to a temporary file, swapped in after verification
 - **Stay awake**: no idle sleep during transfers
 - **Transfer receipt**: copy/save a verified-transfer record
 

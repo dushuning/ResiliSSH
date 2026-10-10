@@ -149,11 +149,11 @@ async function confirmBatch(items: QueueItem[], download: boolean): Promise<bool
   let body: string;
   if (existing === null) {
     body = download
-      ? t("将下载 {total} 个文件。本地已有的同名文件会被覆盖。", { total })
+      ? t("将下载 {total} 个文件。本地已有的同名文件会在新文件校验通过后被替换。", { total })
       : t("将上传 {total} 个文件。远端已有的同名文件会在新文件校验通过后被替换。", { total });
   } else {
     body = download
-      ? t("将下载 {total} 个文件：新建 {fresh} 个，覆盖本地已有的 {existing} 个。", { total, fresh, existing })
+      ? t("将下载 {total} 个文件：新建 {fresh} 个，替换本地已有的 {existing} 个（新文件校验通过后才替换，此前旧文件保持不变）。", { total, fresh, existing })
       : t("将上传 {total} 个文件：新建 {fresh} 个，替换远端已有的 {existing} 个（新文件校验通过后才替换，此前旧文件保持不变）。", { total, fresh, existing });
   }
   body += "\n\n" + (force

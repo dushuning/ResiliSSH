@@ -80,9 +80,9 @@ export function analyzeProbeState(
       kind: "warn",
       title: download ? t("将强制覆盖本地文件") : t("将强制覆盖远端文件"),
       detail: probe.message,
-      // 上传先写临时文件：从头重传期间远端原文件不动，校验通过后才替换。
+      // 两个方向都先写临时文件：从头重传期间原文件不动，校验通过后才替换。
       hint: download
-        ? t("开始传输前会删除已有文件并从头重来")
+        ? t("将从头重新下载，本地原文件在新文件校验通过后才会被替换")
         : t("将从头重新上传，远端原文件在新文件校验通过后才会被替换"),
       showClear: false,
     };
@@ -126,7 +126,7 @@ export function analyzeProbeState(
       title: action === "full_redownload" ? t("需从头重下") : t("需从头重传"),
       detail: probe.message,
       hint: action === "full_redownload"
-        ? t("继续将删除已有文件并重新传输")
+        ? t("继续将从头重新下载，本地原文件在新文件校验通过前保持不变")
         : t("继续将从头重新上传，远端原文件在新文件校验通过前保持不变"),
       showClear: false,
     };
@@ -134,7 +134,7 @@ export function analyzeProbeState(
   if (action === "overwrite") {
     return {
       kind: "warn",
-      title: download ? t("将覆盖本地文件") : t("将替换远端文件"),
+      title: download ? t("将替换本地文件") : t("将替换远端文件"),
       detail: probe.message,
       showClear: false,
     };
@@ -259,21 +259,21 @@ export async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise
   if (forceOverwriteInput.checked) {
     return showConfirm(
       t("强制覆盖下载"),
-      t("将删除本地已有文件并从头重下，是否继续？"),
+      t("将从头重新下载，本地原文件在新文件校验通过后才会被替换。是否继续？"),
     );
   }
 
   if (probe.action === "full_redownload") {
     return showConfirm(
       t("需要从头重下"),
-      t("{message}\n\n将删除本地已有文件并重新下载，是否继续？", { message: probe.message }),
+      t("{message}\n\n将从头重新下载，是否继续？", { message: probe.message }),
     );
   }
 
   if (probe.action === "overwrite") {
     return showConfirm(
-      t("覆盖本地文件"),
-      t("{message}\n\n本地已有同名文件，继续将覆盖重下，是否继续？", { message: probe.message }),
+      t("替换本地文件"),
+      t("{message}\n\n本地已有同名文件，是否下载并替换它？", { message: probe.message }),
     );
   }
 

@@ -245,6 +245,7 @@ fn download_checkpoint(env: &Env, remote: &str, local: &str, size: u64) -> Downl
         retry_count: 0,
         failure_reason: None,
         status: CheckpointStatus::InProgress,
+        staged: true,
     }
 }
 
@@ -529,4 +530,53 @@ fn e2e_remote_paths_exist_lists_each_directory_once() {
     let paths = [path("index.html"), path("about.html"), path("js/app.js"), path("css/site.css")];
     let exists = crate::sftp::remote_paths_exist(&env.config, &paths).expect("check");
     assert_eq!(exists, vec![true, false, true, false]);
+}
+
+/// 与上传对称：下载中途本地的同名旧文件保持完整，校验通过后才被替换。
+#[test]
+fn e2e_staged_download_never_exposes_partial_file() {
+    let _guard = serial();
+    let Some(env) = env("staged-download") else { return };
+    let remote = env.work.join("remote/report.pdf");
+    std::fs::write(&remote, sample_bytes(FILE_SIZE, 81)).unwrap();
+    let remote_str = remote.to_string_lossy().to_string();
+    let local = env.work.join("local/report.pdf");
+    let old = sample_bytes(MB as usize, 82);
+    std::fs::write(&local, &old).unwrap();
+    let local_str = local.to_string_lossy().to_string();
+    let part = PathBuf::from(crate::sftp::staging_path(&local_str));
+    let cp = Arc::new(Mutex::new(download_checkpoint(&env, &remote_str, &local_str, FILE_SIZE as u64)));
+
+    let (first, _) = download(&env, &remote_str, &local_str, &cp, Some(CANCEL_AT));
+    assert!(matches!(first, Err(DownloadError::Cancelled)), "first run should be cancelled");
+    assert_eq!(std::fs::read(&local).unwrap(), old, "local file must still be the old one mid-download");
+    assert!(part.exists(), "progress must live in the staging file");
+
+    let (second, resumed_from) = download(&env, &remote_str, &local_str, &cp, None);
+    second.expect("resumed staged download should succeed");
+    assert!(resumed_from > 0, "second run must resume from the staging file");
+    assert_same_file(&remote, &local);
+    assert!(!part.exists(), "staging file must be gone after the replace");
+}
+
+#[test]
+fn e2e_legacy_download_checkpoint_resumes_in_place() {
+    let _guard = serial();
+    let Some(env) = env("legacy-download") else { return };
+    let remote = env.work.join("remote/old.iso");
+    std::fs::write(&remote, sample_bytes(FILE_SIZE, 91)).unwrap();
+    let remote_str = remote.to_string_lossy().to_string();
+    let local = env.work.join("local/old.iso");
+    let local_str = local.to_string_lossy().to_string();
+    let mut legacy = download_checkpoint(&env, &remote_str, &local_str, FILE_SIZE as u64);
+    legacy.staged = false;
+    let cp = Arc::new(Mutex::new(legacy));
+
+    let (first, _) = download(&env, &remote_str, &local_str, &cp, Some(CANCEL_AT));
+    assert!(matches!(first, Err(DownloadError::Cancelled)));
+    assert!(local.exists(), "legacy downloads write the target directly");
+    let (second, resumed_from) = download(&env, &remote_str, &local_str, &cp, None);
+    second.expect("legacy resume should succeed");
+    assert!(resumed_from > 0);
+    assert_same_file(&remote, &local);
 }

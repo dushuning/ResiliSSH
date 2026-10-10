@@ -7,6 +7,7 @@ use super::transfer_common::{
 };
 use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use super::preflight::shell_quote;
+pub use super::transfer_common::staging_path;
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};
@@ -315,19 +316,8 @@ pub fn remote_parent_status(sftp: &Sftp, remote_file: &str) -> Option<String> {
 }
 
 
-/// 临时文件后缀。放在目标同目录（rename 在同一文件系统内才是原子的），并以点开头，
-/// 避免出现在常规的目录列表里被误当成正式文件。
-const STAGING_SUFFIX: &str = ".resiliss-part";
 /// 权限位（含 setuid/setgid/sticky），不含文件类型位。
 const PERMISSION_BITS: u32 = 0o7777;
-
-/// 目标文件对应的临时文件路径：`/opt/app/app.jar` → `/opt/app/.app.jar.resiliss-part`。
-pub fn staging_path(final_path: &str) -> String {
-    match final_path.rsplit_once('/') {
-        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
-        None => format!(".{final_path}{STAGING_SUFFIX}"),
-    }
-}
 
 /// 临时文件已不在、目标已是完整大小：说明上次的改名其实成功了，只是回复在断线中丢失。
 fn already_promoted(sftp: &Sftp, final_path: &str, size: u64) -> bool {
