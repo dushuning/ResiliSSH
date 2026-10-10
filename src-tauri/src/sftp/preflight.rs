@@ -70,7 +70,7 @@ fn df_available(session: &Session, dir: &str) -> Option<u64> {
 /// 解析 `df -Pk` 的「可用」列（单位 KB）。从使用率列（以 % 结尾）往前取一列，
 /// 而不是按固定下标：文件系统名里可能有空格，固定下标会取错。
 fn parse_df_available_kb(output: &str) -> Option<u64> {
-    let line = output.lines().filter(|l| !l.trim().is_empty()).last()?;
+    let line = output.lines().rev().find(|l| !l.trim().is_empty())?;
     let fields: Vec<&str> = line.split_whitespace().collect();
     let pct = fields.iter().rposition(|f| f.ends_with('%'))?;
     fields.get(pct.checked_sub(1)?)?.parse().ok()
