@@ -4,7 +4,7 @@ import { icons } from "../ui/icons";
 import { invoke } from "@tauri-apps/api/core";
 import { connectionPayload, ensureCredentialsLoaded, prepareConnection, validateConnectionBeforeTransfer } from "./connection";
 import { CONFIRM_ANIM_MS } from "./constants";
-import { browseRemoteBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseHint, remoteBrowseList, remoteBrowseNewDirName, remoteBrowseNewDirRow, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseStatus, remoteBrowseTitle, remoteBrowseUpBtn, remotePathInput } from "./dom";
+import { browseRemoteBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseHint, remoteBrowseList, remoteBrowseNewDirName, remoteBrowseNewDirRow, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseShowHidden, remoteBrowseStatus, remoteBrowseTitle, remoteBrowseUpBtn, remotePathInput } from "./dom";
 import { describeError, formatBytes } from "./format";
 import { expandRemotePaths, reportExpansionWarnings, setSelectedDownloads, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
@@ -123,6 +123,38 @@ export async function applyRemoteDownloadPicks(picked: string[]) {
 }
 
 
+/** 「显示隐藏文件」的偏好跨次保留：需要它的人（如要下载 .env）每次都要找，很烦。 */
+const SHOW_HIDDEN_STORAGE_KEY = "resiliss-remote-show-hidden";
+remoteBrowseShowHidden.checked = localStorage.getItem(SHOW_HIDDEN_STORAGE_KEY) === "1";
+remoteBrowseShowHidden.addEventListener("change", () => {
+  localStorage.setItem(SHOW_HIDDEN_STORAGE_KEY, remoteBrowseShowHidden.checked ? "1" : "0");
+  if (state.remoteBrowseCurrent) {
+    renderRemoteBrowseListing(state.remoteBrowseCurrent);
+    updateRemoteBrowseCount(state.remoteBrowseCurrent);
+  }
+});
+
+
+/** 以点开头的文件（.bashrc、.cache 等）默认不显示：挑要传的文件时它们只是干扰。 */
+function visibleEntries(listing: RemoteDirListing): RemoteDirEntry[] {
+  return remoteBrowseShowHidden.checked
+    ? listing.entries
+    : listing.entries.filter((entry) => !entry.name.startsWith("."));
+}
+
+
+/** 状态行写明隐藏了多少项，免得用户以为文件不见了。 */
+export function updateRemoteBrowseCount(listing: RemoteDirListing) {
+  const shown = visibleEntries(listing).length;
+  const hidden = listing.entries.length - shown;
+  setRemoteBrowseStatus(
+    hidden > 0
+      ? t("{length} 项，另有 {hidden} 个隐藏项", { length: shown, hidden })
+      : t("{length} 项", { length: shown }),
+  );
+}
+
+
 export function renderRemoteBrowseListing(listing: RemoteDirListing) {
   remoteBrowsePicked.clear();
   updateRemoteBrowsePickButton();
@@ -131,7 +163,8 @@ export function renderRemoteBrowseListing(listing: RemoteDirListing) {
   remoteBrowseUpBtn.disabled = !listing.parent;
 
   remoteBrowseList.replaceChildren();
-  if (listing.entries.length === 0) {
+  const entries = visibleEntries(listing);
+  if (entries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "remote-browse-empty";
     empty.textContent = t("此目录为空");
@@ -139,7 +172,7 @@ export function renderRemoteBrowseListing(listing: RemoteDirListing) {
     return;
   }
 
-  for (const entry of listing.entries) {
+  for (const entry of entries) {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `remote-browse-item${entry.is_dir ? " is-dir" : " is-file"}`;
@@ -255,7 +288,7 @@ export async function loadRemoteBrowseDir(path?: string) {
       },
     });
     renderRemoteBrowseListing(listing);
-    setRemoteBrowseStatus(t("{length} 项", { length: listing.entries.length }));
+    updateRemoteBrowseCount(listing);
   } catch (error) {
     setRemoteBrowseStatus(describeError(error), "error");
   } finally {

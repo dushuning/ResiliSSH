@@ -640,3 +640,19 @@ fn e2e_clearing_checkpoints_removes_staging_files() {
     assert!(!local_part.exists(), "local staging file should be removed");
     assert_eq!(std::fs::read(&local).unwrap(), b"old copy");
 }
+
+/// 未完成传输留下的临时文件不应出现在远端目录列表里，以免被误选下载；普通隐藏文件照常返回，由界面决定是否显示。
+#[test]
+fn e2e_remote_listing_hides_staging_files() {
+    let _guard = serial();
+    let Some(env) = env("listing") else { return };
+    let dir = env.work.join("remote/app");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("app.jar"), b"x").unwrap();
+    std::fs::write(dir.join(".env"), b"y").unwrap();
+    std::fs::write(dir.join(".app.jar.resiliss-part"), b"half").unwrap();
+    let listing = crate::sftp::list_remote_directory(&env.config, Some(&dir.to_string_lossy())).expect("list");
+    let mut names: Vec<String> = listing.entries.iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec![".env".to_string(), "app.jar".to_string()]);
+}

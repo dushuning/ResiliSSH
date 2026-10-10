@@ -423,4 +423,6 @@ export const en: Record<string, string> = {
   "{count} 个文件": "{count} files",
   "{done} / {count} 个文件成功": "{done} of {count} files succeeded",
   "选择过多，无法复用": "Too many items to reuse",
+  "{length} 项，另有 {hidden} 个隐藏项": "{length} items, {hidden} hidden",
+  "显示隐藏文件": "Show hidden files",
 };

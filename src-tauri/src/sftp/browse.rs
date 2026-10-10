@@ -1,4 +1,5 @@
 use super::client::{connect_session, ConnectionConfig};
+use super::transfer_common::is_staging_file;
 use crate::local_files::{is_ignored_name, ExpandedPaths, LocalEntry, MAX_EXPANDED_FILES};
 use serde::Serialize;
 use ssh2::Sftp;
@@ -222,7 +223,8 @@ fn read_directory_listing(sftp: &Sftp, dir_path: &str) -> Result<RemoteDirListin
     let mut entries = Vec::new();
     for (name_path, file_stat) in raw {
         let name = entry_name(&name_path);
-        if name == "." || name == ".." {
+        // 临时文件是未完成传输的半截数据，列出来只会让人困惑，甚至被误选下载。
+        if name == "." || name == ".." || is_staging_file(&name) {
             continue;
         }
         let full_path = join_remote_path(dir_path, &name);

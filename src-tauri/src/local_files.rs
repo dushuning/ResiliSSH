@@ -11,8 +11,9 @@ pub(crate) const MAX_EXPANDED_FILES: usize = 10_000;
 const IGNORED_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", ".localized"];
 
 /// 远端文件夹展开（下载）沿用同一份忽略列表，两个方向对「杂项文件」的判断保持一致。
+/// 本程序的临时文件（未完成传输的半截数据）同样排除，否则会被当成普通文件传出去。
 pub(crate) fn is_ignored_name(name: &str) -> bool {
-    IGNORED_NAMES.contains(&name)
+    IGNORED_NAMES.contains(&name) || crate::sftp::is_staging_file(name)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -117,6 +118,7 @@ mod tests {
         fs::write(dist.join("index.html"), b"<html>").unwrap();
         fs::write(dist.join("js/app.js"), b"x").unwrap();
         fs::write(dist.join(".DS_Store"), b"junk").unwrap();
+        fs::write(dist.join(".index.html.resiliss-part"), b"half").unwrap();
         let single = root.join("notes.txt");
         fs::write(&single, b"hi").unwrap();
 

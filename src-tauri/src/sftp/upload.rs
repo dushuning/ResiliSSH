@@ -7,7 +7,7 @@ use super::transfer_common::{
 };
 use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
 use super::preflight::shell_quote;
-pub use super::transfer_common::staging_path;
+pub use super::transfer_common::{is_staging_file, staging_path};
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};

@@ -386,7 +386,13 @@ export function appTemplate(appName: string): string {
         <button class="btn btn-secondary btn-small" id="remoteBrowseGoBtn" type="button">${t("前往")}</button>
       </div>
       <div class="remote-browse-status" id="remoteBrowseStatus"></div>
-      <p class="hint" id="remoteBrowseHint">${t("双击文件夹进入；双击文件可选中")}</p>
+      <div class="remote-browse-hint-row">
+        <p class="hint" id="remoteBrowseHint">${t("双击文件夹进入；双击文件可选中")}</p>
+        <label class="checkbox remote-browse-hidden-toggle">
+          <input type="checkbox" id="remoteBrowseShowHidden" />
+          <span>${t("显示隐藏文件")}</span>
+        </label>
+      </div>
       <div class="remote-browse-list" id="remoteBrowseList"></div>
       <div class="input-row remote-browse-new-dir hidden" id="remoteBrowseNewDirRow">
         <input id="remoteBrowseNewDirName" type="text" placeholder="${t("新目录名称")}" spellcheck="false" />

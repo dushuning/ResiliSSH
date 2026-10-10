@@ -1907,6 +1907,18 @@ input[type="radio"] {
   margin-bottom: 0;
 }
 
+.remote-browse-hint-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-browse-hidden-toggle {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
 .remote-browse-status {
   min-height: 16px;
   font-size: 12px;

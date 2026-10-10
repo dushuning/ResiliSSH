@@ -280,3 +280,4 @@ export const copyLogBtn = document.querySelector<HTMLButtonElement>("#copyLogBtn
 export const resultReceipt = document.querySelector<HTMLElement>("#resultReceipt")!;
 export const copyReceiptBtn = document.querySelector<HTMLButtonElement>("#copyReceiptBtn")!;
 export const saveReceiptBtn = document.querySelector<HTMLButtonElement>("#saveReceiptBtn")!;
+export const remoteBrowseShowHidden = document.querySelector<HTMLInputElement>("#remoteBrowseShowHidden")!;

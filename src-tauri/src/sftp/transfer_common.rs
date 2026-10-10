@@ -56,6 +56,12 @@ pub fn staging_path(final_path: &str) -> String {
     }
 }
 
+/// 是否是本程序的临时文件（只看文件名）。展开文件夹、列远端目录时都要排除：
+/// 它们是未完成传输的半截数据，被当成普通文件上传或下载只会制造垃圾。
+pub fn is_staging_file(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(STAGING_SUFFIX)
+}
+
 pub fn align_down(offset: u64) -> u64 {
     offset - (offset % CHUNK_SIZE)
 }
@@ -206,6 +212,13 @@ mod tests {
     fn staging_path_is_hidden_sibling() {
         assert_eq!(staging_path("/opt/app/app.jar"), "/opt/app/.app.jar.resiliss-part");
         assert_eq!(staging_path("app.jar"), ".app.jar.resiliss-part");
+    }
+
+    #[test]
+    fn staging_files_are_recognized_by_name() {
+        assert!(is_staging_file(".app.jar.resiliss-part"));
+        assert!(!is_staging_file("app.jar"));
+        assert!(!is_staging_file("app.jar.resiliss-part"));
     }
 
     #[test]
