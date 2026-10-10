@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 与 scripts/e2e-sshd.sh 的默认值一致。
+  RESILISS_E2E_PORT: "2299"
+  RESILISS_SSHD_DIR: /tmp/resiliss-sshd
+
+jobs:
+  test:
+    # 应用只支持 macOS；runner 自带 /usr/sbin/sshd，可以直接起一个测试用 sshd。
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check frontend
+        run: npx tsc --noEmit
+
+      - name: Check translations
+        run: npm run check:i18n
+
+      # tauri::generate_context! 在编译期需要 dist/ 存在，所以先构建前端再跑 cargo test。
+      - name: Build frontend
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Unit tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Start test sshd
+        run: |
+          scripts/e2e-sshd.sh > "$RUNNER_TEMP/sshd.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 "$RESILISS_E2E_PORT" && exit 0
+            sleep 1
+          done
+          echo "sshd did not start"; cat "$RUNNER_TEMP/sshd.log"; exit 1
+
+      - name: End-to-end transfer tests
+        working-directory: src-tauri
+        env:
+          RESILISS_E2E_KEY: /tmp/resiliss-sshd/client_ed25519
+          RESILISS_E2E_HOSTKEY: /tmp/resiliss-sshd/host_ed25519.pub
+          # 环境不全时让测试失败，而不是静默跳过后显示通过。
+          RESILISS_E2E_REQUIRED: "1"
+        run: cargo test e2e -- --test-threads=1
+
+      - name: sshd log
+        if: failure()
+        run: cat "$RUNNER_TEMP/sshd.log" || true

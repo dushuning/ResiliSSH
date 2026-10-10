@@ -19,7 +19,7 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **Recovery:** offer to resume unfinished transfers on launch
 - **Privacy:** per-server "remember password in Keychain" option
 - **i18n:** English and Chinese UI
-- **Internals:** persistent remote file handle + adaptive write size (≈3× faster at 100 ms RTT), Content Security Policy, frontend split into modules, end-to-end tests against a real `sshd`
+- **Internals:** persistent remote file handle + adaptive write size (≈3× faster at 100 ms RTT), Content Security Policy, frontend split into modules, end-to-end tests against a real `sshd`, run in CI on every push
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
@@ -27,7 +27,6 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 | Item | Why |
 |---|---|
-| Run the `sshd` end-to-end tests in CI | They exist (`scripts/e2e-sshd.sh`) but only run locally today |
 | Signed & notarized releases, Homebrew cask | Remove Gatekeeper and repeated Keychain prompts |
 
 ## Later / maybe

@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/dushuning/ResiliSSH/actions/workflows/ci.yml"><img src="https://github.com/dushuning/ResiliSSH/actions/workflows/ci.yml/badge.svg" alt="CI" /></a><br />
   <a href="./README.md">English</a> · 简体中文
 </p>
 
@@ -136,6 +137,8 @@ npm run tauri dev       # 开发模式（热更新）
 npm run check:i18n      # 检查界面文案是否都有英文翻译
 cd src-tauri && cargo test
 ```
+
+端到端测试对着一个只监听 `127.0.0.1` 的临时 `sshd` 运行（无需管理员权限，不碰你的 `~/.ssh`）：先启动 `scripts/e2e-sshd.sh`，再按脚本开头注释里的命令运行。CI 会在每次推送时自动跑。
 
 | 层 | 技术 |
 |---|---|

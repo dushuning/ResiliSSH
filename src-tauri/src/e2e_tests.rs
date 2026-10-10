@@ -4,6 +4,7 @@
 //!   RESILISS_E2E_PORT=2299 RESILISS_E2E_KEY=/tmp/resiliss-sshd/client_ed25519 \
 //!   RESILISS_E2E_HOSTKEY=/tmp/resiliss-sshd/host_ed25519.pub cargo test e2e -- --test-threads=1
 //! 测试服务器就在本机，所以「远端文件」可以直接用 std::fs 读取来比对。
+//! CI 中设置 RESILISS_E2E_REQUIRED=1：环境不全时直接失败，而不是静默跳过后显示「通过」。
 
 use crate::checkpoint::{AuthKind, CheckpointStatus, UploadCheckpoint};
 use crate::download_checkpoint::DownloadCheckpoint;
@@ -32,8 +33,19 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 为真时缺少测试环境视为失败（CI 用），否则跳过（本地开发默认没有测试 sshd）。
+const E2E_REQUIRED_ENV: &str = "RESILISS_E2E_REQUIRED";
+
 /// 读取测试环境；未配置时返回 None，测试直接跳过。
 fn env(name: &str) -> Option<Env> {
+    let env = try_env(name);
+    if env.is_none() && std::env::var_os(E2E_REQUIRED_ENV).is_some() {
+        panic!("{E2E_REQUIRED_ENV} is set but the e2e environment is incomplete (RESILISS_E2E_PORT/KEY/HOSTKEY)");
+    }
+    env
+}
+
+fn try_env(name: &str) -> Option<Env> {
     let port: u16 = std::env::var("RESILISS_E2E_PORT").ok()?.parse().ok()?;
     let key = std::env::var("RESILISS_E2E_KEY").ok()?;
     let host_pub = std::fs::read_to_string(std::env::var("RESILISS_E2E_HOSTKEY").ok()?).ok()?;

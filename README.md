@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/dushuning/ResiliSSH/actions/workflows/ci.yml"><img src="https://github.com/dushuning/ResiliSSH/actions/workflows/ci.yml/badge.svg" alt="CI" /></a><br />
   English · <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
@@ -136,6 +137,8 @@ npm run tauri dev       # run with hot reload
 npm run check:i18n      # every UI string has an English translation
 cd src-tauri && cargo test
 ```
+
+End-to-end tests run against a throwaway `sshd` on `127.0.0.1` (no root, your `~/.ssh` is untouched): start `scripts/e2e-sshd.sh`, then follow the command printed in its header. CI runs them on every push.
 
 | Layer | Tech |
 |---|---|

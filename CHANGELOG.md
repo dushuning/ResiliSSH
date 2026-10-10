@@ -25,6 +25,7 @@
 - Faster transfers on high-latency links: the remote file stays open across blocks, and write slices adapt to the measured speed (about 3× faster at 100 ms RTT).
 - The webview runs under a strict Content Security Policy.
 - Frontend split from a single `main.ts` into focused modules under `src/app/`.
+- CI on every push: type check, translations, unit tests and end-to-end transfer tests against a real `sshd`.
 
 ### Fixed
 - A single failed `stat` could reset upload progress to zero or permanently fail a download.
