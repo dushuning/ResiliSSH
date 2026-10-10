@@ -24,8 +24,9 @@ use profiles::{
     ConnectionProfile, ProfileSecrets, SaveProfileRequest, UpdateProfileExtrasRequest,
 };
 use sftp::{
-    abort_socket, connect_session, create_remote_directory, download_with_resume,
-    format_remote_sftp_error, inspect_host_key, list_remote_directory, open_handshake, remote_file_name, remote_parent_status,
+    abort_socket, bytes_needed, connect_session, create_remote_directory, download_with_resume,
+    format_remote_sftp_error, inspect_host_key, list_remote_directory, local_sha256,
+    open_handshake, remote_free_bytes, remote_sha256, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
     run_remote_command as run_sftp_remote_command, CommandContext, CommandOutcome, DownloadCallbacks,
@@ -707,6 +708,65 @@ fn list_upload_history() -> Result<Vec<history::UploadHistoryEntry>, String> {
     list_history()
 }
 
+/// 上传预检中优先于续传/覆盖判断的两种结论：远端已是同一个文件（无需上传），
+/// 或远端空间不足（传到一半才失败不如现在就告诉用户）。都不成立时返回 None 走原流程。
+fn upload_preflight(
+    session: &ssh2::Session,
+    sftp: &ssh2::Sftp,
+    local_path: &std::path::Path,
+    remote_path: &str,
+    local_size: u64,
+    remote_size: u64,
+    verified_bytes: u64,
+) -> Option<(&'static str, String)> {
+    // 大小一致且没有进行中的续传，才值得比对哈希；正在续传的文件远端大小本来就不同。
+    let resuming = verified_bytes > 0 && verified_bytes < local_size;
+    if remote_size == local_size && local_size > 0 && !resuming {
+        if let (Some(remote), Some(local)) =
+            (remote_sha256(session, remote_path), local_sha256(local_path))
+        {
+            if remote == local {
+                activity::info(
+                    activity::Category::Verify,
+                    crate::tr!(
+                        format!("远端 {remote_path} 与本地文件 SHA-256 一致，无需上传"),
+                        format!("{remote_path} already matches the local file (SHA-256); skipping upload")
+                    ),
+                );
+                return Some((
+                    "identical",
+                    crate::tr!(
+                        "远端已有完全相同的文件（SHA-256 一致），无需上传",
+                        "The server already has an identical file (SHA-256 match); no upload needed"
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+
+    let dir = remote_path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d })?;
+    let free = remote_free_bytes(sftp, dir)?;
+    let needed = bytes_needed(local_size, remote_size.max(verified_bytes));
+    if free < needed {
+        let message = crate::tr!(
+            format!(
+                "远端磁盘空间不足：{dir} 剩余 {}，还需要 {}",
+                activity::format_bytes(free),
+                activity::format_bytes(needed)
+            ),
+            format!(
+                "Not enough space on the server: {} free in {dir}, {} needed",
+                activity::format_bytes(free),
+                activity::format_bytes(needed)
+            )
+        );
+        activity::error(activity::Category::Transfer, message.clone());
+        return Some(("insufficient_space", message));
+    }
+    None
+}
+
 #[tauri::command(async)]
 fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe, String> {
     if request.host.trim().is_empty() {
@@ -770,7 +830,19 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
         })
         .unwrap_or(0);
 
-    let (action, message) = if checkpoint.as_ref().is_some_and(|cp| {
+    let preflight = upload_preflight(
+        &session,
+        &sftp,
+        &local_path,
+        &actual_remote_path,
+        local_size,
+        remote_size,
+        verified_bytes,
+    );
+
+    let (action, message) = if let Some(preflight) = preflight {
+        preflight
+    } else if checkpoint.as_ref().is_some_and(|cp| {
         cp.failure_reason.as_deref() == Some("verify_read_failed")
             && cp.uploaded_bytes >= cp.file_size
     }) {

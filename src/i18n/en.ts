@@ -341,4 +341,11 @@ export const en: Record<string, string> = {
   "不保存密码：只在本次运行中使用，下次选择该服务器时需要重新输入": "Not saved: used for this session only — you'll be asked again next time",
   "「{name}」设置为不保存密码，请输入密码后连接": "“{name}” doesn't save its password — enter it to connect",
   "，密码不保存（仅本次使用）": ", password not saved (this session only)",
+  "远端 SHA-256 与本地一致": "Remote SHA-256 matches local",
+  "远端已是最新": "Already up to date",
+  "远端已有完全相同的文件，无需上传": "The server already has an identical file — nothing to upload",
+  "已是最新，跳过": "Up to date, skipped",
+  "开始后将直接完成，不会重新上传；如需重传请勾选「强制从头覆盖」": "Starting will finish immediately without re-uploading. Tick “Overwrite from scratch” to upload anyway",
+  "远端磁盘空间不足": "Not enough space on the server",
+  "请清理服务器空间或换一个目录后再试": "Free up space on the server or choose another folder, then try again",
 };

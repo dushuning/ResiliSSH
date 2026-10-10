@@ -100,7 +100,14 @@ interface RemoteUploadProbe {
   remote_size: number;
   local_size: number;
   verified_bytes: number;
-  action: "new" | "resume" | "overwrite" | "full_reupload" | "verify_retry";
+  action:
+    | "new"
+    | "resume"
+    | "overwrite"
+    | "full_reupload"
+    | "verify_retry"
+    | "identical"
+    | "insufficient_space";
   message: string;
 }
 
@@ -853,6 +860,24 @@ function analyzeProbeState(
   }
 
   const action = probe.action;
+  if (action === "identical") {
+    return {
+      kind: "info",
+      title: t("远端已是最新"),
+      detail: probe.message,
+      hint: t("开始后将直接完成，不会重新上传；如需重传请勾选「强制从头覆盖」"),
+      showClear: false,
+    };
+  }
+  if (action === "insufficient_space") {
+    return {
+      kind: "error",
+      title: t("远端磁盘空间不足"),
+      detail: probe.message,
+      hint: t("请清理服务器空间或换一个目录后再试"),
+      showClear: false,
+    };
+  }
   if (action === "verify_retry") {
     return {
       kind: "info",
@@ -1416,17 +1441,52 @@ function setSelectedUploads(paths: string[]) {
 
 async function startUploadFlow() {
   await prepareConnection();
-  await startOneUpload();
+  const outcome = await startOneUpload();
+  if (outcome === "identical") await finishIdenticalUpload();
+}
+
+/**
+ * 远端已有完全相同的文件：不传输，直接按「已送达」收尾。
+ * 传完后命令照常执行——文件确实已在服务器上且校验一致，部署流程不应因为「没变化」而中断。
+ */
+async function finishIdenticalUpload() {
+  runDirection = "upload";
+  beginRunVisuals();
+  showTransferView("run");
+  const size = lastProbe?.local_size ?? 0;
+  blockMap.update(size, size);
+  blockMap.setPhase("completed");
+  showVerifySummary(t("远端 SHA-256 与本地一致"));
+  await finishSuccessfulRun(
+    t("远端已是最新"),
+    t("远端已有完全相同的文件，无需上传"),
+    { elapsedMs: 0, movedBytes: 0, retries: 0 },
+    [runRemotePath],
+  );
 }
 
 /**
  * 预检、确认、启动一个上传。返回 false 表示用户在确认框里放弃了这个文件。
  * 单文件与队列共用：队列只是对每个文件依次调用它，续传、校验等行为完全一致。
  */
-async function startOneUpload(): Promise<boolean> {
+type UploadStart = "started" | "declined" | "identical";
+
+async function startOneUpload(): Promise<UploadStart> {
   const probe = await probeRemoteUpload();
+  // 空间不足时直接拦下：传到 90% 才因磁盘满失败，比现在就报错糟糕得多。
+  if (probe.action === "insufficient_space") {
+    showProbeResult(probe);
+    throw new Error(probe.message);
+  }
+  // 勾了「强制从头覆盖」说明用户明确要重传，此时不走跳过逻辑。
+  if (probe.action === "identical" && !forceOverwriteInput.checked) {
+    showProbeResult(probe);
+    runRemotePath = probe.resolved_remote_path;
+    runPostCommandTemplate = postCommandInput.value.trim();
+    return "identical";
+  }
   const confirmed = await confirmUploadAction(probe);
-  if (!confirmed) return false;
+  if (!confirmed) return "declined";
 
   const forceOverwrite =
     probe.action === "full_reupload" || forceOverwriteInput.checked;
@@ -1442,7 +1502,7 @@ async function startOneUpload(): Promise<boolean> {
   showProgressSpeed(t("正在建立 SSH 连接…"));
 
   await invokeStartUpload(forceOverwrite);
-  return true;
+  return "started";
 }
 
 /**
@@ -1473,7 +1533,7 @@ async function startQueueFlow() {
       const step = new Promise<RunStepResult>((resolve) => {
         resolveQueueStep = resolve;
       });
-      let started: boolean;
+      let started: UploadStart;
       try {
         started = await startOneUpload();
       } catch (error) {
@@ -1483,10 +1543,18 @@ async function startQueueFlow() {
         item.message = clarifyTransferError(describeError(error));
         continue;
       }
-      if (!started) {
+      if (started === "declined") {
         resolveQueueStep = null;
         item.status = "skipped";
         item.message = t("已跳过");
+        continue;
+      }
+      if (started === "identical") {
+        // 与远端完全一致视为已送达：计入成功，队列结束后的命令照常执行。
+        resolveQueueStep = null;
+        item.status = "done";
+        item.remote = runRemotePath;
+        item.message = t("已是最新，跳过");
         continue;
       }
       item.remote = runRemotePath;
@@ -3529,6 +3597,8 @@ function showResult(
     [t("本次传输"), formatBytes(stats.movedBytes)],
     [stats.retries > 0 ? t("自动重连") : t("平均速度"), stats.retries > 0 ? t("{retries} 次", { retries: stats.retries }) : `${formatBytes(avg)}/s`],
   ];
+  // 没有实际传输（如远端已是最新）时，用时、速度都没有意义。
+  resultStats.classList.toggle("hidden", stats.movedBytes === 0 && stats.retries === 0);
   resultStats.replaceChildren(
     ...rows.map(([label, value]) => {
       const item = document.createElement("div");

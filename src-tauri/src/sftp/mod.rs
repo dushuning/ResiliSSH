@@ -5,6 +5,7 @@ mod errors;
 
 pub use errors::is_remote_path_message;
 mod host_key;
+mod preflight;
 mod remote_command;
 mod upload;
 
@@ -13,6 +14,7 @@ pub use client::{
     abort_socket, connect_session, open_handshake, test_connection, AuthMethod, ConnectionConfig,
 };
 pub use host_key::{inspect_host_key, trust_host_key, HostKeyInfo};
+pub use preflight::{bytes_needed, local_sha256, remote_free_bytes, remote_sha256};
 pub use remote_command::{run_remote_command, CommandContext, CommandOutcome};
 pub use download::{
     download_with_resume, remote_file_name, resolve_local_path, DownloadCallbacks, DownloadError,
