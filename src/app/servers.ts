@@ -7,6 +7,8 @@ import { authTypeSelect, hostInput, hostSelect, jumpProfileSelect, keyPassphrase
 import { state } from "./state";
 import { ConnectionProfile, SshHostEntry } from "./types";
 
+const DEFAULT_SSH_PORT = 22;
+
 /** 最近使用的目录最多列几个：太多会把收藏挤出视野。 */
 export const RECENT_DIR_LIMIT = 6;
 
@@ -257,12 +259,24 @@ export function highlightSelectedServer() {
 
 /** 新建：清空编辑表单并取消选中，避免用户在已有服务器上改着改着覆盖了它。 */
 export function startNewServer() {
+  hostSelect.value = "";
+  resetServerForm();
+  profileNameInput.focus();
+}
+
+
+/**
+ * 清空编辑表单的所有连接字段。任何一项漏清都会被带进新服务器：
+ * 曾出现过上一台的私钥路径残留，保存后新服务器拿着别人的私钥去认证。
+ */
+function resetServerForm() {
   profileSelect.value = "";
   profileNameInput.value = "";
-  hostSelect.value = "";
   hostInput.value = "";
-  portInput.value = "22";
+  portInput.value = String(DEFAULT_SSH_PORT);
   usernameInput.value = "";
+  authTypeSelect.value = "key";
+  keyPathInput.value = "";
   passwordInput.value = "";
   keyPassphraseInput.value = "";
   rememberSecretsInput.checked = true;
@@ -270,7 +284,6 @@ export function startNewServer() {
   setConnectionStatus("");
   updateAuthFields();
   updateConnectionSummary();
-  profileNameInput.focus();
 }
 
 
@@ -289,6 +302,8 @@ export async function applyHostSelection(alias: string) {
   if (!alias) return;
   const entry = await invoke<SshHostEntry | null>("get_host", { alias });
   if (!entry) return;
+  // 导入即新建一台服务器：从空白表单开始，ssh config 没写的字段不能沿用之前选中的服务器。
+  resetServerForm();
 
   if (entry.hostname) hostInput.value = entry.hostname;
   if (entry.user) usernameInput.value = entry.user;
