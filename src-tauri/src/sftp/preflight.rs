@@ -15,16 +15,65 @@ use std::time::SystemTime;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const SHA256_HEX_LEN: usize = 64;
 
-/// 远端目录所在文件系统的可用字节数（普通用户可用的部分，即 f_bavail）。
-pub fn remote_free_bytes(sftp: &Sftp, dir: &str) -> Option<u64> {
-    let mut handle = sftp.opendir(Path::new(dir)).ok()?;
-    let vfs = handle.statvfs().ok()?;
-    // f_frsize 是 f_bavail 的计量单位；个别实现填 0，此时退回 f_bsize。
-    let unit = if vfs.f_frsize > 0 { vfs.f_frsize } else { vfs.f_bsize };
-    if unit == 0 {
-        return None;
+/// f_frsize 是 f_bavail 的计量单位；个别实现填 0，此时退回 f_bsize。
+/// （ssh2 未公开 statvfs 结构体的类型名，所以按字段传入。）
+fn available_bytes(frsize: u64, bsize: u64, bavail: u64) -> Option<u64> {
+    let unit = if frsize > 0 { frsize } else { bsize };
+    (unit > 0).then(|| bavail.saturating_mul(unit))
+}
+
+/// 远端目标文件所在文件系统的可用字节数（普通用户可用的部分）。依次尝试：
+/// 1. 目标文件已存在时，对文件句柄做 fstatvfs——OpenSSH 只支持对文件句柄查询，目录句柄会失败；
+/// 2. 在服务器上执行 `df -Pk`，对象是最近一个已存在的上级目录（文件夹上传的子目录往往还没建）；
+/// 3. 目录句柄 fstatvfs（部分非 OpenSSH 服务器支持）。
+pub fn remote_free_bytes(session: &Session, sftp: &Sftp, remote_file: &str) -> Option<u64> {
+    if let Ok(mut file) = sftp.open(Path::new(remote_file)) {
+        if let Some(free) = file
+            .statvfs()
+            .ok()
+            .and_then(|v| available_bytes(v.f_frsize, v.f_bsize, v.f_bavail))
+        {
+            return Some(free);
+        }
     }
-    Some(vfs.f_bavail.saturating_mul(unit))
+    let dir = nearest_existing_dir(sftp, remote_file)?;
+    if let Some(free) = df_available(session, &dir) {
+        return Some(free);
+    }
+    let mut handle = sftp.opendir(Path::new(&dir)).ok()?;
+    let vfs = handle.statvfs().ok()?;
+    available_bytes(vfs.f_frsize, vfs.f_bsize, vfs.f_bavail)
+}
+
+/// 最多向上找几级：再往上通常已经是挂载点之外，得到的空间信息没有参考意义。
+const MAX_ANCESTOR_LOOKUP: usize = 8;
+
+fn nearest_existing_dir(sftp: &Sftp, remote_file: &str) -> Option<String> {
+    Path::new(remote_file)
+        .ancestors()
+        .skip(1)
+        .take(MAX_ANCESTOR_LOOKUP)
+        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| if p.is_empty() { ".".to_string() } else { p })
+        .find(|p| sftp.stat(Path::new(p)).is_ok_and(|st| st.is_dir()))
+}
+
+fn df_available(session: &Session, dir: &str) -> Option<u64> {
+    let mut channel = session.channel_session().ok()?;
+    channel.exec(&format!("df -Pk -- {} 2>/dev/null", shell_quote(dir))).ok()?;
+    let mut output = String::new();
+    channel.read_to_string(&mut output).ok()?;
+    let _ = channel.wait_close();
+    parse_df_available_kb(&output).map(|kb| kb.saturating_mul(1024))
+}
+
+/// 解析 `df -Pk` 的「可用」列（单位 KB）。从使用率列（以 % 结尾）往前取一列，
+/// 而不是按固定下标：文件系统名里可能有空格，固定下标会取错。
+fn parse_df_available_kb(output: &str) -> Option<u64> {
+    let line = output.lines().filter(|l| !l.trim().is_empty()).last()?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let pct = fields.iter().rposition(|f| f.ends_with('%'))?;
+    fields.get(pct.checked_sub(1)?)?.parse().ok()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -109,6 +158,15 @@ mod tests {
         assert_eq!(parse_sha256_output(""), None);
         assert_eq!(parse_sha256_output("sh: sha256sum: command not found"), None);
         assert_eq!(parse_sha256_output("abc123  file"), None);
+    }
+
+    #[test]
+    fn parses_df_available_column() {
+        let linux = "Filesystem     1024-blocks    Used Available Capacity Mounted on\n/dev/sda1  41152812 9876543  29152345      26% /\n";
+        assert_eq!(parse_df_available_kb(linux), Some(29_152_345));
+        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on\nmy disk 100 40 60 40% /Volumes/my disk\n";
+        assert_eq!(parse_df_available_kb(spaced), Some(60));
+        assert_eq!(parse_df_available_kb("df: /nope: No such file or directory"), None);
     }
 
     #[test]

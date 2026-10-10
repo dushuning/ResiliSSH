@@ -25,7 +25,14 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
+/// 覆盖数据目录的环境变量：端到端测试用它把断点、已信任指纹等写到临时目录，
+/// 不污染用户真实的应用数据；也可用于同时运行多个互不干扰的实例。
+pub const DATA_DIR_ENV: &str = "RESILISS_DATA_DIR";
+
 pub fn app_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sshutil")

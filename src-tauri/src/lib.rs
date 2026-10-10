@@ -4,6 +4,8 @@ mod download_checkpoint;
 mod history;
 mod i18n;
 mod local_files;
+#[cfg(test)]
+mod e2e_tests;
 mod profiles;
 mod retry;
 mod secrets;
@@ -752,8 +754,8 @@ fn upload_preflight(
         }
     }
 
-    let dir = remote_path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d })?;
-    let free = remote_free_bytes(sftp, dir)?;
+    let free = remote_free_bytes(session, sftp, remote_path)?;
+    let dir = remote_path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
     let needed = bytes_needed(local_size, remote_size.max(verified_bytes));
     if free < needed {
         let message = crate::tr!(
