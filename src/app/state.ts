@@ -59,6 +59,9 @@ export const state = {
   selectedDownloads: [] as string[],
   /** 文件夹下载时每个远端文件相对所选文件夹的目录，用于在本地还原目录结构；与 uploadRelDirs 对称。 */
   downloadRelDirs: new Map<string, string>(),
+  /** 当初选择的路径（拖入的文件夹、勾选的文件等），批量历史据此一键复用。 */
+  uploadRoots: [] as string[],
+  downloadRoots: [] as string[],
   downloadSizes: new Map<string, number>(),
   /** 队列执行中的状态；为 null 表示当前是普通单文件传输。 */
   activeQueue: null as ActiveQueue | null,

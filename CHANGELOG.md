@@ -16,6 +16,7 @@
 - Batch transfers ask once before starting, with a count of new files and files that will replace existing ones, instead of asking for every existing file (re-uploading a `dist/` folder used to mean hundreds of prompts).
 
 ### Fixed
+- A batch transfer no longer floods the history (which keeps the last 30 entries): the whole batch is recorded as one entry — e.g. “dist/ · 238 files” with how many succeeded — and Reuse re-expands the original selection, picking up files added since.
 - Clearing a checkpoint, or starting a different transfer that replaces it, now deletes the abandoned `.resiliss-part` temporary file (locally for downloads, on the server for uploads when connected to that server). If it cannot be removed, the checkpoint is still cleared and the leftover path is shown and logged.
 - “New” server and “Import from ~/.ssh/config” no longer carry over the previous server's authentication type and private key path.
 

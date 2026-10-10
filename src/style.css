@@ -1594,6 +1594,13 @@ input[type="radio"] {
   text-overflow: ellipsis;
 }
 
+/* 无法复用的批量记录：占住按钮的位置，说明原因而不是让按钮凭空消失。 */
+.entry-note {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
 .entry-meta {
   font-size: 11.5px;
   color: var(--text-tertiary);

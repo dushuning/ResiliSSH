@@ -7,7 +7,7 @@ import { showConfirm } from "./dialogs";
 import { authTypeSelect, historyList, hostInput, keyPathInput, localPathInput, navHistoryBadge, pendingList, pendingSection, portInput, profileSelect, remotePathInput, statusText, transferBtn, usernameInput } from "./dom";
 import { fileNameOf, formatBytes, formatTime } from "./format";
 import { showPage } from "./nav";
-import { updateDropZoneState, updateResolvedPathHint } from "./paths";
+import { selectLocalPathsExpanded, selectRemotePathsExpanded, updateDropZoneState, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe, updateTransferStatePanel } from "./probe";
 import { setProgressState, setStatus } from "./progress";
 import { applyProfile, findProfileFor, restoreCredentialsFromProfile, setJumpSelection } from "./servers";
@@ -122,9 +122,16 @@ export function renderHistory() {
       const direction: TransferDirection = entry.direction === "download" ? "download" : "upload";
       const row = document.createElement("div");
       row.className = "history-row";
-      const name = fileNameOf(direction === "download" ? entry.remote_path : entry.local_path);
+      const batch = entry.batch;
+      const name = batch?.label ?? fileNameOf(direction === "download" ? entry.remote_path : entry.local_path);
       const retries = entry.retry_count > 0 ? t(" · 重连 {retry_count} 次", { retry_count: entry.retry_count }) : "";
-      const meta = `${entry.username}@${entry.host} · ${formatBytes(entry.file_size)} · ${formatTime(entry.finished_at)}${retries}`;
+      // 批量记录写出成功了几个：「完成」「失败」的状态标签本身说明不了部分成功的程度。
+      const count = batch
+        ? batch.done_count === batch.file_count
+          ? t("{count} 个文件", { count: batch.file_count }) + " · "
+          : t("{done} / {count} 个文件成功", { done: batch.done_count, count: batch.file_count }) + " · "
+        : "";
+      const meta = `${entry.username}@${entry.host} · ${count}${formatBytes(entry.file_size)} · ${formatTime(entry.finished_at)}${retries}`;
       const chip = document.createElement("span");
       chip.className = `status-chip ${entry.status}`;
       chip.textContent = HISTORY_STATUS_LABEL[entry.status] ?? entry.status;
@@ -133,11 +140,21 @@ export function renderHistory() {
         entryIcon(direction),
         entryMain(name, meta),
         chip,
-        makeButton(t("复用"), "btn btn-secondary btn-small", () => void reuseHistoryEntry(entry)),
+        batch && batch.roots.length === 0
+          ? reuseUnavailableNote()
+          : makeButton(t("复用"), "btn btn-secondary btn-small", () => void reuseHistoryEntry(entry)),
       );
       return row;
     }),
   );
+}
+
+
+function reuseUnavailableNote(): HTMLSpanElement {
+  const note = document.createElement("span");
+  note.className = "entry-note";
+  note.textContent = t("选择过多，无法复用");
+  return note;
 }
 
 
@@ -156,14 +173,32 @@ export async function reuseHistoryEntry(entry: UploadHistoryEntry) {
     setJumpSelection(null);
     updateConnectionSummary();
   }
+  showTransferView("compose");
+  showPage("transfer");
+  if (entry.batch) {
+    await reuseBatch(entry);
+    return;
+  }
   localPathInput.value = entry.local_path;
   remotePathInput.value = entry.remote_path;
   updateDropZoneState();
   updateResolvedPathHint();
   clearProbeResult();
-  showTransferView("compose");
-  showPage("transfer");
   scheduleBackgroundProbe();
+}
+
+
+/** 按当初选择的路径重新展开：文件夹里新增或删掉的文件都会如实反映。 */
+async function reuseBatch(entry: UploadHistoryEntry) {
+  const roots = entry.batch?.roots ?? [];
+  if (entry.direction === "download") {
+    localPathInput.value = entry.local_path;
+    await selectRemotePathsExpanded(roots);
+  } else {
+    remotePathInput.value = entry.remote_path;
+    await selectLocalPathsExpanded(roots);
+  }
+  updateResolvedPathHint();
 }
 
 

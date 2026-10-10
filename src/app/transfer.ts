@@ -189,6 +189,8 @@ export function uploadPayload(forceOverwrite: boolean) {
     remote_path: remotePathInput.value.trim(),
     strict_chunk_verify: isReliableMode(),
     force_overwrite: forceOverwrite,
+    // 批量中的文件由队列结束时整体记一条历史，避免一次批量挤掉全部历史。
+    in_batch: Boolean(state.activeQueue),
   };
 }
 
@@ -200,6 +202,7 @@ export function downloadPayload(forceOverwrite: boolean) {
     remote_path: remotePathInput.value.trim(),
     strict_chunk_verify: isReliableMode(),
     force_overwrite: forceOverwrite,
+    in_batch: Boolean(state.activeQueue),
   };
 }
 

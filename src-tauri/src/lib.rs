@@ -170,6 +170,9 @@ struct StartUploadRequest {
     strict_chunk_verify: Option<bool>,
     #[serde(default)]
     force_overwrite: Option<bool>,
+    /// 属于一次批量传输：逐个文件不写历史，由前端在批量结束时整体记一条。
+    #[serde(default)]
+    in_batch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +238,9 @@ struct StartDownloadRequest {
     strict_chunk_verify: Option<bool>,
     #[serde(default)]
     force_overwrite: Option<bool>,
+    /// 属于一次批量传输：逐个文件不写历史，由前端在批量结束时整体记一条。
+    #[serde(default)]
+    in_batch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -560,6 +566,12 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
     };
     let config = build_connection_config(&conn)?;
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
+}
+
+/// 批量传输结束时由前端整体记一条历史（逐个文件在批量中不记，见 StartUploadRequest::in_batch）。
+#[tauri::command]
+fn record_batch_history(entry: history::UploadHistoryEntry) -> Result<(), String> {
+    history::record_batch(entry)
 }
 
 /// 批量上传前统计远端已有多少同名文件（只连接一次），供一次性确认。
@@ -1674,6 +1686,7 @@ fn start_upload(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
+    let record_history = !request.in_batch;
     let worker = thread::spawn(move || {
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path),
@@ -1847,17 +1860,19 @@ fn start_upload(
                         activity::Category::Transfer,
                         format!("{message} · {}", activity::format_bytes(cp.file_size)),
                     );
-                    record_upload_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "completed",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_upload_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "completed",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     send_desktop_notification(&app, "ResiliSSH", &message);
                     let _ = app.emit(
                         "upload-progress",
@@ -1899,17 +1914,19 @@ fn start_upload(
                             )
                         ),
                     );
-                    record_upload_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "cancelled",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_upload_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "cancelled",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     let _ = app.emit(
                         "upload-progress",
                         UploadProgressEvent {
@@ -1942,17 +1959,19 @@ fn start_upload(
                         format_upload_failure(&err, &cp.remote_path, cp.retry_count)
                     };
                     activity::error(activity::classify_failure(&message), message.clone());
-                    record_upload_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "failed",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_upload_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "failed",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     send_desktop_notification(
                         &app,
                         crate::tr!("ResiliSSH 上传失败", "ResiliSSH Upload failed"),
@@ -2254,6 +2273,7 @@ fn start_download(
     let username_for_history = request.username.clone();
     let port_for_history = request.port;
 
+    let record_history = !request.in_batch;
     let worker = thread::spawn(move || {
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string),
@@ -2423,17 +2443,19 @@ fn start_download(
                         activity::Category::Transfer,
                         format!("{message} · {}", activity::format_bytes(cp.file_size)),
                     );
-                    record_download_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "completed",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_download_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "completed",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     send_desktop_notification(&app, "ResiliSSH", &message);
                     let _ = app.emit(
                         "download-progress",
@@ -2475,17 +2497,19 @@ fn start_download(
                             )
                         ),
                     );
-                    record_download_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "cancelled",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_download_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "cancelled",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     let _ = app.emit(
                         "download-progress",
                         DownloadProgressEvent {
@@ -2518,17 +2542,19 @@ fn start_download(
                         format_download_failure(&err, &cp.remote_path, cp.retry_count)
                     };
                     activity::error(activity::classify_failure(&message), message.clone());
-                    record_download_result(
-                        &cp.local_path,
-                        &cp.remote_path,
-                        &host_for_history,
-                        port_for_history,
-                        &username_for_history,
-                        cp.file_size,
-                        "failed",
-                        cp.retry_count,
-                        Some(message.clone()),
-                    );
+                    if record_history {
+                        record_download_result(
+                            &cp.local_path,
+                            &cp.remote_path,
+                            &host_for_history,
+                            port_for_history,
+                            &username_for_history,
+                            cp.file_size,
+                            "failed",
+                            cp.retry_count,
+                            Some(message.clone()),
+                        );
+                    }
                     send_desktop_notification(
                         &app,
                         crate::tr!("ResiliSSH 下载失败", "ResiliSSH Download failed"),
@@ -2689,6 +2715,7 @@ pub fn run() {
             expand_local_paths,
             expand_remote_paths,
             remote_paths_exist,
+            record_batch_history,
             local_paths_exist,
             local_file_digests,
             save_text_file,

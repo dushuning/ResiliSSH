@@ -420,4 +420,7 @@ export const en: Record<string, string> = {
   "确定清除下载断点？\n\n下次下载将从头开始，已下载的部分（临时文件）会一并删除；本地原有的同名文件不受影响。": "Clear the download checkpoint?\n\nThe next download starts from the beginning and the partly downloaded temporary file is deleted. An existing local file with the same name is not touched.",
   "确定清除上传断点？\n\n下次上传将从头开始，服务器上已传的部分（临时文件）会一并删除；远端原有的同名文件不受影响。": "Clear the upload checkpoint?\n\nThe next upload starts from the beginning and the partly uploaded temporary file on the server is deleted. An existing remote file with the same name is not touched.",
   "断点记录已清除，但服务器上的临时文件 {path} 未能删除，可手动删除": "Checkpoint cleared, but the temporary file {path} on the server could not be removed; you can delete it manually",
+  "{count} 个文件": "{count} files",
+  "{done} / {count} 个文件成功": "{done} of {count} files succeeded",
+  "选择过多，无法复用": "Too many items to reuse",
 };

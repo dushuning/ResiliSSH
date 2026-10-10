@@ -5,9 +5,10 @@ import { clarifyTransferError } from "./backendText";
 import { showCommandResult } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { showConfirm } from "./dialogs";
-import { forceOverwriteInput, hostInput, localPathInput, postCommandInput, queueChip, remotePathInput, resultFiles } from "./dom";
+import { forceOverwriteInput, hostInput, localPathInput, portInput, postCommandInput, queueChip, remotePathInput, resultFiles, usernameInput } from "./dom";
 import { asDir, describeError, fileNameOf } from "./format";
 import { setSelectedDownloads, setSelectedUploads } from "./paths";
+import { loadHistory } from "./history";
 import { hideVerifySummary, setStatus } from "./progress";
 import { state } from "./state";
 import { finishSuccessfulRun, setTransferring, showResult, startOneDownload, startOneUpload, verificationModeText } from "./transfer";
@@ -33,6 +34,7 @@ export async function startQueueFlow() {
   const template = postCommandInput.value.trim();
   const sources = download ? [...state.selectedDownloads] : [...state.selectedUploads];
   const relDirs = new Map(download ? state.downloadRelDirs : state.uploadRelDirs);
+  const roots = [...(download ? state.downloadRoots : state.uploadRoots)];
   const sizes = new Map(download ? state.downloadSizes : state.uploadSizes);
   const queue = {
     items: sources.map<QueueItem>((source) => {
@@ -127,7 +129,7 @@ export async function startQueueFlow() {
     queueChip.classList.add("hidden");
     baseInput.value = baseDir;
   }
-  await finishQueue(queue.items, template, queueStartedAt, direction, { relDirs, sizes });
+  await finishQueue(queue.items, template, queueStartedAt, direction, { relDirs, sizes, roots, baseDir });
 }
 
 
@@ -169,12 +171,68 @@ async function confirmBatch(items: QueueItem[], download: boolean): Promise<bool
 }
 
 
+/** 批量的展示名：来自同一个文件夹时以文件夹为主（如「dist/」），否则写文件数。 */
+function batchLabel(items: QueueItem[], relDirs: Map<string, string>): string {
+  const tops = new Set(items.map((i) => (relDirs.get(i.source) ?? "").split("/")[0]));
+  if (tops.size === 1 && !tops.has("")) return `${[...tops][0]}/`;
+  return t("{count} 个文件", { count: items.length });
+}
+
+
+/**
+ * 批量整体记一条历史（含取消、部分失败）。逐个文件记录会让一次几百个文件的批量把历史全部挤掉。
+ * 写历史失败不影响结果页，只记控制台。
+ */
+async function recordBatchHistory(
+  items: QueueItem[],
+  direction: TransferDirection,
+  selection: { relDirs: Map<string, string>; sizes: Map<string, number>; roots: string[]; baseDir: string },
+  stats: RunStats,
+  cancelled: boolean,
+) {
+  const download = direction === "download";
+  const done = items.filter((i) => i.status === "done");
+  const failed = items.filter((i) => i.status === "failed");
+  const status = done.length === items.length ? "completed" : cancelled ? "cancelled" : "failed";
+  const firstRoot = selection.roots[0] ?? "";
+  try {
+    await invoke("record_batch_history", {
+      entry: {
+        id: "",
+        // 上传：本地是当初选择的路径、远端是目标目录；下载反之。复用时据此回填。
+        local_path: download ? selection.baseDir : firstRoot,
+        remote_path: download ? firstRoot : selection.baseDir,
+        host: hostInput.value.trim(),
+        port: Number(portInput.value) || 22,
+        username: usernameInput.value.trim(),
+        file_size: done.reduce((sum, i) => sum + (selection.sizes.get(i.source) ?? 0), 0),
+        status,
+        retry_count: stats.retries,
+        finished_at: 0,
+        message: failed.length > 0 ? failed.map((i) => `${i.label}: ${i.message ?? ""}`).slice(0, 5).join("\n") : null,
+        direction,
+        batch: {
+          label: batchLabel(items, selection.relDirs),
+          file_count: items.length,
+          done_count: done.length,
+          failed_count: failed.length,
+          roots: selection.roots,
+        },
+      },
+    });
+  } catch (error) {
+    console.warn("failed to record batch history", error);
+  }
+  void loadHistory();
+}
+
+
 export async function finishQueue(
   items: QueueItem[],
   template: string,
   startedAt: number,
   direction: TransferDirection,
-  selection: { relDirs: Map<string, string>; sizes: Map<string, number> },
+  selection: { relDirs: Map<string, string>; sizes: Map<string, number>; roots: string[]; baseDir: string },
 ) {
   const download = direction === "download";
   const done = items.filter((i) => i.status === "done");
@@ -185,6 +243,7 @@ export async function finishQueue(
   };
   const cancelled = items.some((i) => i.status === "cancelled");
   const total = items.length;
+  await recordBatchHistory(items, direction, selection, stats, cancelled);
   renderQueueResultFiles(items);
   // 选择只保留没成功的文件：之后点「重试 / 继续传输」不会把已完成的文件再传一遍。
   const remaining = items.filter((i) => i.status !== "done").map((i) => i.source);
@@ -199,6 +258,10 @@ export async function finishQueue(
   } else {
     setSelectedUploads(keep, keepEntries);
   }
+  // 有文件没成功时，选择只剩这些文件；下次的批量历史也应如实反映「只传了这些」。
+  const nextRoots = remaining.length > 0 ? remaining : selection.roots;
+  if (download) state.downloadRoots = nextRoots;
+  else state.uploadRoots = nextRoots;
 
   if (done.length === total) {
     state.runPostCommandTemplate = template;

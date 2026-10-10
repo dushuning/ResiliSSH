@@ -65,6 +65,18 @@ export interface UploadHistoryEntry {
   finished_at: number;
   message: string | null;
   direction?: string;
+  /** 批量传输整体一条记录；单文件传输为空。 */
+  batch?: BatchSummary | null;
+}
+
+
+export interface BatchSummary {
+  label: string;
+  file_count: number;
+  done_count: number;
+  failed_count: number;
+  /** 当初选择的路径，复用时重新展开；选择过多时为空，表示不能一键复用。 */
+  roots: string[];
 }
 
 

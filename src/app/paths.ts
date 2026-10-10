@@ -5,6 +5,7 @@ import { type PopoverItem } from "../ui/popover";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { connectionPayload, prepareConnection } from "./connection";
 import { bookmarkBtn, dropZone, fileChip, fileChipName, fileChipPath, hostInput, localPathInput, pathMenu, portInput, remotePathInput, resolvedPathHint, usernameInput } from "./dom";
 import { asDir, describeError, fileNameOf, formatBytes, remoteDirOf } from "./format";
 import { showPage } from "./nav";
@@ -68,6 +69,34 @@ export async function selectLocalPathsExpanded(paths: string[]) {
       expanded.entries.map((e) => e.path),
       expanded.entries,
     );
+    state.uploadRoots = [...paths];
+    reportExpansionWarnings(expanded);
+  } catch (error) {
+    setStatus(describeError(error), "error");
+  }
+}
+
+
+/** 在服务器上展开远端路径（文件夹递归）。远端浏览确认选择、复用批量历史都走这里。 */
+export async function expandRemotePaths(paths: string[]): Promise<ExpandedPaths> {
+  await prepareConnection();
+  return invoke<ExpandedPaths>("expand_remote_paths", {
+    request: { ...connectionPayload(), paths },
+  });
+}
+
+
+/** 复用批量下载历史：重新展开当初勾选的远端路径作为待下载列表。 */
+export async function selectRemotePathsExpanded(paths: string[]) {
+  if (paths.length === 0) return;
+  try {
+    const expanded = await expandRemotePaths(paths);
+    if (expanded.entries.length === 0) {
+      setStatus(t("所选文件夹里没有可下载的文件"), "error");
+      return;
+    }
+    setSelectedDownloads(expanded.entries.map((e) => e.path), expanded.entries);
+    state.downloadRoots = [...paths];
     reportExpansionWarnings(expanded);
   } catch (error) {
     setStatus(describeError(error), "error");
@@ -186,6 +215,7 @@ export function updateDropZoneState() {
   // 路径被程序直接改写（复用历史、恢复断点、手动输入）时，退回单文件选择。
   if (!isDownloadMode() && state.selectedUploads[0] !== path) {
     state.selectedUploads = path ? [path] : [];
+    state.uploadRoots = path ? [path] : [];
     state.uploadRelDirs = new Map();
     state.uploadSizes = new Map();
   }
@@ -263,6 +293,7 @@ export function updateResolvedPathHint() {
   if (isDownloadMode() && state.selectedDownloads[0] !== remotePathInput.value.trim()) {
     const remote = remotePathInput.value.trim();
     state.selectedDownloads = remote ? [remote] : [];
+    state.downloadRoots = remote ? [remote] : [];
     state.downloadRelDirs = new Map();
     state.downloadSizes = new Map();
   }

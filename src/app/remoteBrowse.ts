@@ -6,12 +6,12 @@ import { connectionPayload, ensureCredentialsLoaded, prepareConnection, validate
 import { CONFIRM_ANIM_MS } from "./constants";
 import { browseRemoteBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseHint, remoteBrowseList, remoteBrowseNewDirName, remoteBrowseNewDirRow, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseStatus, remoteBrowseTitle, remoteBrowseUpBtn, remotePathInput } from "./dom";
 import { describeError, formatBytes } from "./format";
-import { reportExpansionWarnings, setSelectedDownloads, updateResolvedPathHint } from "./paths";
+import { expandRemotePaths, reportExpansionWarnings, setSelectedDownloads, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
 import { setStatus } from "./progress";
 import { state } from "./state";
 import { isDownloadMode } from "./transfer";
-import { ExpandedPaths, RemoteDirEntry, RemoteDirListing } from "./types";
+import { RemoteDirEntry, RemoteDirListing } from "./types";
 
 export function updateRemoteBrowseModeUi() {
   const download = isDownloadMode();
@@ -96,16 +96,14 @@ export async function applyRemoteDownloadPicks(picked: string[]) {
       picked,
       picked.map((path) => ({ path, rel_dir: "", size: sizes.get(path) ?? 0 })),
     );
+    state.downloadRoots = [...picked];
     closeRemoteBrowseOverlay();
     return;
   }
   remoteBrowseSelectDirBtn.disabled = true;
   setRemoteBrowseStatus(t("正在列出文件夹内容…"));
   try {
-    await prepareConnection();
-    const expanded = await invoke<ExpandedPaths>("expand_remote_paths", {
-      request: { ...connectionPayload(), paths: picked },
-    });
+    const expanded = await expandRemotePaths(picked);
     if (expanded.entries.length === 0) {
       setRemoteBrowseStatus(t("所选文件夹里没有可下载的文件"), "error");
       return;
@@ -114,6 +112,7 @@ export async function applyRemoteDownloadPicks(picked: string[]) {
       expanded.entries.map((e) => e.path),
       expanded.entries,
     );
+    state.downloadRoots = [...picked];
     closeRemoteBrowseOverlay();
     reportExpansionWarnings(expanded);
   } catch (error) {
