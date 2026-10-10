@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- ResiliSSH 图标：水熊虫（最顽强的生物）＝ 断了也能接着传；右上角对勾 ＝ 送到了、校验通过。修改后运行 npm run icon 重新生成全部尺寸。 -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#19c2a8"/><stop offset="1" stop-color="#0a5bd6"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#d9f3ef"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <g transform="translate(470 560)">
+    <!-- 腿：四对短粗的腿，末端带小爪（水熊虫的标志特征） -->
+    <g fill="url(#body)">
+      <rect x="-212" y="40" width="66" height="112" rx="33"/>
+      <rect x="-92" y="56" width="66" height="112" rx="33"/>
+      <rect x="28" y="56" width="66" height="112" rx="33"/>
+      <rect x="140" y="40" width="66" height="112" rx="33"/>
+    </g>
+    <g stroke="#0b3a7a" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.75">
+      <path d="M-196 150 l-8 18 M-179 152 v20 M-162 150 l8 18"/>
+      <path d="M-76 166 l-8 18 M-59 168 v20 M-42 166 l8 18"/>
+      <path d="M44 166 l-8 18 M61 168 v20 M78 166 l8 18"/>
+      <path d="M156 150 l-8 18 M173 152 v20 M190 150 l8 18"/>
+    </g>
+    <!-- 身体：分节的胖桶形，上缘是一节节的弧 -->
+    <path fill="url(#body)" d="M-250 30
+      C-262 -60 -214 -120 -150 -122
+      C-120 -158 -60 -160 -30 -128
+      C 0 -164 70 -164 98 -126
+      C 140 -150 196 -128 214 -84
+      L 214 70
+      C 214 110 180 130 140 130
+      L -190 130
+      C -230 130 -252 96 -250 30 Z"/>
+    <g fill="none" stroke="#0a5bd6" stroke-opacity="0.16" stroke-width="12" stroke-linecap="round">
+      <path d="M-150 -110 q-14 110 0 230"/><path d="M-30 -118 q-14 118 0 240"/><path d="M98 -114 q-14 112 0 236"/>
+    </g>
+    <!-- 头：圆脑袋 + 前端的管状嘴 -->
+    <circle cx="232" cy="-6" r="112" fill="url(#body)"/>
+    <ellipse cx="338" cy="8" rx="38" ry="34" fill="url(#body)"/>
+    <ellipse cx="350" cy="8" rx="12" ry="14" fill="#0b3a7a" opacity="0.55"/>
+    <circle cx="262" cy="-40" r="17" fill="#0b3a7a"/>
+    <circle cx="268" cy="-46" r="5" fill="#ffffff"/>
+    <ellipse cx="236" cy="22" rx="22" ry="12" fill="#ff9db0" opacity="0.45"/>
+  </g>
+  <circle cx="752" cy="276" r="88" fill="#ffffff"/>
+  <path d="M708 278 l32 32 l60 -64" stroke="#16a35a" stroke-width="32" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

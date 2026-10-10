@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/app-logo.png" width="96" height="96" alt="ResiliSSH 图标" />
+  <img src="assets/brand/icon.svg" width="112" height="112" alt="ResiliSSH 图标" />
 </p>
 
 <h1 align="center">ResiliSSH</h1>
