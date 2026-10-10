@@ -802,6 +802,30 @@ input[type="radio"] {
   margin-left: auto;
 }
 
+/* 首次使用：还没有保存任何服务器时显示在传输页，一步导入 ~/.ssh/config 里的主机。 */
+.onboarding {
+  padding: 14px 16px;
+  border-radius: var(--radius-m);
+  border: 1px dashed var(--border);
+  font-size: 12.5px;
+}
+
+.onboarding-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.onboarding-detail {
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.onboarding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .state-panel {
   display: flex;
   align-items: flex-start;

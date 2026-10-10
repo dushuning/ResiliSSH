@@ -3,7 +3,8 @@ import { t } from "../i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { restorePostCommand } from "./command";
 import { loadProfileSecrets, sessionSecrets, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./connection";
-import { authTypeSelect, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, navServerCount, passwordInput, portInput, profileNameInput, profileSelect, rememberSecretsInput, serverList, usernameInput } from "./dom";
+import { authTypeSelect, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, navServerCount, onboarding, onboardingActions, onboardingDetail, passwordInput, portInput, profileNameInput, profileSelect, rememberSecretsInput, saveProfileBtn, serverList, usernameInput } from "./dom";
+import { showPage } from "./nav";
 import { state } from "./state";
 import { ConnectionProfile, SshHostEntry } from "./types";
 
@@ -139,6 +140,7 @@ export async function loadProfiles() {
   }
   renderJumpOptions();
   renderServerList();
+  renderOnboarding();
 }
 
 
@@ -287,14 +289,65 @@ function resetServerForm() {
 }
 
 
+/** ~/.ssh/config 里的主机别名，首次使用引导据此给出「一键导入」。 */
+let sshConfigAliases: string[] = [];
+/** 引导里最多列几个主机：多了会把传输页撑满，其余到「服务器」页的导入下拉框里选。 */
+const ONBOARDING_HOST_LIMIT = 6;
+
+
 export async function loadHosts() {
   const hosts = await invoke<SshHostEntry[]>("list_hosts");
+  sshConfigAliases = hosts.map((host) => host.alias);
   for (const host of hosts) {
     const option = document.createElement("option");
     option.value = host.alias;
     option.textContent = host.alias;
     hostSelect.appendChild(option);
   }
+  renderOnboarding();
+}
+
+
+/**
+ * 首次使用（还没有保存任何服务器）时在传输页给出下一步：原来只有一句「点编辑添加」，
+ * 而大多数人的 ~/.ssh/config 里已经有现成的主机，点一下就能导入。
+ */
+export function renderOnboarding() {
+  const show = state.savedProfiles.length === 0;
+  onboarding.classList.toggle("hidden", !show);
+  if (!show) return;
+  const aliases = sshConfigAliases.slice(0, ONBOARDING_HOST_LIMIT);
+  onboardingDetail.textContent = aliases.length > 0
+    ? t("在 ~/.ssh/config 里找到了这些主机，点一个即可导入：")
+    : t("填写主机、用户名和认证方式后保存，之后每次直接选择即可。");
+  const hostButtons = aliases.map((alias) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-secondary btn-small";
+    btn.textContent = alias;
+    btn.addEventListener("click", () => void importFromOnboarding(alias));
+    return btn;
+  });
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = aliases.length > 0 ? "btn btn-plain btn-small" : "btn btn-primary btn-small";
+  addBtn.textContent = aliases.length > 0 ? t("手动添加…") : t("添加服务器");
+  addBtn.addEventListener("click", () => {
+    showPage("servers");
+    startNewServer();
+  });
+  onboardingActions.replaceChildren(...hostButtons, addBtn);
+}
+
+
+/** 导入后停在「服务器」页让用户确认再保存：ssh config 里没有密码等信息，可能还要补填。 */
+async function importFromOnboarding(alias: string) {
+  showPage("servers");
+  startNewServer();
+  hostSelect.value = alias;
+  await applyHostSelection(alias);
+  setConnectionStatus(t("已从 ~/.ssh/config 填入「{alias}」，确认无误后点「保存」", { alias }), "ok");
+  saveProfileBtn.focus();
 }
 
 

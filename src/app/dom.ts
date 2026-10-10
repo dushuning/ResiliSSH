@@ -281,3 +281,6 @@ export const resultReceipt = document.querySelector<HTMLElement>("#resultReceipt
 export const copyReceiptBtn = document.querySelector<HTMLButtonElement>("#copyReceiptBtn")!;
 export const saveReceiptBtn = document.querySelector<HTMLButtonElement>("#saveReceiptBtn")!;
 export const remoteBrowseShowHidden = document.querySelector<HTMLInputElement>("#remoteBrowseShowHidden")!;
+export const onboarding = document.querySelector<HTMLElement>("#onboarding")!;
+export const onboardingDetail = document.querySelector<HTMLElement>("#onboardingDetail")!;
+export const onboardingActions = document.querySelector<HTMLElement>("#onboardingActions")!;

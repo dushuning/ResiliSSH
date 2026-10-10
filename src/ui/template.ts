@@ -70,6 +70,12 @@ export function appTemplate(appName: string): string {
               <button class="btn btn-plain" id="editServerBtn" type="button">${t("编辑")}${icons.chevronRight}</button>
             </div>
 
+            <div class="onboarding hidden" id="onboarding">
+              <div class="onboarding-title">${t("先添加一台服务器")}</div>
+              <div class="onboarding-detail" id="onboardingDetail"></div>
+              <div class="onboarding-actions" id="onboardingActions"></div>
+            </div>
+
             <div id="transferStatePanel" class="state-panel hidden">
               <div class="state-panel-main">
                 <div class="state-panel-title" id="statePanelTitle"></div>

@@ -425,4 +425,10 @@ export const en: Record<string, string> = {
   "选择过多，无法复用": "Too many items to reuse",
   "{length} 项，另有 {hidden} 个隐藏项": "{length} items, {hidden} hidden",
   "显示隐藏文件": "Show hidden files",
+  "在 ~/.ssh/config 里找到了这些主机，点一个即可导入：": "Found these hosts in ~/.ssh/config — click one to import it:",
+  "填写主机、用户名和认证方式后保存，之后每次直接选择即可。": "Enter the host, username and authentication once and save; after that, just pick it.",
+  "手动添加…": "Add manually…",
+  "添加服务器": "Add server",
+  "已从 ~/.ssh/config 填入「{alias}」，确认无误后点「保存」": "Filled in “{alias}” from ~/.ssh/config — check it, then click Save",
+  "先添加一台服务器": "Add a server to get started",
 };

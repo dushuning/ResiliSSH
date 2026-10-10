@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- First-run guidance on the Transfer page: hosts found in `~/.ssh/config` are offered for one-click import (the form is pre-filled for you to check and save), or “Add server” when there are none.
 - Transfer progress on the Dock icon (overall progress for batches), so long transfers can run in the background.
 - Transfer receipt on the result page: copy or save a plain-text record of a fully successful transfer (server and jump hosts, start/finish time with time zone, verification method, reconnects, and per-file local/remote paths, size and SHA-256). Not offered when any file failed, so it cannot be mistaken for proof of a partial run.
 - The Mac no longer idle-sleeps while an upload or download is running (including while waiting to reconnect). Closing the lid or choosing Sleep still works, and the assertion ends with the app even if it crashes.
