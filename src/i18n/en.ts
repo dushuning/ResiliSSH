@@ -372,4 +372,13 @@ export const en: Record<string, string> = {
   "正在列出文件夹内容…": "Listing folder contents…",
   "所选文件夹里没有可下载的文件": "The selected folders contain no files to download",
   "本地已有完全相同的文件，无需下载": "An identical file already exists locally; no download needed",
+  "{base} · 经 {name}": "{base} · via {name}",
+  "首次连接该跳板机": "First connection to this jump host",
+  "跳板机「{name}」没有保存密码，请到「服务器」页填写并保存": "Jump host “{name}” has no saved password. Enter it on the Servers page and save",
+  "跳板机「{name}」设置为不保存密码，请先在「服务器」页选中它并输入密码": "Jump host “{name}” does not store its password. Select it on the Servers page and enter the password first",
+  "直接连接": "Direct",
+  " · 经 {name}": " · via {name}",
+  "ssh 配置中该主机经由 {spec} 连接，请先导入并保存 {spec}，再在「经由」中选择它": "In your ssh config this host is reached via {spec}. Import and save {spec} first, then pick it under “Via”",
+  "经由": "Via",
+  "内网服务器只能经堡垒机访问时，选择作为跳板机的已保存服务器（相当于 ssh -J）": "When a server is only reachable through a bastion, pick the saved server to use as the jump host (like ssh -J)",
 };

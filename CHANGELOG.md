@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- Jump hosts (like `ssh -J`): pick another saved server under “Via” to reach internal servers through a bastion. Multi-hop chains (up to 3), `ProxyJump` from `~/.ssh/config` on import, host keys confirmed hop by hop, and the usual unlimited reconnect/resume. A jump host that forbids forwarding is reported instead of retried forever.
+
 ## [1.1.0] - 2026-10-10
 
 ### Added

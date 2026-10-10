@@ -9,10 +9,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { clarifyTransferError } from "./app/backendText";
 import { appendConsoleLine, commandStorageKey, openCommandMenu, toggleSavedCommand, updateSaveCommandButton } from "./app/command";
-import { connectionPayload, prepareConnection, rememberForSession, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./app/connection";
+import { connectionPayload, forgetJumpSecrets, prepareConnection, rememberForSession, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./app/connection";
 import { PAGE_ORDER } from "./app/constants";
 import { closeConfirm, showConfirm } from "./app/dialogs";
-import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
+import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
 import { describeError, fileNameOf, formatBytes } from "./app/format";
 import { clearCheckpointFor, loadHistory, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
 import { showPage } from "./app/nav";
@@ -21,7 +21,7 @@ import { clearProbeResult, invalidateProbeOnEdit, runBackgroundProbe, updateTran
 import { refreshLiveVisuals, setBadge, setProgressState, setStatus, showReconnectingSpeedText, showTransferStatus, syncMapLegend, updateProgressDetail } from "./app/progress";
 import { startQueueFlow } from "./app/queue";
 import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
-import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, startNewServer } from "./app/servers";
+import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, setJumpSelection, startNewServer } from "./app/servers";
 import { applyThemePreference, initLanguagePreference, initThemePreference } from "./app/settings";
 import { state } from "./app/state";
 import { getTransferredBytes, handleProgressUpdate, isDownloadMode, setTransferring, showTransferView, startDownloadFlow, startUploadFlow, updateModeHint, updateTransferDirectionUI } from "./app/transfer";
@@ -38,9 +38,13 @@ authTypeSelect.addEventListener("change", updateAuthFields);
 rememberSecretsInput.addEventListener("change", updateAuthHintVisibility);
 
 
+jumpProfileSelect.addEventListener("change", () => updateConnectionSummary());
+
+
 profileSelect.addEventListener("change", async () => {
   const id = profileSelect.value;
   if (!id) {
+    setJumpSelection(null);
     updateConnectionSummary();
     return;
   }
@@ -69,11 +73,15 @@ saveProfileBtn.addEventListener("click", async () => {
         password: passwordInput.value || null,
         key_passphrase: keyPassphraseInput.value || null,
         remember_secrets: rememberSecretsInput.checked,
+        jump_profile_id: jumpProfileSelect.value || null,
       },
     });
     await loadProfiles();
     profileSelect.value = saved.id;
     profileNameInput.value = saved.name;
+    setJumpSelection(saved.jump_profile_id);
+    // 这台服务器可能是别的服务器的跳板机，密码改过后要重新读取。
+    forgetJumpSecrets(saved.id);
     rememberForSession();
     const stored = !rememberSecretsInput.checked
       ? t("，密码不保存（仅本次使用）")

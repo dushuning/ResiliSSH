@@ -10,7 +10,7 @@ import { showPage } from "./nav";
 import { updateDropZoneState, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe, updateTransferStatePanel } from "./probe";
 import { setProgressState, setStatus } from "./progress";
-import { applyProfile, findProfileFor, restoreCredentialsFromProfile } from "./servers";
+import { applyProfile, findProfileFor, restoreCredentialsFromProfile, setJumpSelection } from "./servers";
 import { state } from "./state";
 import { getTransferredBytes, isDownloadMode, setTransferDirection, showTransferView } from "./transfer";
 import { DownloadCheckpoint, TransferDirection, UploadCheckpoint, UploadHistoryEntry } from "./types";
@@ -153,6 +153,7 @@ export async function reuseHistoryEntry(entry: UploadHistoryEntry) {
     portInput.value = String(entry.port);
     usernameInput.value = entry.username;
     profileSelect.value = "";
+    setJumpSelection(null);
     updateConnectionSummary();
   }
   localPathInput.value = entry.local_path;

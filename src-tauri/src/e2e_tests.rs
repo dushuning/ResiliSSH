@@ -70,6 +70,7 @@ fn try_env(name: &str) -> Option<Env> {
             port,
             username: std::env::var("USER").ok()?,
             auth: AuthMethod::PrivateKey { key_path: key, passphrase: None },
+            jump: None,
         },
         work,
     })
@@ -344,4 +345,98 @@ fn e2e_expand_remote_folder_keeps_structure() {
     assert_eq!(expanded.entries[0].size, 6);
     assert!(!expanded.truncated);
     assert!(expanded.unreadable_dirs.is_empty());
+}
+
+/// 让测试 sshd 自己充当跳板机：先连上它，再经它的 direct-tcpip 转发连回它自己。
+/// 链路与真实的「跳板机 → 内网服务器」完全相同，只是两跳恰好是同一台。
+fn via_self_jump(mut env: Env) -> Env {
+    let direct = env.config.clone();
+    env.config.jump = Some(Box::new(direct));
+    env
+}
+
+#[test]
+fn e2e_upload_resumes_via_jump_host() {
+    let _guard = serial();
+    let Some(env) = env("jump-upload").map(via_self_jump) else { return };
+    let local = env.work.join("local/app.jar");
+    std::fs::write(&local, sample_bytes(FILE_SIZE, 41)).unwrap();
+    let remote = env.work.join("remote/app.jar");
+    let remote_str = remote.to_string_lossy().to_string();
+    let cp = Arc::new(Mutex::new(upload_checkpoint(&local, &remote_str, &env, FILE_SIZE as u64)));
+
+    let (first, _) = upload(&env, &local, &remote_str, true, &cp, Some(CANCEL_AT));
+    assert!(matches!(first, Err(UploadError::Cancelled)), "first run should be cancelled");
+    let (second, resumed_from) = upload(&env, &local, &remote_str, true, &cp, None);
+    second.expect("resumed upload through the jump host should succeed");
+    assert!(resumed_from > 0, "second run must resume, not restart from 0");
+    assert_same_file(&local, &remote);
+}
+
+#[test]
+fn e2e_download_via_jump_host() {
+    let _guard = serial();
+    let Some(env) = env("jump-download").map(via_self_jump) else { return };
+    let remote = env.work.join("remote/dump.sql");
+    std::fs::write(&remote, sample_bytes(FILE_SIZE, 43)).unwrap();
+    let remote_str = remote.to_string_lossy().to_string();
+    let local = env.work.join("local/dump.sql");
+    let local_str = local.to_string_lossy().to_string();
+    let cp = Arc::new(Mutex::new(download_checkpoint(&env, &remote_str, &local_str, FILE_SIZE as u64)));
+    let (result, _) = download(&env, &remote_str, &local_str, &cp, None);
+    result.expect("download through the jump host should succeed");
+    assert_same_file(&remote, &local);
+}
+
+#[test]
+fn e2e_jump_host_key_check_and_connection_test() {
+    let _guard = serial();
+    let Some(env) = env("jump-hostkey").map(via_self_jump) else { return };
+    let jump = env.config.jump.as_deref();
+    let (session, _) = crate::sftp::open_handshake(&env.config.host, env.config.port, jump).expect("handshake via jump");
+    let info = crate::sftp::inspect_host_key(&session, &env.config.host, env.config.port).expect("inspect");
+    assert_eq!(serde_json::to_value(&info).unwrap()["status"], "trusted");
+    let message = crate::sftp::test_connection(&env.config).expect("connection test via jump");
+    assert!(message.contains(&env.config.host), "{message}");
+}
+
+/// 取消和弱网重连都靠 shutdown 第一跳的 TCP 来打断阻塞 IO；经跳板机时目标会话跑在本地 socket 上，
+/// 必须同样被立即打断，而不是等 90 秒的读超时。
+#[test]
+fn e2e_abort_breaks_jump_connection_quickly() {
+    /// 远小于 socket 读超时（90 秒），足以区分「被打断」与「等到超时」。
+    const ABORT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    let _guard = serial();
+    let Some(env) = env("jump-abort").map(via_self_jump) else { return };
+    let (session, abort) = crate::sftp::connect_session(&env.config).expect("connect via jump");
+    let sftp = session.sftp().expect("sftp");
+    crate::sftp::abort_socket(&abort);
+    let started = std::time::Instant::now();
+    let result = sftp.stat(&env.work);
+    assert!(result.is_err(), "operation after abort must fail");
+    assert!(started.elapsed() < ABORT_DEADLINE, "abort took {:?}", started.elapsed());
+}
+
+/// 弱网下会无限次重连；每次断开后转发线程必须退出并关闭它持有的 socket，否则长时间运行会耗尽文件描述符。
+#[test]
+fn e2e_jump_tunnel_releases_resources_after_disconnect() {
+    const CYCLES: usize = 5;
+    /// 转发线程发现本地端关闭后立即退出，留足余量避免偶发的调度延迟。
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+    /// 测试框架或日志自身可能临时多开一两个描述符。
+    const TOLERANCE: usize = 2;
+    let open_fds = || std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+    let _guard = serial();
+    let Some(env) = env("jump-leak").map(via_self_jump) else { return };
+    // 先连一次，让一次性初始化（日志、known_hosts 读取等）占用的描述符不计入。
+    drop(crate::sftp::connect_session(&env.config).expect("warm-up"));
+    std::thread::sleep(SETTLE);
+    let before = open_fds();
+    for _ in 0..CYCLES {
+        let (session, _abort) = crate::sftp::connect_session(&env.config).expect("connect via jump");
+        session.sftp().expect("sftp").stat(&env.work).expect("stat");
+    }
+    std::thread::sleep(SETTLE);
+    let after = open_fds();
+    assert!(after <= before + TOLERANCE, "fds grew from {before} to {after} after {CYCLES} jump connections");
 }

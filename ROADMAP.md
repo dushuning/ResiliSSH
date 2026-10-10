@@ -21,6 +21,9 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **i18n:** English and Chinese UI
 - **Internals:** persistent remote file handle + adaptive write size (≈3× faster at 100 ms RTT), Content Security Policy, frontend split into modules, end-to-end tests against a real `sshd`, run in CI on every push
 
+### Unreleased
+- **Jump hosts** (ProxyJump), multi-hop, imported from `~/.ssh/config`
+
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Project health (before wider release)
@@ -31,7 +34,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Later / maybe
 
-ProxyJump (bastion hosts) · bandwidth limit · keep running from the menu bar · export a verification report · Windows & Linux builds (Tauri supports them; needs testing and packaging).
+bandwidth limit · keep running from the menu bar · export a verification report · Windows & Linux builds (Tauri supports them; needs testing and packaging).
 
 ## Out of scope
 

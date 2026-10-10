@@ -31,6 +31,10 @@ pub struct ConnectionProfile {
     /// 下次选中该服务器不访问钥匙串，直接要求重新输入。旧配置默认视为开启（与之前行为一致）。
     #[serde(default = "default_true")]
     pub remember_secrets: bool,
+    /// 经由哪台已保存的服务器连接（跳板机）。引用而不是复制一份地址和凭据：
+    /// 跳板机改密码、换地址时只需改一处，凭据也仍只存在它自己的钥匙串条目里。
+    #[serde(default)]
+    pub jump_profile_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -144,6 +148,40 @@ pub struct SaveProfileRequest {
     pub key_passphrase: Option<String>,
     #[serde(default = "default_true")]
     pub remember_secrets: bool,
+    #[serde(default)]
+    pub jump_profile_id: Option<String>,
+}
+
+/// 校验「经由」设置：跳板机必须是已保存的另一台服务器，链路不能成环、不能超过层数上限。
+/// 成环时连接会无限递归，必须在保存时就拦下，而不是等到连接时才发现。
+fn validate_jump(
+    profiles: &[ConnectionProfile],
+    profile_id: &str,
+    jump_id: Option<&str>,
+) -> Result<(), String> {
+    let mut seen = vec![profile_id.to_string()];
+    let mut next = jump_id;
+    while let Some(id) = next {
+        if seen.iter().any(|s| s == id) {
+            return Err(crate::tr!(
+                "跳板机设置形成了循环（经由的服务器最终又经由了自己），请换一台",
+                "The jump host settings form a loop (a server ends up going through itself); choose another one"
+            )
+            .into());
+        }
+        let hop = profiles.iter().find(|p| p.id == id).ok_or_else(|| {
+            crate::tr!("所选的跳板机已不存在，请重新选择", "The selected jump host no longer exists; choose again").to_string()
+        })?;
+        seen.push(id.to_string());
+        if seen.len() - 1 > crate::sftp::MAX_JUMP_HOPS {
+            return Err(crate::tr!(
+                format!("跳板机最多 {} 级", crate::sftp::MAX_JUMP_HOPS),
+                format!("At most {} jump hosts are supported", crate::sftp::MAX_JUMP_HOPS)
+            ));
+        }
+        next = hop.jump_profile_id.as_deref();
+    }
+    Ok(())
 }
 
 fn expand_key_path(path: &str) -> String {
@@ -204,6 +242,8 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         .as_ref()
         .map(|p| p.id.clone())
         .unwrap_or_else(new_id);
+    let jump_profile_id = request.jump_profile_id.filter(|id| !id.is_empty());
+    validate_jump(&store.profiles, &profile_id, jump_profile_id.as_deref())?;
 
     let remember = request.remember_secrets;
     // 表单留空表示「沿用已保存的值」，所以回退到该连接现有的钥匙串条目。
@@ -260,6 +300,7 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         bookmarks,
         post_commands,
         remember_secrets: remember,
+        jump_profile_id,
     };
 
     store.profiles.retain(|p| p.name != profile.name);
@@ -274,6 +315,20 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
 
 pub fn delete_profile(id: String) -> Result<(), String> {
     let mut store = load_store()?;
+    // 删掉仍被引用的跳板机，依赖它的服务器会在下次连接时莫名失败；让用户先改掉引用。
+    let dependents: Vec<&str> = store
+        .profiles
+        .iter()
+        .filter(|p| p.jump_profile_id.as_deref() == Some(id.as_str()))
+        .map(|p| p.name.as_str())
+        .collect();
+    if !dependents.is_empty() {
+        let names = dependents.join("、");
+        return Err(crate::tr!(
+            format!("这台服务器是「{names}」的跳板机，请先修改它们的「经由」设置再删除"),
+            format!("This server is the jump host for \"{names}\"; change their \"via\" setting before deleting it")
+        ));
+    }
     let before = store.profiles.len();
     store.profiles.retain(|p| p.id != id);
     if store.profiles.len() == before {
@@ -348,5 +403,48 @@ mod tests {
         assert!(profile.bookmarks.is_empty() && profile.post_commands.is_empty());
         // 旧配置里存过密码的用户不应在升级后突然失去「记住密码」。
         assert!(profile.remember_secrets);
+        assert!(profile.jump_profile_id.is_none());
+    }
+
+    fn profile(id: &str, jump: Option<&str>) -> ConnectionProfile {
+        ConnectionProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            auth_kind: AuthKind::Password,
+            key_path: None,
+            password: None,
+            key_passphrase: None,
+            created_at: 0,
+            bookmarks: vec![],
+            post_commands: vec![],
+            remember_secrets: true,
+            jump_profile_id: jump.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn jump_chain_validation() {
+        let profiles = vec![profile("bastion", None), profile("mid", Some("bastion")), profile("app", Some("mid"))];
+        assert!(validate_jump(&profiles, "new", None).is_ok());
+        assert!(validate_jump(&profiles, "new", Some("mid")).is_ok());
+        // 自己经由自己、或经由一台最终又经由自己的服务器，都是循环。
+        assert!(validate_jump(&profiles, "bastion", Some("bastion")).is_err());
+        assert!(validate_jump(&profiles, "bastion", Some("app")).is_err());
+        assert!(validate_jump(&profiles, "new", Some("missing")).is_err());
+    }
+
+    #[test]
+    fn jump_chain_length_is_capped() {
+        let profiles = vec![
+            profile("a", None),
+            profile("b", Some("a")),
+            profile("c", Some("b")),
+            profile("d", Some("c")),
+        ];
+        assert!(validate_jump(&profiles, "new", Some("c")).is_ok());
+        assert!(validate_jump(&profiles, "new", Some("d")).is_err());
     }
 }

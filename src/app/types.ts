@@ -5,6 +5,8 @@ export interface SshHostEntry {
   user: string | null;
   port: number | null;
   identity_file: string | null;
+  /** ProxyJump 中离目标最近的一跳：别名或 user@host:port。 */
+  proxy_jump: string | null;
 }
 
 
@@ -22,6 +24,8 @@ export interface ConnectionProfile {
   bookmarks: string[];
   post_commands: string[];
   remember_secrets: boolean;
+  /** 经由的跳板机（另一台已保存服务器的 id）。 */
+  jump_profile_id?: string | null;
 }
 
 

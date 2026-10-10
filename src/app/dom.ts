@@ -46,6 +46,7 @@ export const portInput = document.querySelector<HTMLInputElement>("#port")!;
 export const usernameInput = document.querySelector<HTMLInputElement>("#username")!;
 
 export const authTypeSelect = document.querySelector<HTMLSelectElement>("#authType")!;
+export const jumpProfileSelect = document.querySelector<HTMLSelectElement>("#jumpProfile")!;
 
 export const keyFields = document.querySelector<HTMLDivElement>("#keyFields")!;
 

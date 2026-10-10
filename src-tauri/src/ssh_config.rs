@@ -9,6 +9,9 @@ pub struct SshHostEntry {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    /// ProxyJump 中离目标最近的那一跳（别名或 user@host:port）。`ProxyJump a,b` 表示先连 a、
+    /// 再经 a 连 b、最后经 b 连目标，所以目标直接经由的是 b；更前面的跳由 b 自己的设置描述。
+    pub proxy_jump: Option<String>,
 }
 
 /// 读取 ~/.ssh/config，方便用户直接选已有 Host 而不用手填。
@@ -46,6 +49,14 @@ fn expand_path(path: &str) -> String {
     path.to_string()
 }
 
+/// `ProxyJump none` 表示显式不用跳板机。
+fn last_jump_hop(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    value.rsplit(',').map(str::trim).find(|hop| !hop.is_empty()).map(str::to_string)
+}
+
 fn parse_ssh_config(content: &str) -> Vec<SshHostEntry> {
     let mut entries = Vec::new();
     let mut current: Option<SshHostEntry> = None;
@@ -79,6 +90,7 @@ fn parse_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     user: None,
                     port: None,
                     identity_file: None,
+                    proxy_jump: None,
                 });
             }
             "hostname" if current.is_some() => {
@@ -96,6 +108,11 @@ fn parse_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     if let Ok(port) = value.parse::<u16>() {
                         current.as_mut().unwrap().port = Some(port);
                     }
+                }
+            }
+            "proxyjump" if current.is_some() => {
+                if let Some(value) = parts.next() {
+                    current.as_mut().unwrap().proxy_jump = last_jump_hop(value);
                 }
             }
             "identityfile" if current.is_some() => {
@@ -136,5 +153,15 @@ Host myserver
         assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
         assert_eq!(hosts[0].port, Some(2222));
         assert!(hosts[0].identity_file.as_ref().unwrap().ends_with(".ssh/id_ed25519"));
+        assert_eq!(hosts[0].proxy_jump, None);
+    }
+
+    #[test]
+    fn proxy_jump_keeps_hop_nearest_to_target() {
+        let content = "Host app\n  HostName 10.0.0.5\n  ProxyJump ops@gate.example.com:2222,bastion\n\
+                       Host direct\n  ProxyJump none\n";
+        let hosts = parse_ssh_config(content);
+        assert_eq!(hosts[0].proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(hosts[1].proxy_jump, None);
     }
 }

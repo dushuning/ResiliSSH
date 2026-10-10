@@ -2,11 +2,11 @@
 import { t } from "../i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { showConfirm } from "./dialogs";
-import { authHint, authTypeSelect, connectionStatus, connectionSummary, hostInput, keyFields, keyPassphraseInput, keyPathInput, passwordFields, passwordInput, portInput, profileSelect, rememberRow, rememberSecretsInput, usernameInput } from "./dom";
+import { authHint, authTypeSelect, connectionStatus, connectionSummary, hostInput, jumpProfileSelect, keyFields, keyPassphraseInput, keyPathInput, passwordFields, passwordInput, portInput, profileSelect, rememberRow, rememberSecretsInput, usernameInput } from "./dom";
 import { updateBookmarkButton } from "./paths";
 import { updateTransferStatePanel } from "./probe";
-import { currentProfile, highlightSelectedServer } from "./servers";
-import { ConnectionReadiness, HostKeyInfo, ProfileSecrets } from "./types";
+import { currentProfile, highlightSelectedServer, profileById } from "./servers";
+import { ConnectionProfile, ConnectionReadiness, HostKeyInfo, ProfileSecrets } from "./types";
 
 export function getConnectionReadiness(): ConnectionReadiness {
   const host = hostInput.value.trim();
@@ -40,7 +40,9 @@ export function getConnectionReadiness(): ConnectionReadiness {
 
   if (issues.length === 0) {
     // 选择器本身已显示服务器名称，摘要只补充地址；未保存的连接才需要在摘要里说明。
-    const summary = profileLabel ? endpoint : t("{endpoint} · 未保存", { endpoint });
+    const base = profileLabel ? endpoint : t("{endpoint} · 未保存", { endpoint });
+    const jump = profileById(jumpProfileSelect.value);
+    const summary = jump ? t("{base} · 经 {name}", { base, name: jump.name }) : base;
     return { ready: true, summary };
   }
 
@@ -154,13 +156,23 @@ export const trustedHostsThisSession = new Set<string>();
 /**
  * 任何会发送凭据的连接前调用：未知主机先展示指纹让用户确认，再写入应用 known_hosts。
  * 后端 connect_session 仍会强制校验，这里只是把「拒绝连接」变成可操作的确认流程。
+ * 经跳板机时从最外层的跳板机开始逐跳确认：要先信任并连上跳板机，才拿得到它后面那台的指纹。
  */
 export async function ensureHostTrusted(): Promise<void> {
-  const { host, port } = connectionPayload();
+  const hops: ConnectionPayload[] = [];
+  for (let hop: ConnectionPayload | null = connectionPayload(); hop; hop = hop.jump) hops.unshift(hop);
+  for (const [index, hop] of hops.entries()) {
+    await ensureHopTrusted(hop, index < hops.length - 1);
+  }
+}
+
+
+async function ensureHopTrusted(hop: ConnectionPayload, isJumpHost: boolean): Promise<void> {
+  const { host, port, jump } = hop;
   const hostId = `${host}:${port}`;
   if (trustedHostsThisSession.has(hostId)) return;
 
-  const info = await invoke<HostKeyInfo>("check_host_key", { request: { host, port } });
+  const info = await invoke<HostKeyInfo>("check_host_key", { request: { host, port, jump } });
   if (info.status === "changed") {
     throw new Error(
       t("服务器 {hostId} 的指纹与已记录的不一致（当前 {fingerprint}），可能遭遇中间人攻击，已拒绝连接。\n", { hostId, fingerprint: info.fingerprint }) +
@@ -169,20 +181,37 @@ export async function ensureHostTrusted(): Promise<void> {
   }
   if (info.status === "unknown") {
     const trusted = await showConfirm(
-      t("首次连接该服务器"),
+      isJumpHost ? t("首次连接该跳板机") : t("首次连接该服务器"),
       `${hostId}\n${info.key_type}\n${info.fingerprint}\n\n` +
         t("请与服务器管理员核对上面的指纹（服务器上可运行 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub）。确认信任后将记住该服务器。"),
     );
     if (!trusted) throw new Error(t("未信任该服务器，已取消连接"));
     await invoke("trust_host_key", {
-      request: { host, port, fingerprint: info.fingerprint },
+      request: { host, port, fingerprint: info.fingerprint, jump },
     });
   }
   trustedHostsThisSession.add(hostId);
 }
 
 
-export function connectionPayload() {
+/** 与后端 ConnectionRequest 对应；jump 递归描述跳板机链。 */
+export interface ConnectionPayload {
+  host: string;
+  port: number;
+  username: string;
+  auth_type: string;
+  password: string;
+  key_path: string;
+  key_passphrase: string;
+  jump: ConnectionPayload | null;
+}
+
+
+/** 与后端 MAX_JUMP_HOPS 一致：防御异常数据形成的超长或成环链，后端也会再校验。 */
+const MAX_JUMP_HOPS = 3;
+
+
+export function connectionPayload(): ConnectionPayload {
   return {
     host: hostInput.value.trim(),
     port: Number(portInput.value) || 22,
@@ -191,7 +220,60 @@ export function connectionPayload() {
     password: passwordInput.value,
     key_path: keyPathInput.value.trim(),
     key_passphrase: keyPassphraseInput.value,
+    jump: jumpPayload(profileById(jumpProfileSelect.value), 1),
   };
+}
+
+
+/**
+ * 跳板机已读取的凭据。跳板机不在表单里，凭据不能从输入框取，只能在连接前按需读钥匙串并暂存；
+ * 不记住密码的跳板机则取本次运行中用户输入过的值（sessionSecrets）。
+ */
+const jumpSecrets = new Map<string, { password: string; passphrase: string }>();
+
+
+function jumpPayload(profile: ConnectionProfile | undefined, depth: number): ConnectionPayload | null {
+  if (!profile || depth > MAX_JUMP_HOPS) return null;
+  const secrets = jumpSecrets.get(profile.id) ?? sessionSecrets.get(profile.id);
+  return {
+    host: profile.host,
+    port: profile.port,
+    username: profile.username,
+    auth_type: profile.auth_kind === "private_key" ? "key" : "password",
+    password: secrets?.password ?? "",
+    key_path: profile.key_path ?? "",
+    key_passphrase: secrets?.passphrase ?? "",
+    jump: jumpPayload(profileById(profile.jump_profile_id), depth + 1),
+  };
+}
+
+
+/** 连接前补齐跳板机链上每一跳的凭据；缺密码时指明是哪台跳板机，否则用户只会看到一句「请填写密码」。 */
+async function ensureJumpCredentialsLoaded() {
+  let hop = profileById(jumpProfileSelect.value);
+  for (let depth = 1; hop && depth <= MAX_JUMP_HOPS; depth++) {
+    const needsPassword = hop.auth_kind === "password";
+    if (hop.remember_secrets && !jumpSecrets.has(hop.id)) {
+      const secrets = await loadProfileSecrets(hop.id);
+      jumpSecrets.set(hop.id, { password: secrets.password ?? "", passphrase: secrets.key_passphrase ?? "" });
+    }
+    const secrets = jumpSecrets.get(hop.id) ?? sessionSecrets.get(hop.id);
+    if (needsPassword && !secrets?.password) {
+      throw new Error(
+        hop.remember_secrets
+          ? t("跳板机「{name}」没有保存密码，请到「服务器」页填写并保存", { name: hop.name })
+          : t("跳板机「{name}」设置为不保存密码，请先在「服务器」页选中它并输入密码", { name: hop.name }),
+      );
+    }
+    hop = profileById(hop.jump_profile_id);
+  }
+}
+
+
+/** 跳板机的密码在「服务器」页改过后，丢掉旧的暂存值，下次连接重新读取。 */
+export function forgetJumpSecrets(id?: string) {
+  if (id) jumpSecrets.delete(id);
+  else jumpSecrets.clear();
 }
 
 
@@ -234,6 +316,7 @@ export async function ensureCredentialsLoaded() {
 export async function prepareConnection() {
   await ensureCredentialsLoaded();
   validateConnectionBeforeTransfer();
+  await ensureJumpCredentialsLoaded();
   await ensureHostTrusted();
 }
 

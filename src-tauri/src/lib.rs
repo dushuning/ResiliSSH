@@ -33,6 +33,7 @@ use sftp::{
     open_handshake, remote_free_bytes, remote_sha256, remote_file_name, remote_parent_status,
     resolve_local_path, resolve_remote_path, resolve_upload_target,
     test_connection as test_sftp_connection, upload_with_resume, AuthMethod, ConnectionConfig,
+    MAX_JUMP_HOPS,
     run_remote_command as run_sftp_remote_command, CommandContext, CommandOutcome, DownloadCallbacks,
     DownloadError, HostKeyInfo, RemoteDirListing, UploadCallbacks, UploadError,
 };
@@ -116,10 +117,13 @@ struct CommandOutputEvent {
     line: String,
 }
 
+/// 经跳板机时要先连上（并认证）跳板机才能拿到目标的公钥，所以也带上 jump。
 #[derive(Debug, Deserialize)]
 struct HostKeyRequest {
     host: String,
     port: u16,
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,9 +131,11 @@ struct TrustHostKeyRequest {
     host: String,
     port: u16,
     fingerprint: String,
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ConnectionRequest {
     host: String,
     port: u16,
@@ -138,6 +144,9 @@ struct ConnectionRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +158,9 @@ struct StartUploadRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     local_path: String,
     remote_path: String,
     #[serde(default)]
@@ -166,6 +178,9 @@ struct ProbeUploadRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     local_path: String,
     remote_path: String,
 }
@@ -208,6 +223,9 @@ struct StartDownloadRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     local_path: String,
     remote_path: String,
     #[serde(default)]
@@ -225,6 +243,9 @@ struct ProbeDownloadRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     local_path: String,
     remote_path: String,
 }
@@ -285,11 +306,33 @@ fn build_auth(request: &ConnectionRequest) -> Result<AuthMethod, String> {
 }
 
 fn build_connection_config(request: &ConnectionRequest) -> Result<ConnectionConfig, String> {
-    Ok(ConnectionConfig {
+    let config = ConnectionConfig {
         host: request.host.clone(),
         port: request.port,
         username: request.username.clone(),
         auth: build_auth(request)?,
+        jump: build_jump_config(request.jump.as_deref())?,
+    };
+    if config.jump_hops() > MAX_JUMP_HOPS {
+        return Err(crate::tr!(
+            format!("跳板机最多 {MAX_JUMP_HOPS} 级，请检查服务器的「经由」设置是否形成了循环"),
+            format!("At most {MAX_JUMP_HOPS} jump hosts are supported; check that the \"via\" settings do not form a loop")
+        ));
+    }
+    Ok(config)
+}
+
+/// 跳板机的凭据缺失时给出指向跳板机本身的提示，否则用户只会看到一句「请填写密码」而不知道是哪台。
+fn build_jump_config(jump: Option<&ConnectionRequest>) -> Result<Option<Box<ConnectionConfig>>, String> {
+    let Some(jump) = jump else { return Ok(None) };
+    if jump.host.trim().is_empty() || jump.username.trim().is_empty() {
+        return Err(crate::tr!("跳板机缺少主机或用户名", "The jump host is missing a host or username").into());
+    }
+    build_connection_config(jump).map(|c| Some(Box::new(c))).map_err(|e| {
+        crate::tr!(
+            format!("跳板机 {}@{}：{e}", jump.username, jump.host),
+            format!("Jump host {}@{}: {e}", jump.username, jump.host)
+        )
     })
 }
 
@@ -449,6 +492,9 @@ struct ListRemoteDirRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     path: Option<String>,
 }
 
@@ -461,6 +507,9 @@ struct ExpandRemotePathsRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     paths: Vec<String>,
 }
 
@@ -473,6 +522,9 @@ struct CreateRemoteDirRequest {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+    /// 经由的跳板机（与服务器配置里选的「经由」对应），可多级嵌套。
+    #[serde(default)]
+    jump: Option<Box<ConnectionRequest>>,
     parent_path: String,
     dir_name: String,
 }
@@ -500,6 +552,7 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
         password: request.password,
         key_path: request.key_path,
         key_passphrase: request.key_passphrase,
+        jump: request.jump,
     };
     let config = build_connection_config(&conn)?;
     create_remote_directory(&config, &request.parent_path, &request.dir_name)
@@ -516,6 +569,7 @@ fn expand_remote_paths(request: ExpandRemotePathsRequest) -> Result<local_files:
         password: request.password,
         key_path: request.key_path,
         key_passphrase: request.key_passphrase,
+        jump: request.jump,
     };
     let config = build_connection_config(&conn)?;
     let expanded = expand_sftp_remote_paths(&config, &request.paths)?;
@@ -551,6 +605,7 @@ fn list_remote_dir(request: ListRemoteDirRequest) -> Result<RemoteDirListing, St
         password: request.password,
         key_path: request.key_path,
         key_passphrase: request.key_passphrase,
+        jump: request.jump,
     };
     let config = build_connection_config(&conn)?;
     list_remote_directory(&config, request.path.as_deref())
@@ -907,6 +962,7 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
         password: request.password.clone(),
         key_path: request.key_path.clone(),
         key_passphrase: request.key_passphrase.clone(),
+        jump: request.jump.clone(),
     };
     let config = build_connection_config(&conn)?;
     let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
@@ -1054,6 +1110,7 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         password: request.password.clone(),
         key_path: request.key_path.clone(),
         key_passphrase: request.key_passphrase.clone(),
+        jump: request.jump.clone(),
     };
     let config = build_connection_config(&conn)?;
     let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
@@ -1214,14 +1271,16 @@ fn check_host_key(request: HostKeyRequest) -> Result<HostKeyInfo, String> {
     if host.is_empty() {
         return Err(crate::tr!("请填写主机", "Please enter a host").into());
     }
-    let (session, _) = open_handshake(host, request.port).map_err(|e| e.to_string())?;
+    let jump = build_jump_config(request.jump.as_deref())?;
+    let (session, _) = open_handshake(host, request.port, jump.as_deref()).map_err(|e| e.to_string())?;
     inspect_host_key(&session, host, request.port).map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
 fn trust_host_key(request: TrustHostKeyRequest) -> Result<(), String> {
     let host = request.host.trim();
-    let (session, _) = open_handshake(host, request.port).map_err(|e| e.to_string())?;
+    let jump = build_jump_config(request.jump.as_deref())?;
+    let (session, _) = open_handshake(host, request.port, jump.as_deref()).map_err(|e| e.to_string())?;
     sftp::trust_host_key(&session, host, request.port, &request.fingerprint)
 }
 
@@ -1325,6 +1384,7 @@ fn start_upload(
         password: request.password.clone(),
         key_path: request.key_path.clone(),
         key_passphrase: request.key_passphrase.clone(),
+        jump: request.jump.clone(),
     })?;
 
     let auth_kind = match &auth {
@@ -1440,6 +1500,7 @@ fn start_upload(
         port: request.port,
         username: request.username.clone(),
         auth,
+        jump: build_jump_config(request.jump.as_deref())?,
     };
 
     let remote_path = resolved_remote_path;
@@ -1856,6 +1917,7 @@ fn start_download(
         password: request.password.clone(),
         key_path: request.key_path.clone(),
         key_passphrase: request.key_passphrase.clone(),
+        jump: request.jump.clone(),
     })?;
 
     let auth_kind = match &auth {
@@ -1904,6 +1966,7 @@ fn start_download(
             password: request.password.clone(),
             key_path: request.key_path.clone(),
             key_passphrase: request.key_passphrase.clone(),
+            jump: request.jump.clone(),
         })?;
         let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
         let sftp = session.sftp().map_err(|e| e.to_string())?;
@@ -2004,6 +2067,7 @@ fn start_download(
         port: request.port,
         username: request.username.clone(),
         auth,
+        jump: build_jump_config(request.jump.as_deref())?,
     };
 
     let local_path_string = request.local_path.clone();

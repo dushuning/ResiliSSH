@@ -8,6 +8,7 @@ mod host_key;
 mod preflight;
 mod remote_command;
 mod transfer_common;
+mod tunnel;
 mod upload;
 
 pub use browse::{
@@ -15,6 +16,7 @@ pub use browse::{
 };
 pub use client::{
     abort_socket, connect_session, open_handshake, test_connection, AuthMethod, ConnectionConfig,
+    MAX_JUMP_HOPS,
 };
 pub use host_key::{inspect_host_key, trust_host_key, HostKeyInfo};
 pub use preflight::{

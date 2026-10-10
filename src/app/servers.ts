@@ -3,7 +3,7 @@ import { t } from "../i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { restorePostCommand } from "./command";
 import { loadProfileSecrets, sessionSecrets, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./connection";
-import { authTypeSelect, hostInput, hostSelect, keyPassphraseInput, keyPathInput, navServerCount, passwordInput, portInput, profileNameInput, profileSelect, rememberSecretsInput, serverList, usernameInput } from "./dom";
+import { authTypeSelect, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, navServerCount, passwordInput, portInput, profileNameInput, profileSelect, rememberSecretsInput, serverList, usernameInput } from "./dom";
 import { state } from "./state";
 import { ConnectionProfile, SshHostEntry } from "./types";
 
@@ -37,6 +37,7 @@ export function restoreCredentialsFromProfile(host: string, port: number, userna
 
   profileSelect.value = profile.id;
   profileNameInput.value = profile.name;
+  setJumpSelection(profile.jump_profile_id);
 
   // 这里由启动时自动恢复断点触发，不主动读钥匙串（会弹授权框）；
   // 真正连接前由 ensureCredentialsLoaded 按需补齐密码。
@@ -77,6 +78,7 @@ export async function applyProfile(profile: ConnectionProfile) {
   passwordInput.value = "";
   keyPassphraseInput.value = "";
   profileNameInput.value = profile.name;
+  setJumpSelection(profile.jump_profile_id);
   updateAuthFields();
   updateConnectionSummary();
 
@@ -133,7 +135,74 @@ export async function loadProfiles() {
     option.textContent = profile.name;
     profileSelect.appendChild(option);
   }
+  renderJumpOptions();
   renderServerList();
+}
+
+
+export function profileById(id: string | null | undefined): ConnectionProfile | undefined {
+  return id ? state.savedProfiles.find((p) => p.id === id) : undefined;
+}
+
+
+/**
+ * 「经由」下拉框：列出可作为跳板机的其他已保存服务器。不能选自己，
+ * 也不列出最终又经由当前服务器的那些（会成环）；后端保存时还会再校验一次。
+ */
+export function renderJumpOptions() {
+  const selfId = profileSelect.value;
+  const keep = jumpProfileSelect.value;
+  const direct = document.createElement("option");
+  direct.value = "";
+  direct.textContent = t("直接连接");
+  const candidates = state.savedProfiles.filter((p) => p.id !== selfId && !jumpChainIncludes(p, selfId));
+  jumpProfileSelect.replaceChildren(
+    direct,
+    ...candidates.map((p) => {
+      const option = document.createElement("option");
+      option.value = p.id;
+      option.textContent = `${p.name} (${p.username}@${p.host}${p.port === 22 ? "" : `:${p.port}`})`;
+      return option;
+    }),
+  );
+  jumpProfileSelect.value = candidates.some((p) => p.id === keep) ? keep : "";
+}
+
+
+function jumpChainIncludes(profile: ConnectionProfile, id: string): boolean {
+  if (!id) return false;
+  const seen = new Set<string>();
+  let hop = profileById(profile.jump_profile_id);
+  while (hop && !seen.has(hop.id)) {
+    if (hop.id === id) return true;
+    seen.add(hop.id);
+    hop = profileById(hop.jump_profile_id);
+  }
+  return false;
+}
+
+
+export function setJumpSelection(jumpId: string | null | undefined) {
+  renderJumpOptions();
+  jumpProfileSelect.value = profileById(jumpId) ? (jumpId as string) : "";
+}
+
+
+/**
+ * ssh config 里的 ProxyJump 写的是别名或 user@host:port，这里找出对应的已保存服务器：
+ * 先按名称（导入时名称默认就是别名），再按地址。找不到返回 undefined，由调用方提示先保存跳板机。
+ */
+export function findProfileForJumpSpec(spec: string): ConnectionProfile | undefined {
+  const byName = state.savedProfiles.find((p) => p.name === spec);
+  if (byName) return byName;
+  const match = /^(?:([^@]+)@)?(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(spec);
+  if (!match) return undefined;
+  const [, user, rawHost, rawPort] = match;
+  const host = rawHost.replace(/^\[|\]$/g, "");
+  const port = rawPort ? Number(rawPort) : 22;
+  return state.savedProfiles.find(
+    (p) => p.host === host && p.port === port && (!user || p.username === user),
+  );
 }
 
 
@@ -160,7 +229,10 @@ export function renderServerList() {
       name.textContent = profile.name;
       const meta = document.createElement("span");
       meta.className = "server-item-meta";
-      meta.textContent = `${profile.username}@${profile.host}${profile.port === 22 ? "" : `:${profile.port}`}`;
+      const jump = profileById(profile.jump_profile_id);
+      meta.textContent =
+        `${profile.username}@${profile.host}${profile.port === 22 ? "" : `:${profile.port}`}` +
+        (jump ? t(" · 经 {name}", { name: jump.name }) : "");
       item.append(name, meta);
       item.disabled = state.isTransferring;
       item.addEventListener("click", () => {
@@ -194,6 +266,7 @@ export function startNewServer() {
   passwordInput.value = "";
   keyPassphraseInput.value = "";
   rememberSecretsInput.checked = true;
+  setJumpSelection(null);
   setConnectionStatus("");
   updateAuthFields();
   updateConnectionSummary();
@@ -226,6 +299,23 @@ export async function applyHostSelection(alias: string) {
     updateAuthFields();
   }
   profileNameInput.value = alias;
+  applyProxyJump(entry.proxy_jump);
   updateConnectionSummary();
+}
+
+
+function applyProxyJump(spec: string | null) {
+  if (!spec) {
+    setJumpSelection(null);
+    return;
+  }
+  const jump = findProfileForJumpSpec(spec);
+  setJumpSelection(jump?.id);
+  if (!jump) {
+    setConnectionStatus(
+      t("ssh 配置中该主机经由 {spec} 连接，请先导入并保存 {spec}，再在「经由」中选择它", { spec }),
+      "error",
+    );
+  }
 }
 

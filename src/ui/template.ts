@@ -258,6 +258,11 @@ export function appTemplate(appName: string): string {
                 <label for="password">${t("密码")}</label>
                 <input id="password" type="password" />
               </div>
+
+              <label for="jumpProfile">${t("经由")}</label>
+              <select id="jumpProfile" title="${t("内网服务器只能经堡垒机访问时，选择作为跳板机的已保存服务器（相当于 ssh -J）")}">
+                <option value="">${t("直接连接")}</option>
+              </select>
             </div>
             <label class="checkbox remember-row" id="rememberRow">
               <input type="checkbox" id="rememberSecrets" checked />

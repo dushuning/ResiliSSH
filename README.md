@@ -45,6 +45,7 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 
 **Everyday comfort**
 - Saved servers, import from `~/.ssh/config`, connection test
+- **Jump hosts** (like `ssh -J`): reach internal servers through a bastion, multi-hop supported, `ProxyJump` picked up on import; host keys are confirmed hop by hop and transfers still reconnect and resume automatically
 - Bookmarked and recent remote folders per server
 - History with one-click reuse; unfinished transfers listed with a *Resume* button, and offered again on launch
 - **Activity log**: every connect, auth, reconnect, permission error and verification step, filterable and copyable

@@ -32,6 +32,7 @@ export const TRANSFER_LOCK_SELECTORS = [
   "#keyPath",
   "#keyPassphrase",
   "#password",
+  "#jumpProfile",
   "#pickKeyBtn",
   "#localPath",
   "#remotePath",
