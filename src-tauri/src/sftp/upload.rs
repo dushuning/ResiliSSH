@@ -3,7 +3,7 @@ use super::client::{connect_session, is_sftp_not_found, ConnectError, Connection
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};
-use ssh2::{FileStat, OpenFlags, OpenType, Session, Sftp};
+use ssh2::{File as RemoteFile, FileStat, OpenFlags, OpenType, Session, Sftp};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -16,8 +16,15 @@ use std::time::Duration;
 /// 固定块大小：续传时回退到块边界，避免“半块”脏数据（你遇到的 33556504 正是此类问题）。
 const CHUNK_SIZE: u64 = 1024 * 1024;
 const HASH_READ_BUFFER_SIZE: usize = 256 * 1024;
-/// 写入时更细粒度的进度回调（仅 UI 速度用，不改变断点块大小）。
-const PROGRESS_SLICE_SIZE: usize = 64 * 1024;
+/// 写入分片大小的上下限。libssh2 会把单次写入的数据流水线发送，分片越大，每个往返在途的数据越多：
+/// 实测 100 ms 往返延迟下 5 MB 上传，64 KB 分片 12.5 s、256 KB 6.0 s、1 MB 4.2 s。
+/// 但进度只在每个分片写完时刷新，慢速链路上大分片会让进度条长时间不动、被误判为无响应，
+/// 所以按实测速度自适应：让每个分片大约 TARGET_SLICE_SECS 秒写完。
+const MIN_WRITE_SLICE: usize = 64 * 1024;
+const MAX_WRITE_SLICE: usize = CHUNK_SIZE as usize;
+/// 第一块还没有测速数据，取中间值。
+const INITIAL_WRITE_SLICE: usize = 256 * 1024;
+const TARGET_SLICE_SECS: f64 = 2.0;
 
 pub struct UploadCallbacks {
     pub on_progress: Box<dyn Fn(u64, u64, &str, u32) + Send + Sync>,
@@ -774,21 +781,13 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn sha256_remote_range(
-    sftp: &Sftp,
-    remote_path: &str,
+/// 在已打开的句柄上读回 [offset, offset+len) 并计算 SHA-256（不重新打开文件）。
+fn sha256_remote_handle_range(
+    remote_file: &mut RemoteFile,
     offset: u64,
     len: u64,
     on_read: Option<&dyn Fn()>,
 ) -> Result<[u8; 32], UploadError> {
-    let mut remote_file = sftp
-        .open_mode(
-            Path::new(remote_path),
-            OpenFlags::READ,
-            0,
-            OpenType::File,
-        )
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
     remote_file
         .seek(SeekFrom::Start(offset))
         .map_err(|e| UploadError::Sftp(e.to_string()))?;
@@ -824,6 +823,7 @@ fn sha256_remote_range(
 /// 每写完一块立即读回比对 SHA-256，失败则截断远端并拒绝推进 verified 断点。
 fn verify_written_chunk(
     sftp: &Sftp,
+    remote_file: &mut RemoteFile,
     local_bytes: &[u8],
     remote_path: &str,
     offset: u64,
@@ -837,7 +837,7 @@ fn verify_written_chunk(
     // 本地块内容已在内存缓冲，直接哈希；远端侧必须真读回，这正是要验证的目标。
     let local_hash = sha256_bytes(local_bytes);
     on_activity();
-    let remote_hash = sha256_remote_range(sftp, remote_path, offset, len, Some(on_activity))?;
+    let remote_hash = sha256_remote_handle_range(remote_file, offset, len, Some(on_activity))?;
 
     if local_hash == remote_hash {
         log::info!(
@@ -922,53 +922,56 @@ pub(super) fn log_resume_point(offset: u64, total: u64) {
     }
 }
 
+/// 一次连接只打开一次远端文件，所有块复用同一个句柄：此前每块都要 stat + open + close，
+/// 读回校验再 open + close，每 MB 多出约 5 次往返，高延迟链路上 1 GB 文件要多花二十多分钟。
+/// 写入与读回走同一个句柄：同一 SFTP 通道上的请求由服务器按序处理，读到的一定是刚写入的数据。
+/// 从 0 开始传时截断（覆盖远端旧文件）；续传时保留已有内容。
+fn open_remote_for_upload(sftp: &Sftp, remote_path: &str, fresh: bool) -> Result<RemoteFile, UploadError> {
+    let flags = if fresh {
+        OpenFlags::WRITE | OpenFlags::READ | OpenFlags::CREATE | OpenFlags::TRUNCATE
+    } else {
+        OpenFlags::WRITE | OpenFlags::READ | OpenFlags::CREATE
+    };
+    sftp.open_mode(Path::new(remote_path), flags, 0o644, OpenType::File)
+        .map_err(|e| UploadError::Sftp(e.to_string()))
+}
+
+/// 根据上一块的实测写入速度决定下一块的分片大小（取 2 的幂，避免尺寸频繁抖动）。
+fn next_write_slice(bytes: usize, elapsed: std::time::Duration) -> usize {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return MAX_WRITE_SLICE;
+    }
+    let target = (bytes as f64 / secs * TARGET_SLICE_SECS) as usize;
+    let power_of_two = if target == 0 {
+        MIN_WRITE_SLICE
+    } else {
+        1 << (usize::BITS - 1 - target.leading_zeros())
+    };
+    power_of_two.clamp(MIN_WRITE_SLICE, MAX_WRITE_SLICE)
+}
+
 fn write_remote_chunk<F: FnMut(u64)>(
-    sftp: &Sftp,
-    remote_path: &str,
+    remote_file: &mut RemoteFile,
     offset: u64,
     data: &[u8],
-    truncate_first: bool,
+    slice: usize,
     mut on_partial_progress: F,
 ) -> Result<(), UploadError> {
-    let path = Path::new(remote_path);
-    let remote_exists = sftp
-        .stat(path)
-        .ok()
-        .is_some_and(|stat| stat.is_file());
-
-    let flags = if offset == 0 {
-        if truncate_first && remote_exists {
-            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
-        } else {
-            OpenFlags::WRITE | OpenFlags::CREATE
-        }
-    } else {
-        OpenFlags::WRITE | OpenFlags::READ
-    };
-
-    let mut remote_file = sftp
-        .open_mode(path, flags, 0o644, OpenType::File)
+    // seek 只改 libssh2 本地记录的写入位置，不产生网络往返。
+    remote_file
+        .seek(SeekFrom::Start(offset))
         .map_err(|e| UploadError::Sftp(e.to_string()))?;
-
-    if offset > 0 {
-        remote_file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    }
 
     let mut written = 0usize;
     while written < data.len() {
-        let end = (written + PROGRESS_SLICE_SIZE).min(data.len());
+        let end = (written + slice).min(data.len());
         remote_file
             .write_all(&data[written..end])
             .map_err(|e| UploadError::Sftp(e.to_string()))?;
         written = end;
         on_partial_progress(offset + written as u64);
     }
-
-    remote_file
-        .close()
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
     Ok(())
 }
 
@@ -1048,7 +1051,8 @@ fn transfer_chunks(
         .map_err(|e| UploadError::LocalIo(e.to_string()))?;
 
     let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
-    let mut truncate_first = offset == 0;
+    let mut remote_file = open_remote_for_upload(&sftp, &actual_remote_path, offset == 0)?;
+    let mut write_slice = INITIAL_WRITE_SLICE;
 
     while offset < local_size {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -1064,17 +1068,17 @@ fn transfer_chunks(
 
         let chunk_start = offset;
 
+        let write_started = std::time::Instant::now();
         write_remote_chunk(
-            &sftp,
-            &actual_remote_path,
+            &mut remote_file,
             offset,
             &chunk_buffer[..chunk_len],
-            truncate_first,
+            write_slice,
             |absolute| {
                 (callbacks.on_progress)(absolute, local_size, "uploading", retry_count);
             },
         )?;
-        truncate_first = false;
+        write_slice = next_write_slice(chunk_len, write_started.elapsed());
 
         if strict_chunk_verify.load(Ordering::Relaxed) {
             (callbacks.on_progress)(
@@ -1085,6 +1089,7 @@ fn transfer_chunks(
             );
             verify_written_chunk(
                 &sftp,
+                &mut remote_file,
                 &chunk_buffer[..chunk_len],
                 &actual_remote_path,
                 chunk_start,
@@ -1103,6 +1108,10 @@ fn transfer_chunks(
         (callbacks.on_progress)(offset, local_size, "uploading", retry_count);
     }
 
+    // 关闭句柄让服务器完成所有写入，再用路径 stat 核对最终大小。
+    remote_file
+        .close()
+        .map_err(|e| UploadError::Sftp(e.to_string()))?;
     let final_size = sftp
         .stat(Path::new(&actual_remote_path))
         .map_err(|e| UploadError::Sftp(e.to_string()))?
@@ -1129,6 +1138,18 @@ mod tests {
         let local = PathBuf::from("/tmp/demo.jar");
         let resolved = resolve_remote_path("/home/user/dsn/", &local).unwrap();
         assert_eq!(resolved, "/home/user/dsn/demo.jar");
+    }
+
+    #[test]
+    fn write_slice_adapts_to_measured_speed() {
+        use std::time::Duration;
+        // 快速链路：1 MB 只用 0.1 s → 用满上限，尽量多的数据在途。
+        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(100)), MAX_WRITE_SLICE);
+        // 约 300 KB/s：2 秒约 600 KB → 取 2 的幂 512 KB。
+        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(3400)), 512 * 1024);
+        // 弱网 20 KB/s：退到下限，保证进度仍然频繁刷新。
+        assert_eq!(next_write_slice(1 << 20, Duration::from_secs(50)), MIN_WRITE_SLICE);
+        assert_eq!(next_write_slice(1 << 20, Duration::ZERO), MAX_WRITE_SLICE);
     }
 
     #[test]

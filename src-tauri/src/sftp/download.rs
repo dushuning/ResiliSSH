@@ -4,7 +4,7 @@ use crate::checkpoint::CheckpointStatus;
 use crate::download_checkpoint::{save_download_checkpoint, DownloadCheckpoint};
 use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
 use sha2::{Digest, Sha256};
-use ssh2::{OpenFlags, OpenType, Session, Sftp};
+use ssh2::{File as RemoteFile, OpenFlags, OpenType, Session, Sftp};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -380,6 +380,7 @@ fn transfer_chunks(
 
     let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
     let mut truncate_first = offset == 0 && !Path::new(&resolved_local_path).exists();
+    let mut remote_file = open_remote_for_download(&sftp, &actual_remote_path)?;
 
     while offset < remote_size {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -391,8 +392,7 @@ fn transfer_chunks(
         let chunk_start = offset;
 
         read_remote_chunk(
-            &sftp,
-            &actual_remote_path,
+            &mut remote_file,
             offset,
             &mut chunk_buffer[..chunk_len],
             |absolute| {
@@ -479,21 +479,18 @@ fn resolve_remote_file(sftp: &Sftp, remote_path: &str) -> Result<String, Downloa
     }
 }
 
+/// 一次连接只打开一次远端文件，所有块复用：此前每块 open + close，每 MB 多两次网络往返。
+fn open_remote_for_download(sftp: &Sftp, remote_path: &str) -> Result<RemoteFile, DownloadError> {
+    sftp.open_mode(Path::new(remote_path), OpenFlags::READ, 0, OpenType::File)
+        .map_err(|e| DownloadError::Sftp(e.to_string()))
+}
+
 fn read_remote_chunk<F: FnMut(u64)>(
-    sftp: &Sftp,
-    remote_path: &str,
+    remote_file: &mut RemoteFile,
     offset: u64,
     buffer: &mut [u8],
     mut on_partial_progress: F,
 ) -> Result<(), DownloadError> {
-    let mut remote_file = sftp
-        .open_mode(
-            Path::new(remote_path),
-            OpenFlags::READ,
-            0,
-            OpenType::File,
-        )
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
     remote_file
         .seek(SeekFrom::Start(offset))
         .map_err(|e| DownloadError::Sftp(e.to_string()))?;
@@ -511,9 +508,6 @@ fn read_remote_chunk<F: FnMut(u64)>(
         read_total += read_bytes;
         on_partial_progress(offset + read_total as u64);
     }
-    remote_file
-        .close()
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
     Ok(())
 }
 
