@@ -3,6 +3,7 @@ mod checkpoint;
 mod download_checkpoint;
 mod history;
 mod i18n;
+mod local_files;
 mod profiles;
 mod retry;
 mod secrets;
@@ -676,6 +677,12 @@ fn cancel_remote_command(runtime: State<'_, Mutex<CommandRuntime>>) -> Result<()
 #[tauri::command]
 fn set_language(language: String) {
     i18n::set_english(language == "en");
+}
+
+/// 把拖入/选择的文件和文件夹展开成待上传列表；遍历大目录可能较慢，所以放到后台线程。
+#[tauri::command(async)]
+fn expand_local_paths(paths: Vec<String>) -> local_files::ExpandedPaths {
+    local_files::expand_local_paths(&paths)
 }
 
 #[tauri::command]
@@ -2321,6 +2328,7 @@ pub fn run() {
             list_saved_profiles,
             get_profile_secrets,
             set_language,
+            expand_local_paths,
             list_activity_log,
             clear_activity_log,
             update_connection_profile_extras,

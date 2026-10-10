@@ -93,6 +93,7 @@ export function appTemplate(appName: string): string {
                 <div class="input-row">
                   <input id="localPath" placeholder="${t("选择或拖拽文件到此处")}" spellcheck="false" />
                   <button class="btn btn-secondary" id="pickFileBtn" type="button">${t("选择…")}</button>
+                  <button class="btn btn-secondary" id="pickFolderBtn" type="button">${t("文件夹…")}</button>
                 </div>
                 <p class="drop-hint" id="dropHint">${t("也可以直接把文件拖到窗口里")}</p>
               </div>

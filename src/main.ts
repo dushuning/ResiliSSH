@@ -407,11 +407,29 @@ let commandRunning = false;
  * localPathInput 始终保存第一个文件，原有的单文件逻辑（预检、路径预览）无需感知队列。
  */
 let selectedUploads: string[] = [];
+/** 文件夹上传时每个文件相对所选文件夹的目录（如 dist/js），用于在远端还原目录结构；直接选的文件不在表中。 */
+let uploadRelDirs = new Map<string, string>();
+let uploadSizes = new Map<string, number>();
+/** 批量下载时选中的远端文件；remotePathInput 始终保存第一个，单文件逻辑不受影响。 */
+let selectedDownloads: string[] = [];
+
+interface LocalEntry {
+  path: string;
+  rel_dir: string;
+  size: number;
+}
 
 type QueueItemStatus = "pending" | "running" | "done" | "failed" | "skipped" | "cancelled";
 
+/**
+ * 队列中的一个文件。source 是被传的文件（上传为本地路径、下载为远端路径），
+ * target 是它要放进的目录（上传为远端目录、下载为本地目录），开始时分别填入两个路径输入框。
+ */
 interface QueueItem {
-  local: string;
+  source: string;
+  target: string;
+  /** 展示用名称：文件夹上传时带上相对目录，便于区分同名文件。 */
+  label: string;
   remote: string;
   status: QueueItemStatus;
   message?: string;
@@ -452,6 +470,7 @@ const TRANSFER_LOCK_SELECTORS = [
   "#remotePath",
   "#browseRemoteBtn",
   "#pickFileBtn",
+  "#pickFolderBtn",
   "#changeFileBtn",
   "#forceOverwrite",
   'input[name="transferDirection"]',
@@ -572,7 +591,8 @@ function updateTransferButtonLabel() {
   }
   resultBackBtn.textContent = t("返回修改");
   if (currentView === "result") {
-    const retryLabel = isQueueSelection() ? t("重试 {length} 个文件", { length: selectedUploads.length }) : t("重试");
+    const queued = isDownloadMode() ? selectedDownloads.length : selectedUploads.length;
+    const retryLabel = isQueueSelection() ? t("重试 {length} 个文件", { length: queued }) : t("重试");
     transferBtn.innerHTML = resultCard.classList.contains("paused") ? t("继续传输") : retryLabel;
   } else {
     // 用整句翻译而不是拼接动词：后端提示里会引用按钮原文（如 click "Start upload"），两边必须一致。
@@ -635,6 +655,7 @@ function updateTransferDirectionUI() {
     ? t("点「选择…」指定保存目录")
     : t("也可以直接把文件拖到窗口里");
   dropZone.classList.toggle("download-mode", download);
+  pickFolderBtn.classList.toggle("hidden", download);
   forceOverwriteLabel.textContent = t("强制从头覆盖");
   forceOverwriteInput.parentElement!.title = download
     ? t("忽略断点与本地已有文件，从头重新下载")
@@ -1053,7 +1074,7 @@ function updateRemoteBrowseModeUi() {
   remoteBrowseSelectDirBtn.classList.toggle("hidden", download);
   remoteBrowseSelectDirBtn.textContent = t("选择此目录");
   remoteBrowseHint.textContent = download
-    ? t("双击文件夹进入；单击文件选中")
+    ? t("双击文件夹进入；单击文件可多选，双击文件只选这一个")
     : t("双击文件夹进入；双击文件选中");
 }
 
@@ -1093,7 +1114,19 @@ function setRemoteBrowseStatus(message: string, kind: "normal" | "error" = "norm
   remoteBrowseStatus.classList.toggle("error", kind === "error");
 }
 
+/** 下载模式下在当前目录勾选的远端文件；切换目录时清空，避免把不同目录的同名文件下到同一处互相覆盖。 */
+const remoteBrowsePicked = new Set<string>();
+
+function updateRemoteBrowsePickButton() {
+  if (!isDownloadMode()) return;
+  const count = remoteBrowsePicked.size;
+  remoteBrowseSelectDirBtn.classList.toggle("hidden", count === 0);
+  remoteBrowseSelectDirBtn.textContent = t("选择 {count} 个文件", { count });
+}
+
 function renderRemoteBrowseListing(listing: RemoteDirListing) {
+  remoteBrowsePicked.clear();
+  updateRemoteBrowsePickButton();
   remoteBrowseCurrent = listing;
   remoteBrowsePath.value = listing.path;
   remoteBrowseUpBtn.disabled = !listing.parent;
@@ -1129,13 +1162,18 @@ function renderRemoteBrowseListing(listing: RemoteDirListing) {
 
     row.append(icon, name, meta);
     row.addEventListener("click", () => {
+      // 下载模式：单击文件切换多选，双击仍是「只要这一个」的快捷方式。
+      if (!entry.is_dir && isDownloadMode()) {
+        if (remoteBrowsePicked.has(entry.path)) remoteBrowsePicked.delete(entry.path);
+        else remoteBrowsePicked.add(entry.path);
+        row.classList.toggle("selected", remoteBrowsePicked.has(entry.path));
+        updateRemoteBrowsePickButton();
+        return;
+      }
       remoteBrowseList
         .querySelectorAll(".remote-browse-item.selected")
         .forEach((el) => el.classList.remove("selected"));
       row.classList.add("selected");
-      if (!entry.is_dir && isDownloadMode()) {
-        applyRemoteBrowseSelection(entry.path, false);
-      }
     });
     row.addEventListener("dblclick", (event) => {
       event.preventDefault();
@@ -1347,9 +1385,14 @@ async function invokeStartDownload(forceOverwrite: boolean) {
 
 async function startDownloadFlow() {
   await prepareConnection();
+  await startOneDownload();
+}
+
+/** 预检、确认、启动一个下载；与 startOneUpload 对称，批量下载逐个调用它。 */
+async function startOneDownload(): Promise<UploadStart> {
   const probe = await probeRemoteDownload();
   const confirmed = await confirmDownloadAction(probe);
-  if (!confirmed) return;
+  if (!confirmed) return "declined";
 
   const forceOverwrite =
     probe.action === "full_redownload" || forceOverwriteInput.checked;
@@ -1365,6 +1408,7 @@ async function startDownloadFlow() {
   showProgressSpeed(t("正在建立 SSH 连接…"));
 
   await invokeStartDownload(forceOverwrite);
+  return "started";
 }
 
 async function probeRemoteUpload(): Promise<RemoteUploadProbe> {
@@ -1433,17 +1477,59 @@ async function invokeStartUpload(forceOverwrite: boolean) {
 }
 
 function isQueueSelection(): boolean {
-  return !isDownloadMode() && selectedUploads.length > 1;
+  if (isDownloadMode()) return selectedDownloads.length > 1;
+  // 文件夹里只有一个文件时也要走队列：它需要放进远端的子目录。
+  return selectedUploads.length > 1 || uploadRelDirs.size > 0;
 }
 
-function setSelectedUploads(paths: string[]) {
+function setSelectedUploads(paths: string[], entries: LocalEntry[] = []) {
   selectedUploads = paths.filter(Boolean);
+  uploadRelDirs = new Map(entries.filter((e) => e.rel_dir).map((e) => [e.path, e.rel_dir]));
+  uploadSizes = new Map(entries.map((e) => [e.path, e.size]));
   localPathInput.value = selectedUploads[0] ?? "";
   updateDropZoneState();
   updateResolvedPathHint();
   clearProbeResult();
   // 多文件时只预检第一个会产生误导，等开始时逐个预检。
   if (selectedUploads.length === 1) scheduleBackgroundProbe();
+}
+
+/** 拖入或选择的路径可能包含文件夹，交给后端递归展开后再作为待上传列表。 */
+async function selectLocalPathsExpanded(paths: string[]) {
+  if (paths.length === 0) return;
+  try {
+    const expanded = await invoke<{ entries: LocalEntry[]; truncated: boolean }>(
+      "expand_local_paths",
+      { paths },
+    );
+    if (expanded.entries.length === 0) {
+      setStatus(t("所选文件夹里没有可上传的文件"), "error");
+      return;
+    }
+    setSelectedUploads(
+      expanded.entries.map((e) => e.path),
+      expanded.entries,
+    );
+    if (expanded.truncated) {
+      setStatus(t("文件太多，只取了前 {count} 个", { count: expanded.entries.length }), "retry");
+    }
+  } catch (error) {
+    setStatus(describeError(error), "error");
+  }
+}
+
+function setSelectedDownloads(paths: string[]) {
+  selectedDownloads = paths.filter(Boolean);
+  remotePathInput.value = selectedDownloads[0] ?? "";
+  // 多个文件只能下载到目录里，否则会互相覆盖成同一个本地文件。
+  const local = localPathInput.value.trim();
+  if (selectedDownloads.length > 1 && local && !local.endsWith("/")) {
+    localPathInput.value = `${local}/`;
+  }
+  updateDropZoneState();
+  updateResolvedPathHint();
+  clearProbeResult();
+  if (selectedDownloads.length === 1) scheduleBackgroundProbe();
 }
 
 async function startUploadFlow() {
@@ -1516,17 +1602,44 @@ async function startOneUpload(): Promise<UploadStart> {
  * 多文件上传：逐个走单文件流程。某个文件失败不影响后面的文件；用户取消则整个队列停止。
  * 传完后命令只在队列结束后执行一次——部署场景下应当全部传完再重启服务。
  */
+/** 目录路径统一以 / 结尾，拼子目录时不必再判断。 */
+function asDir(path: string): string {
+  const trimmed = path.trim();
+  return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
+}
+
+/**
+ * 多文件传输：逐个走单文件流程。某个文件失败不影响后面的文件；用户取消则整个队列停止。
+ * 传完后命令只在队列结束后执行一次——部署场景下应当全部传完再重启服务。
+ */
 async function startQueueFlow() {
   await prepareConnection();
-  // 多个文件必须传到目录里，否则会互相覆盖成同一个远端文件。
-  const remoteDir = remotePathInput.value.trim();
-  if (!remoteDir) throw new Error(t("请填写远端目录"));
-  if (!remoteDir.endsWith("/")) remotePathInput.value = `${remoteDir}/`;
+  const direction = transferDirection;
+  const download = direction === "download";
+  // 多个文件必须放进目录，否则会互相覆盖成同一个文件。
+  const baseInput = download ? localPathInput : remotePathInput;
+  if (!baseInput.value.trim()) {
+    throw new Error(download ? t("请填写本地保存路径") : t("请填写远端目录"));
+  }
+  const baseDir = asDir(baseInput.value);
+  baseInput.value = baseDir;
 
   const queueStartedAt = Date.now();
   const template = postCommandInput.value.trim();
+  const sources = download ? [...selectedDownloads] : [...selectedUploads];
+  const relDirs = new Map(uploadRelDirs);
+  const sizes = new Map(uploadSizes);
   const queue = {
-    items: selectedUploads.map<QueueItem>((local) => ({ local, remote: "", status: "pending" })),
+    items: sources.map<QueueItem>((source) => {
+      const rel = download ? "" : (relDirs.get(source) ?? "");
+      return {
+        source,
+        target: rel ? `${baseDir}${rel}/` : baseDir,
+        label: rel ? `${rel}/${fileNameOf(source)}` : fileNameOf(source),
+        remote: "",
+        status: "pending",
+      };
+    }),
     index: 0,
   };
   activeQueue = queue;
@@ -1535,14 +1648,20 @@ async function startQueueFlow() {
     for (let i = 0; i < queue.items.length; i++) {
       const item = queue.items[i];
       queue.index = i;
-      localPathInput.value = item.local;
+      if (download) {
+        remotePathInput.value = item.source;
+        localPathInput.value = item.target;
+      } else {
+        localPathInput.value = item.source;
+        remotePathInput.value = item.target;
+      }
       item.status = "running";
       const step = new Promise<RunStepResult>((resolve) => {
         resolveQueueStep = resolve;
       });
       let started: UploadStart;
       try {
-        started = await startOneUpload();
+        started = download ? await startOneDownload() : await startOneUpload();
       } catch (error) {
         resolveQueueStep = null;
         setTransferring(false);
@@ -1586,12 +1705,19 @@ async function startQueueFlow() {
     resolveQueueStep = null;
     activeQueue = null;
     queueChip.classList.add("hidden");
+    baseInput.value = baseDir;
   }
-  await finishQueue(queue.items, template, queueStartedAt);
+  await finishQueue(queue.items, template, queueStartedAt, direction, { relDirs, sizes });
 }
 
-/** 汇总队列结果：全部成功才算「完成」，部分失败为「警告」，用户取消为「已暂停」。 */
-async function finishQueue(items: QueueItem[], template: string, startedAt: number) {
+async function finishQueue(
+  items: QueueItem[],
+  template: string,
+  startedAt: number,
+  direction: TransferDirection,
+  selection: { relDirs: Map<string, string>; sizes: Map<string, number> },
+) {
+  const download = direction === "download";
   const done = items.filter((i) => i.status === "done");
   const stats: RunStats = {
     elapsedMs: Date.now() - startedAt,
@@ -1602,17 +1728,30 @@ async function finishQueue(items: QueueItem[], template: string, startedAt: numb
   const total = items.length;
   renderQueueResultFiles(items);
   // 选择只保留没成功的文件：之后点「重试 / 继续传输」不会把已完成的文件再传一遍。
-  const remaining = items.filter((i) => i.status !== "done").map((i) => i.local);
-  selectedUploads = remaining.length > 0 ? remaining : items.map((i) => i.local);
-  localPathInput.value = selectedUploads[0];
-  updateDropZoneState();
-  updateResolvedPathHint();
+  const remaining = items.filter((i) => i.status !== "done").map((i) => i.source);
+  const keep = remaining.length > 0 ? remaining : items.map((i) => i.source);
+  if (download) {
+    setSelectedDownloads(keep);
+  } else {
+    setSelectedUploads(
+      keep,
+      keep.map((path) => ({
+        path,
+        rel_dir: selection.relDirs.get(path) ?? "",
+        size: selection.sizes.get(path) ?? 0,
+      })),
+    );
+  }
 
   if (done.length === total) {
     runPostCommandTemplate = template;
     await finishSuccessfulRun(
-      t("{total} 个文件全部上传完成", { total }),
-      t("已传到 {p1}:{p2}", { p1: hostInput.value.trim(), p2: remoteDirOf(done[0].remote) }),
+      download
+        ? t("{total} 个文件全部下载完成", { total })
+        : t("{total} 个文件全部上传完成", { total }),
+      download
+        ? t("已保存到 {dir}", { dir: localPathInput.value.trim() })
+        : t("已传到 {p1}:{p2}", { p1: hostInput.value.trim(), p2: remotePathInput.value.trim() }),
       stats,
       done.map((i) => i.remote),
     );
@@ -1633,11 +1772,17 @@ async function finishQueue(items: QueueItem[], template: string, startedAt: numb
     .join("，");
   const commandNote = template ? t("\n因有文件未成功，传完后命令没有执行") : "";
   if (cancelled) {
-    showResult("paused", t("批量上传已取消"), `${summary}${commandNote}`, stats);
+    showResult("paused", download ? t("批量下载已取消") : t("批量上传已取消"), `${summary}${commandNote}`, stats);
   } else if (done.length === 0) {
-    showResult("error", t("批量上传失败"), `${summary}${commandNote}`, stats);
+    showResult("error", download ? t("批量下载失败") : t("批量上传失败"), `${summary}${commandNote}`, stats);
   } else {
-    showResult("warn", t("部分文件上传失败"), `${summary}${commandNote}`, stats, false);
+    showResult(
+      "warn",
+      download ? t("部分文件下载失败") : t("部分文件上传失败"),
+      `${summary}${commandNote}`,
+      stats,
+      false,
+    );
   }
 }
 
@@ -1665,8 +1810,8 @@ function renderQueueResultFiles(items: QueueItem[] | null) {
       mark.className = "file-mark";
       const name = document.createElement("span");
       name.className = "file-name";
-      name.textContent = fileNameOf(item.local);
-      name.title = item.local;
+      name.textContent = item.label;
+      name.title = item.source;
       const status = document.createElement("span");
       status.className = "file-status";
       status.textContent = item.message ?? QUEUE_STATUS_LABEL[item.status];
@@ -2334,17 +2479,32 @@ function stopProgressWatchdog() {
 function updateDropZoneState() {
   const path = localPathInput.value.trim();
   // 路径被程序直接改写（复用历史、恢复断点、手动输入）时，退回单文件选择。
-  if (selectedUploads[0] !== path) selectedUploads = path ? [path] : [];
+  if (!isDownloadMode() && selectedUploads[0] !== path) {
+    selectedUploads = path ? [path] : [];
+    uploadRelDirs = new Map();
+    uploadSizes = new Map();
+  }
   const hasPath = path.length > 0;
   dropZone.classList.toggle("has-file", hasPath);
   fileChip.classList.toggle("hidden", !hasPath);
   dropZone.classList.toggle("hidden", hasPath);
   if (!hasPath) return;
 
-  if (isQueueSelection()) {
-    fileChipName.textContent = t("{length} 个文件", { length: selectedUploads.length });
-    fileChipPath.textContent = selectedUploads.map(fileNameOf).join("、");
-    fileChipPath.title = selectedUploads.join("\n");
+  if (isQueueSelection() && !isDownloadMode()) {
+    const folders = [...new Set([...uploadRelDirs.values()].map((d) => d.split("/")[0]))];
+    const totalSize = [...uploadSizes.values()].reduce((sum, size) => sum + size, 0);
+    // 来自同一个文件夹时以文件夹为主角显示，否则列出文件名。
+    fileChipName.textContent =
+      folders.length === 1 && uploadRelDirs.size === selectedUploads.length
+        ? t("{folder}/ · {count} 个文件", { folder: folders[0], count: selectedUploads.length })
+        : t("{length} 个文件", { length: selectedUploads.length });
+    const names = selectedUploads.map((p) => {
+      const rel = uploadRelDirs.get(p);
+      return rel ? `${rel}/${fileNameOf(p)}` : fileNameOf(p);
+    });
+    fileChipPath.textContent =
+      (totalSize > 0 ? `${formatBytes(totalSize)} · ` : "") + names.join("、");
+    fileChipPath.title = names.join("\n");
   } else {
     fileChipName.textContent = fileNameOf(path);
     fileChipPath.textContent = path;
@@ -2392,6 +2552,20 @@ function previewResolvedPath(): string | null {
 function updateResolvedPathHint() {
   // 所有改动远端路径的入口（浏览选择、复用历史、恢复断点）都会走到这里，顺带同步收藏星标。
   updateBookmarkButton();
+  if (isDownloadMode() && selectedDownloads[0] !== remotePathInput.value.trim()) {
+    const remote = remotePathInput.value.trim();
+    selectedDownloads = remote ? [remote] : [];
+  }
+  if (isQueueSelection() && isDownloadMode()) {
+    const dir = localPathInput.value.trim();
+    resolvedPathHint.textContent = t("将依次下载 {count} 个文件到：{dir}", {
+      count: selectedDownloads.length,
+      dir: dir ? asDir(dir) : "…",
+    });
+    resolvedPathHint.title = selectedDownloads.join("\n");
+    resolvedPathHint.classList.remove("hidden");
+    return;
+  }
   if (isQueueSelection()) {
     const dir = remotePathInput.value.trim();
     resolvedPathHint.textContent = dir
@@ -2920,7 +3094,7 @@ function setupDragDrop() {
       if (paths.length > 0) {
         if (currentView !== "compose") showTransferView("compose");
         showPage("transfer");
-        setSelectedUploads(paths);
+        void selectLocalPathsExpanded(paths);
       }
     }
   });
@@ -3092,6 +3266,16 @@ remoteBrowseUpBtn.addEventListener("click", () => {
 });
 
 remoteBrowseSelectDirBtn.addEventListener("click", () => {
+  if (isDownloadMode()) {
+    // 保持列表中的显示顺序，下载顺序与用户看到的一致。
+    const picked = [...remoteBrowseList.querySelectorAll<HTMLElement>(".remote-browse-item.selected")]
+      .map((row) => row.dataset.path ?? "")
+      .filter((path) => remoteBrowsePicked.has(path));
+    if (picked.length === 0) return;
+    setSelectedDownloads(picked);
+    closeRemoteBrowseOverlay();
+    return;
+  }
   const path = remoteBrowseCurrent?.path ?? remoteBrowsePath.value.trim();
   if (!path) return;
   applyRemoteBrowseSelection(path, true);
@@ -3140,19 +3324,32 @@ document.querySelector("#pickKeyBtn")!.addEventListener("click", async () => {
 });
 
 /** 上传可多选（排队依次传）；下载选择的是本地保存目录，只能单选。 */
+/** 上传可多选文件（排队依次传）；下载选择的是本地保存目录，只能单选。 */
 async function pickLocalPaths() {
   const download = isDownloadMode();
   const selected = await open({ multiple: !download, directory: download });
   if (selected === null) return;
   if (download) {
-    const dir = selected as string;
-    setSelectedUploads([dir.endsWith("/") ? dir : `${dir}/`]);
+    localPathInput.value = asDir(selected as string);
+    updateDropZoneState();
+    updateResolvedPathHint();
+    clearProbeResult();
+    scheduleBackgroundProbe();
   } else {
     setSelectedUploads(Array.isArray(selected) ? selected : [selected]);
   }
 }
 
+/** macOS 的打开面板不能同时选文件和文件夹，所以文件夹单独一个入口；拖入时两者都支持。 */
+async function pickLocalFolders() {
+  const selected = await open({ multiple: true, directory: true });
+  if (selected === null) return;
+  await selectLocalPathsExpanded(Array.isArray(selected) ? selected : [selected]);
+}
+
+const pickFolderBtn = document.querySelector<HTMLButtonElement>("#pickFolderBtn")!;
 document.querySelector("#pickFileBtn")!.addEventListener("click", () => void pickLocalPaths());
+pickFolderBtn.addEventListener("click", () => void pickLocalFolders());
 changeFileBtn.addEventListener("click", () => void pickLocalPaths());
 
 forceOverwriteInput.addEventListener("change", () => {
@@ -3234,10 +3431,11 @@ transferBtn.addEventListener("click", async () => {
   startInFlight = true;
   transferBtn.disabled = true;
   try {
-    if (isDownloadMode()) {
-      await startDownloadFlow();
-    } else if (isQueueSelection()) {
+    // 先判断是否多文件：上传和下载都可能是队列，不能先按方向分流。
+    if (isQueueSelection()) {
       await startQueueFlow();
+    } else if (isDownloadMode()) {
+      await startDownloadFlow();
     } else {
       await startUploadFlow();
     }
