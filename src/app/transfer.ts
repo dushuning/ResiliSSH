@@ -6,15 +6,16 @@ import { BACKEND_TEXT, clarifyTransferError, matchesBackend } from "./backendTex
 import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { TRANSFER_LOCK_SELECTORS, UI_STALL_WARN_MS } from "./constants";
-import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, forceOverwriteInput, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, viewLogBtn } from "./dom";
+import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, forceOverwriteInput, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, verifySummary, viewLogBtn } from "./dom";
 import { describeError, formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
 import { isQueueSelection, updateResolvedPathHint } from "./paths";
 import { clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
 import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showProgressSpeed, showReconnectingSpeedText, showTransferStatus, showVerifySummary, showWaitingSpeedText, startProgressWatchdog, stopProgressWatchdog, updateProgress, updateProgressDetail } from "./progress";
+import { recordReceipt, syncReceiptVisibility } from "./receipt";
 import { updateRemoteBrowseModeUi } from "./remoteBrowse";
 import { state } from "./state";
-import { DownloadCheckpoint, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadStart } from "./types";
+import { DownloadCheckpoint, ReceiptFile, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadStart } from "./types";
 
 export function isDownloadMode(): boolean {
   return state.transferDirection === "download";
@@ -240,6 +241,7 @@ export async function startOneDownload(): Promise<UploadStart> {
   if (probe.action === "identical" && !forceOverwriteInput.checked) {
     showDownloadProbeResult(probe);
     state.runRemotePath = probe.resolved_remote_path;
+    state.runLocalPath = probe.resolved_local_path;
     state.runPostCommandTemplate = postCommandInput.value.trim();
     return "identical";
   }
@@ -249,6 +251,7 @@ export async function startOneDownload(): Promise<UploadStart> {
   const forceOverwrite =
     probe.action === "full_redownload" || forceOverwriteInput.checked;
   state.runRemotePath = probe.resolved_remote_path;
+  state.runLocalPath = probe.resolved_local_path;
   state.runPostCommandTemplate = postCommandInput.value.trim();
 
   setTransferring(true);
@@ -309,6 +312,7 @@ export async function finishIdenticalTransfer(direction: TransferDirection) {
     download ? t("本地已有完全相同的文件，无需下载") : t("远端已有完全相同的文件，无需上传"),
     { elapsedMs: 0, movedBytes: 0, retries: 0 },
     [state.runRemotePath],
+    [{ local: state.runLocalPath, remote: state.runRemotePath, skipped: true }],
   );
 }
 
@@ -324,6 +328,7 @@ export async function startOneUpload(): Promise<UploadStart> {
   if (probe.action === "identical" && !forceOverwriteInput.checked) {
     showProbeResult(probe);
     state.runRemotePath = probe.resolved_remote_path;
+    state.runLocalPath = localPathInput.value.trim();
     state.runPostCommandTemplate = postCommandInput.value.trim();
     return "identical";
   }
@@ -333,6 +338,7 @@ export async function startOneUpload(): Promise<UploadStart> {
   const forceOverwrite =
     probe.action === "full_reupload" || forceOverwriteInput.checked;
   state.runRemotePath = probe.resolved_remote_path;
+  state.runLocalPath = localPathInput.value.trim();
   state.runPostCommandTemplate = postCommandInput.value.trim();
 
   setTransferring(true);
@@ -359,6 +365,14 @@ export function setTransferDirection(direction: TransferDirection) {
 }
 
 
+/** 凭证里的校验方式说明，用于没有逐文件校验摘要的场景（如批量传输）。 */
+export function verificationModeText(): string {
+  return isReliableMode()
+    ? t("弱网可靠模式：每块写入后读回比对 SHA-256，必要时再做整体 SHA-256 比对")
+    : t("快速模式：传完后整体比对 SHA-256");
+}
+
+
 /** 完成后留给分块地图播放绿色波纹的时间，略长于 BlockMap 的波纹时长。 */
 export const COMPLETE_REVEAL_MS = 1100;
 
@@ -379,7 +393,11 @@ export async function finishSuccessfulRun(
   message: string,
   stats: RunStats,
   remotePaths: string[],
+  files: ReceiptFile[] = [{ local: state.runLocalPath, remote: state.runRemotePath }],
+  verification = verifySummary.textContent || verificationModeText(),
 ) {
+  // 走到这里说明文件都已送达且校验通过（命令失败不影响这一点），可以出具凭证。
+  recordReceipt(state.runDirection, files, stats, verification);
   if (!state.runPostCommandTemplate) {
     showCommandResult(null);
     showResult("ok", title, message, stats);
@@ -408,6 +426,7 @@ export function showResult(
 ) {
   resultCard.className = `result-card ${kind}`;
   resultCard.dataset.transferOk = transferOk ? "1" : "";
+  syncReceiptVisibility(transferOk);
   resultIcon.innerHTML =
     kind === "ok" ? icons.check : kind === "paused" ? icons.pause : icons.alert;
   resultTitle.textContent = title;

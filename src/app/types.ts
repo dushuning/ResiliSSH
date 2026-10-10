@@ -246,9 +246,13 @@ export interface QueueItem {
   /** 展示用名称：文件夹上传时带上相对目录，便于区分同名文件。 */
   label: string;
   remote: string;
+  /** 实际的本地文件路径（下载时由预检解析出），用于传输凭证。 */
+  local: string;
   status: QueueItemStatus;
   message?: string;
   stats?: RunStats;
+  /** 两端已完全一致而跳过，凭证里需注明「本次未传输」。 */
+  identical?: boolean;
 }
 
 
@@ -275,6 +279,27 @@ export type UploadStart = "started" | "declined" | "identical";
 
 
 export type ResultKind = "ok" | "warn" | "error" | "paused";
+
+
+export interface ReceiptFile {
+  local: string;
+  remote: string;
+  skipped?: boolean;
+}
+
+
+export interface RunReceipt {
+  direction: TransferDirection;
+  endpoint: string;
+  /** 经过的跳板机，按连接顺序从最外层写起。 */
+  via: string[];
+  startedAt: number;
+  finishedAt: number;
+  elapsedMs: number;
+  retries: number;
+  verification: string;
+  files: ReceiptFile[];
+}
 
 
 export interface RunStats {

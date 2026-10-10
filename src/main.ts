@@ -12,7 +12,7 @@ import { appendConsoleLine, commandStorageKey, openCommandMenu, toggleSavedComma
 import { connectionPayload, forgetJumpSecrets, prepareConnection, rememberForSession, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./app/connection";
 import { PAGE_ORDER } from "./app/constants";
 import { closeConfirm, showConfirm } from "./app/dialogs";
-import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
+import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, copyReceiptBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, saveReceiptBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
 import { describeError, fileNameOf, formatBytes } from "./app/format";
 import { clearCheckpointFor, loadHistory, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
 import { showPage } from "./app/nav";
@@ -23,6 +23,7 @@ import { startQueueFlow } from "./app/queue";
 import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
 import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, setJumpSelection, startNewServer } from "./app/servers";
 import { applyThemePreference, initLanguagePreference, initThemePreference } from "./app/settings";
+import { copyReceipt, saveReceipt } from "./app/receipt";
 import { state } from "./app/state";
 import { getTransferredBytes, handleProgressUpdate, isDownloadMode, setTransferring, showTransferView, startDownloadFlow, startUploadFlow, updateModeHint, updateTransferDirectionUI } from "./app/transfer";
 import { ConnectionProfile, DownloadCheckpoint, DownloadProgressEvent, DownloadRetryEvent, PageId, ThemePreference, TransferDirection, UploadCheckpoint, UploadProgressEvent, UploadRetryEvent } from "./app/types";
@@ -39,6 +40,8 @@ rememberSecretsInput.addEventListener("change", updateAuthHintVisibility);
 
 
 jumpProfileSelect.addEventListener("change", () => updateConnectionSummary());
+copyReceiptBtn.addEventListener("click", () => void copyReceipt());
+saveReceiptBtn.addEventListener("click", () => void saveReceipt());
 
 
 profileSelect.addEventListener("change", async () => {

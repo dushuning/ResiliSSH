@@ -25,6 +25,7 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **Jump hosts** (ProxyJump), multi-hop, imported from `~/.ssh/config`
 - **Safe replace**: upload to a temporary file, swap in after verification
 - **Stay awake**: no idle sleep during transfers
+- **Transfer receipt**: copy/save a verified-transfer record
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
@@ -36,7 +37,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Later / maybe
 
-bandwidth limit · keep running from the menu bar · export a verification report · Windows & Linux builds (Tauri supports them; needs testing and packaging).
+bandwidth limit · keep running from the menu bar · Windows & Linux builds (Tauri supports them; needs testing and packaging).
 
 ## Out of scope
 

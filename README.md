@@ -43,6 +43,7 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 - **Host key verification** against `~/.ssh/known_hosts`; unknown hosts must be confirmed by fingerprint, changed keys are refused
 - Passwords and key passphrases live in the **macOS Keychain**, never in config files — or, per server, aren't stored at all
 - Private keys stay where they are; `ssh-agent` is supported
+- **Transfer receipt**: copy or save a plain-text record of a verified transfer — server (and jump hosts), times, verification method, reconnects, and each file's paths, size and SHA-256 — for tickets, colleagues or your own records
 
 **Everyday comfort**
 - Saved servers, import from `~/.ssh/config`, connection test

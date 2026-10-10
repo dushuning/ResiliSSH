@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- Transfer receipt on the result page: copy or save a plain-text record of a fully successful transfer (server and jump hosts, start/finish time with time zone, verification method, reconnects, and per-file local/remote paths, size and SHA-256). Not offered when any file failed, so it cannot be mistaken for proof of a partial run.
 - The Mac no longer idle-sleeps while an upload or download is running (including while waiting to reconnect). Closing the lid or choosing Sleep still works, and the assertion ends with the app even if it crashes.
 - Safe replace for uploads: data goes to a hidden `.name.resiliss-part` file in the same folder and replaces the target only after verification (atomic `mv` when the server allows commands, otherwise delete + rename). A failed or interrupted upload never leaves a half-written file at the target path, and the replaced file keeps its permissions. Checkpoints from earlier versions still resume in place.
 - Jump hosts (like `ssh -J`): pick another saved server under “Via” to reach internal servers through a bastion. Multi-hop chains (up to 3), `ProxyJump` from `~/.ssh/config` on import, host keys confirmed hop by hop, and the usual unlimited reconnect/resume. A jump host that forbids forwarding is reported instead of retried forever.

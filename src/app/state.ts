@@ -1,5 +1,5 @@
 // 运行时可变状态的唯一来源：各模块通过 state.xxx 读写，避免模块间各自持有副本。
-import { ConnectionProfile, DownloadCheckpoint, PageId, QueueItem, RemoteDirListing, RemoteDownloadProbe, RemoteUploadProbe, RunStepResult, TransferDirection, TransferView, UploadCheckpoint, UploadHistoryEntry } from "./types";
+import { ConnectionProfile, DownloadCheckpoint, PageId, QueueItem, RemoteDirListing, RemoteDownloadProbe, RemoteUploadProbe, RunReceipt, RunStepResult, TransferDirection, TransferView, UploadCheckpoint, UploadHistoryEntry } from "./types";
 
 /**
  * 运行时可变状态：集中在一个对象里，各模块通过 state.xxx 读写。
@@ -39,6 +39,10 @@ export const state = {
   runDirection: "upload" as TransferDirection,
   /** 本次传输的远端完整路径（预检解析后的结果），传完后命令的变量从这里取。 */
   runRemotePath: "",
+  /** 本次传输实际的本地文件（下载时由预检解析出的保存路径）。 */
+  runLocalPath: "",
+  /** 最近一次完整成功的传输，结果页的凭证按钮据此生成内容。 */
+  lastReceipt: null as RunReceipt | null,
   /** 传输开始时锁定的「传完后执行」命令：传输中输入框已锁定，这里只是避免读到之后的改动。 */
   runPostCommandTemplate: "",
   /** 传完后命令执行中：此时传输已结束（isTransferring=false），但界面仍停留在进行中视图。 */

@@ -186,6 +186,10 @@ export function appTemplate(appName: string): string {
               <div class="result-subtitle" id="resultSubtitle"></div>
               <div class="verify-summary hidden" id="verifySummary"></div>
               <dl class="result-stats" id="resultStats"></dl>
+              <div class="result-receipt hidden" id="resultReceipt">
+                <button class="btn btn-plain btn-small" id="copyReceiptBtn" type="button">${t("复制传输凭证")}</button>
+                <button class="btn btn-plain btn-small" id="saveReceiptBtn" type="button">${t("保存凭证…")}</button>
+              </div>
               <ul class="result-files hidden" id="resultFiles"></ul>
               <div class="result-command hidden" id="resultCommand">
                 <div class="result-command-line" id="resultCommandLine"></div>

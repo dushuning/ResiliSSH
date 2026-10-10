@@ -7,6 +7,7 @@ import { SPEED_REFRESH_MS, SPEED_SAMPLE_WINDOW_MS, SPEED_STALE_MS, UI_STALL_WARN
 import { blockMap, hostInput, legendDoneLabel, legendResumed, legendRetry, localPathInput, mapCaption, mapLegend, miniTransfer, miniTransferFill, miniTransferLabel, miniTransferPct, miniTransferSpeed, navTransferLive, progressBadge, progressDetail, progressPercent, progressSpeed, progressWrap, queueChip, remotePathInput, runSummary, statusText, verifySummary } from "./dom";
 import { fileNameOf, formatBytes, formatEtaSeconds, formatProgressPercent } from "./format";
 import { renderQueueResultFiles } from "./queue";
+import { clearReceipt } from "./receipt";
 import { state } from "./state";
 import { isDownloadMode, isReliableMode } from "./transfer";
 import { TransferDirection } from "./types";
@@ -17,6 +18,7 @@ export function beginRunVisuals() {
   state.progressTransferredBytes = 0;
   state.runStartedAt = Date.now();
   state.runStartBytes = null;
+  clearReceipt();
   blockMap.reset();
   blockMap.setVerifiedPerBlock(isReliableMode());
   if (state.activeQueue) {

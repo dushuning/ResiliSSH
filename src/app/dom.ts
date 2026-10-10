@@ -277,3 +277,6 @@ export const languageHint = document.querySelector<HTMLParagraphElement>("#langu
 
 
 export const copyLogBtn = document.querySelector<HTMLButtonElement>("#copyLogBtn")!;
+export const resultReceipt = document.querySelector<HTMLElement>("#resultReceipt")!;
+export const copyReceiptBtn = document.querySelector<HTMLButtonElement>("#copyReceiptBtn")!;
+export const saveReceiptBtn = document.querySelector<HTMLButtonElement>("#saveReceiptBtn")!;

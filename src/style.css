@@ -1301,6 +1301,13 @@ input[type="radio"] {
   font-weight: 600;
 }
 
+.result-receipt {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 .result-stats {
   display: grid;
   grid-template-columns: repeat(3, auto);

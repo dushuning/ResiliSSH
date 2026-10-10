@@ -785,6 +785,35 @@ fn expand_local_paths(paths: Vec<String>) -> local_files::ExpandedPaths {
     local_files::expand_local_paths(&paths)
 }
 
+#[derive(Serialize)]
+struct FileDigest {
+    size: u64,
+    sha256: String,
+}
+
+/// 传输凭证里的文件指纹。取本地文件：传输已逐块或整体比对过两端一致，本地哈希即两端内容的哈希；
+/// 预检时算过的直接命中缓存。读不了的文件返回 None，凭证里如实标注。
+#[tauri::command(async)]
+fn local_file_digests(paths: Vec<String>) -> Vec<Option<FileDigest>> {
+    paths
+        .iter()
+        .map(|path| {
+            let path = std::path::Path::new(path);
+            let size = std::fs::metadata(path).ok()?.len();
+            let sha256 = local_sha256(path)?;
+            Some(FileDigest { size, sha256 })
+        })
+        .collect()
+}
+
+/// 保存传输凭证。路径来自系统保存对话框（用户亲自选的），这里只负责写入。
+#[tauri::command(async)]
+fn save_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| {
+        crate::tr!(format!("保存失败：{e}"), format!("Could not save: {e}"))
+    })
+}
+
 #[tauri::command]
 fn list_activity_log() -> Vec<activity::ActivityEntry> {
     activity::entries()
@@ -2544,6 +2573,8 @@ pub fn run() {
             set_language,
             expand_local_paths,
             expand_remote_paths,
+            local_file_digests,
+            save_text_file,
             list_activity_log,
             clear_activity_log,
             update_connection_profile_extras,

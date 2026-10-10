@@ -8,7 +8,7 @@ import { asDir, describeError, fileNameOf } from "./format";
 import { setSelectedDownloads, setSelectedUploads } from "./paths";
 import { hideVerifySummary } from "./progress";
 import { state } from "./state";
-import { finishSuccessfulRun, setTransferring, showResult, startOneDownload, startOneUpload } from "./transfer";
+import { finishSuccessfulRun, setTransferring, showResult, startOneDownload, startOneUpload, verificationModeText } from "./transfer";
 import { QueueItem, QueueItemStatus, RunStats, RunStepResult, TransferDirection, UploadStart } from "./types";
 
 /**
@@ -40,6 +40,7 @@ export async function startQueueFlow() {
         target: rel ? `${baseDir}${rel}/` : baseDir,
         label: rel ? `${rel}/${fileNameOf(source)}` : fileNameOf(source),
         remote: "",
+        local: "",
         status: "pending",
       };
     }),
@@ -83,10 +84,13 @@ export async function startQueueFlow() {
         state.resolveQueueStep = null;
         item.status = "done";
         item.remote = state.runRemotePath;
+        item.local = state.runLocalPath;
+        item.identical = true;
         item.message = t("已是最新，跳过");
         continue;
       }
       item.remote = state.runRemotePath;
+      item.local = state.runLocalPath;
       const result = await step;
       item.stats = result.stats;
       if (result.status === "completed") {
@@ -156,6 +160,8 @@ export async function finishQueue(
         : t("已传到 {p1}:{p2}", { p1: hostInput.value.trim(), p2: remotePathInput.value.trim() }),
       stats,
       done.map((i) => i.remote),
+      done.map((i) => ({ local: i.local, remote: i.remote, skipped: i.identical })),
+      verificationModeText(),
     );
     return;
   }
