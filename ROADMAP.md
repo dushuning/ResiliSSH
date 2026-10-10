@@ -21,11 +21,13 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 - **i18n:** English and Chinese UI
 - **Internals:** persistent remote file handle + adaptive write size (≈3× faster at 100 ms RTT), Content Security Policy, frontend split into modules, end-to-end tests against a real `sshd`, run in CI on every push
 
-### Unreleased
+### v1.2.0 — 2026-10
 - **Jump hosts** (ProxyJump), multi-hop, imported from `~/.ssh/config`
 - **Safe replace**: uploads and downloads go to a temporary file, swapped in after verification
 - **Stay awake**: no idle sleep during transfers
 - **Transfer receipt**: copy/save a verified-transfer record
+- **Batches**: one confirmation, overall progress (also on the Dock icon), one history entry and one notification per batch
+- **First run**: one-click import from `~/.ssh/config`
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 

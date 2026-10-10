@@ -1,6 +1,6 @@
 [package]
 name = "sshutil"
-version = "1.1.0"
+version = "1.2.0"
 description = "ResiliSSH — macOS SFTP upload/download with weak-network resume"
 authors = ["cabbage"]
 edition = "2021"

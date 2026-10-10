@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-10
+
 ### Added
 - First-run guidance on the Transfer page: hosts found in `~/.ssh/config` are offered for one-click import (the form is pre-filled for you to check and save), or “Add server” when there are none.
 - Transfer progress on the Dock icon (overall progress for batches), so long transfers can run in the background.
@@ -91,6 +93,7 @@
 - macOS（Apple Silicon / Intel）
 - 构建：`npm run app` → `ResiliSSH.app` / `.dmg`
 
-[Unreleased]: https://github.com/dushuning/ResiliSSH/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/dushuning/ResiliSSH/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/dushuning/ResiliSSH/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dushuning/ResiliSSH/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dushuning/ResiliSSH/releases/tag/v1.0.0
