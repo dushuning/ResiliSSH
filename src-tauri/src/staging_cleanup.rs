@@ -5,7 +5,7 @@
 //! 所以只处理 staged 断点。清理都是尽力而为：失败只记日志并告知残留路径，不影响后续操作。
 
 use crate::activity::{self, Category};
-use crate::sftp::{connect_session, is_sftp_not_found, staging_path, ConnectionConfig};
+use crate::sftp::{is_sftp_not_found, staging_path, with_session, ConnectionConfig};
 use std::path::Path;
 
 /// 删除下载的本地临时文件。
@@ -30,14 +30,15 @@ pub fn remove_local_staging(final_local: &str) {
 /// 删除上传留在服务器上的临时文件。返回仍然残留的路径（删除失败时），供界面提示用户手动处理。
 pub fn remove_remote_staging(config: &ConnectionConfig, final_remote: &str) -> Option<String> {
     let part = staging_path(final_remote);
-    let result = connect_session(config)
-        .map_err(|e| e.to_string())
-        .and_then(|(session, _)| session.sftp().map_err(|e| e.to_string()))
-        .and_then(|sftp| match sftp.unlink(Path::new(&part)) {
+    // 走连接池：清理通常紧挨着一次预检或下一次传输，不值得为删一个文件单独握手一次。
+    let result = with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        match sftp.unlink(Path::new(&part)) {
             Ok(()) => Ok(true),
             Err(e) if is_sftp_not_found(&e) => Ok(false),
             Err(e) => Err(e.to_string()),
-        });
+        }
+    });
     match result {
         Ok(true) => {
             activity::info(

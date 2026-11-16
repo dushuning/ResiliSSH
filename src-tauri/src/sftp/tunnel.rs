@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 const PUMP_BUFFER_BYTES: usize = 64 * 1024;
 /// 无事件时 poll 的最长等待：兜底防止漏掉唤醒，同时让 keepalive 能按时发出。
 const POLL_TIMEOUT_MS: i32 = 1_000;
-/// 两个方向都没有任何数据流动的上限。目标会话每 30 秒会发 keepalive，正常连接不可能这么久没有流量；
+/// 两个方向都没有任何数据流动的上限。目标会话要么在传输（有流量），要么单次操作 30 秒超时后被丢弃，
+/// 空闲时发 keepalive 或只在连接池里短暂停留（远短于此值），正常连接不可能这么久没有流量；
 /// 超过即认定链路已死，结束线程释放跳板机连接，避免弱网下线程和 socket 永久挂起。
 const IDLE_LIMIT: Duration = Duration::from_secs(180);
 /// libssh2 未给出下次 keepalive 时间时的重试间隔。
@@ -58,6 +59,9 @@ fn pump(hop: Session, mut channel: Channel, mut local: UnixStream, hop_fd: Owned
         return;
     }
     hop.set_blocking(false);
+    // 跳板机会话只在本线程里以非阻塞方式使用，不受「keepalive 让阻塞等待提前超时」的影响；
+    // 它自己没有业务流量之外的保活手段，所以在这里打开，由下面的循环按时发送。
+    super::client::enable_keepalive(&hop);
 
     let mut buffer = vec![0_u8; PUMP_BUFFER_BYTES];
     let mut up: Vec<u8> = Vec::new(); // 目标会话 → 跳板机通道

@@ -29,10 +29,18 @@ pub struct DownloadCheckpoint {
     /// 它们的半截数据就在正式文件里，必须按原方式续传完。
     #[serde(default)]
     pub staged: bool,
+    /// 目标端现有的每一块是否都经过了读回比对（弱网可靠模式）。只要有一块是在快速模式下写的就是 false，
+    /// 此时即使后来切到可靠模式续传，结束时也不能跳过整文件哈希。旧断点没有这个字段，按 false（最保守）处理。
+    #[serde(default)]
+    pub all_chunks_verified: bool,
+    /// 已完成的字节区间。并行传输时各连接传文件的不同部分，进度不再是「开头连续的一段」。
+    /// 旧断点没有这个字段（空），此时以 verified_bytes 表示的开头一段为准。
+    #[serde(default)]
+    pub done_ranges: crate::sftp::RangeSet,
 }
 
 pub fn checkpoint_path() -> PathBuf {
-    crate::storage::app_data_dir().join(CHECKPOINT_FILE)
+    crate::storage::checkpoint_dir().join(CHECKPOINT_FILE)
 }
 
 pub fn save_download_checkpoint(checkpoint: &DownloadCheckpoint) -> Result<(), String> {

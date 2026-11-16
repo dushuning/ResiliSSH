@@ -1,9 +1,11 @@
 mod activity;
 mod checkpoint;
+pub mod cli;
 mod download_checkpoint;
 mod history;
 mod i18n;
 mod local_files;
+mod netwatch;
 mod power;
 mod staging_cleanup;
 #[cfg(test)]
@@ -29,7 +31,7 @@ use profiles::{
     ConnectionProfile, ProfileSecrets, SaveProfileRequest, UpdateProfileExtrasRequest,
 };
 use sftp::{
-    abort_socket, bytes_needed, connect_session, create_remote_directory, download_with_resume,
+    abort_socket, bytes_needed, create_remote_directory, AbortHandles, DEFAULT_CONNECTIONS, download_with_resume,
     expand_remote_paths as expand_sftp_remote_paths, format_remote_sftp_error, inspect_host_key,
     remote_paths_exist as sftp_remote_paths_exist,
     list_remote_directory, local_free_bytes, local_sha256,
@@ -53,7 +55,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
-const UPLOAD_STALL_TIMEOUT_SECS: u64 = 45;
+const TRANSFER_STALL_TIMEOUT_SECS: u64 = 45;
 
 /// 按传输阶段同步 stall 心跳：全文件校验关闭检测，块校验仅 defer，正常传输 touch
 fn sync_transfer_heartbeat(heartbeat: &ProgressHeartbeat, bytes: u64, status: &str) {
@@ -73,23 +75,55 @@ fn sync_transfer_heartbeat(heartbeat: &ProgressHeartbeat, bytes: u64, status: &s
 #[derive(Default)]
 struct UploadRuntime {
     cancel_flag: Option<Arc<AtomicBool>>,
-    abort_socket: Option<Arc<Mutex<Option<TcpStream>>>>,
+    abort_socket: Option<Arc<AbortHandles>>,
     is_running: bool,
-    /// 传输 worker 线程句柄。reset 时须 join 旧线程，确保它不再写断点文件，
-    /// 否则新传输可能与旧线程并发写同一断点文件导致内容交错损坏。
-    worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
 struct DownloadRuntime {
     cancel_flag: Option<Arc<AtomicBool>>,
-    abort_socket: Option<Arc<Mutex<Option<TcpStream>>>>,
+    abort_socket: Option<Arc<AbortHandles>>,
     is_running: bool,
-    /// 同 UploadRuntime::worker。
-    worker: Option<thread::JoinHandle<()>>,
 }
 
-const DOWNLOAD_STALL_TIMEOUT_SECS: u64 = 45;
+/// 两个方向的运行状态结构相同，但必须是两个类型（Tauri 按类型管理 State），用这个 trait 共享复位逻辑。
+trait TransferRuntime: Send + 'static {
+    fn reset(&mut self);
+}
+
+impl TransferRuntime for UploadRuntime {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl TransferRuntime for DownloadRuntime {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// 传输线程结束时复位运行状态。做成析构而不是线程末尾的一段代码：线程里任何一处 panic
+/// 都会跳过末尾，is_running 就此卡在 true，此后每次开始都报「已有任务在进行中」，只能重启应用。
+struct ResetRuntimeOnExit<R: TransferRuntime> {
+    app: AppHandle,
+    runtime: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<R: TransferRuntime> ResetRuntimeOnExit<R> {
+    fn new(app: &AppHandle) -> Self {
+        Self { app: app.clone(), runtime: std::marker::PhantomData }
+    }
+}
+
+impl<R: TransferRuntime> Drop for ResetRuntimeOnExit<R> {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.app.try_state::<Mutex<R>>() {
+            // 锁中毒也要复位：中毒正说明有线程 panic 过，这恰恰是需要兜底的情况。
+            runtime.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        }
+    }
+}
 
 #[derive(Default)]
 struct CloseGate(AtomicBool);
@@ -168,6 +202,9 @@ struct StartUploadRequest {
     remote_path: String,
     #[serde(default)]
     strict_chunk_verify: Option<bool>,
+    /// 并行连接数；不传则用默认值，小文件无论如何只用一条。
+    #[serde(default)]
+    connections: Option<usize>,
     #[serde(default)]
     force_overwrite: Option<bool>,
     /// 属于一次批量传输：逐个文件不写历史、不发通知，由前端在批量结束时整体处理。
@@ -211,6 +248,10 @@ struct UploadProgressEvent {
     retry_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     verify_summary: Option<String>,
+    /// 已完成的字节区间，供分块地图画出并行传输时不连续的进度。引擎的进度事件总会带上（哪怕还一块都没完成，为空数组），
+    /// 界面据此区分「还没有任何块完成」与「这个事件不含区间信息」；其他事件里为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_ranges: Option<Vec<(u64, u64)>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -236,6 +277,9 @@ struct StartDownloadRequest {
     remote_path: String,
     #[serde(default)]
     strict_chunk_verify: Option<bool>,
+    /// 并行连接数；不传则用默认值，小文件无论如何只用一条。
+    #[serde(default)]
+    connections: Option<usize>,
     #[serde(default)]
     force_overwrite: Option<bool>,
     /// 属于一次批量传输：逐个文件不写历史、不发通知，由前端在批量结束时整体处理。
@@ -280,6 +324,10 @@ struct DownloadProgressEvent {
     retry_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     verify_summary: Option<String>,
+    /// 已完成的字节区间，供分块地图画出并行传输时不连续的进度。引擎的进度事件总会带上（哪怕还一块都没完成，为空数组），
+    /// 界面据此区分「还没有任何块完成」与「这个事件不含区间信息」；其他事件里为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_ranges: Option<Vec<(u64, u64)>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -300,10 +348,14 @@ fn build_auth(request: &ConnectionRequest) -> Result<AuthMethod, String> {
             Ok(AuthMethod::Password(password))
         }
         "key" => {
+            // 手输的 `~/.ssh/id_ed25519` 保存时能通过存在性检查，libssh2 却不会展开 `~`；
+            // 在所有连接共用的入口统一展开，保存过的旧配置也一并生效。
             let key_path = request
                 .key_path
-                .clone()
+                .as_deref()
+                .map(str::trim)
                 .filter(|p| !p.is_empty())
+                .map(ssh_config::expand_home)
                 .ok_or_else(|| crate::tr!("请选择私钥文件", "Please choose a private key file").to_string())?;
             Ok(AuthMethod::PrivateKey {
                 key_path,
@@ -345,50 +397,29 @@ fn build_jump_config(jump: Option<&ConnectionRequest>) -> Result<Option<Box<Conn
     })
 }
 
-/// 传输函数在最终校验读远端失败时写下的 failure_reason（见 sftp::upload/download）。
-const FAILURE_VERIFY_READ: &str = "verify_read_failed";
+/// 传输函数在整文件哈希不一致时写下的 failure_reason（见 sftp::upload/download）。
+const FAILURE_HASH_MISMATCH: &str = "hash_mismatch";
 
-/// 数据全部传完、只是最终校验时读远端断了（弱网常见）：此时 trusted == file_size，
-/// 也必须走续传，传输循环会直接跳到校验阶段。若当成「无可续传进度」处理，
-/// 预检提示「仅需重试校验」，实际却会把整个大文件从头重传。
+/// 断点里的进度还能不能接着用。数据已全部传完（trusted == file_size）也算：可能是最终校验时
+/// 读远端断了，也可能是校验或替换阶段被取消、应用被退出——传输循环会直接跳到校验和替换。
+/// 若当成「无可续传进度」，就会把已经完整的临时文件删掉、把整个大文件从头重传。
+/// 只有哈希不一致例外：那份数据已被证明是坏的（进度也已清零）。
 fn can_resume_from(trusted: u64, file_size: u64, failure_reason: Option<&str>) -> bool {
-    trusted > 0
-        && (trusted < file_size
-            || (trusted == file_size && failure_reason == Some(FAILURE_VERIFY_READ)))
+    trusted > 0 && trusted <= file_size && failure_reason != Some(FAILURE_HASH_MISMATCH)
 }
 
-fn remote_paths_compatible(
-    checkpoint_remote: &str,
-    resolved_remote: &str,
-    user_remote: &str,
-) -> bool {
-    let cp = checkpoint_remote.trim();
-    let resolved = resolved_remote.trim();
-    let user = user_remote.trim();
-
-    if cp == resolved || cp == user {
-        return true;
-    }
-
-    let base = user.trim_end_matches('/');
-    cp == base || cp.starts_with(&format!("{base}/"))
+/// 断点记录的目标路径是否就是这次要写的路径。用户填的可以是完整文件路径，也可以是目录
+/// （此时目标是「目录/源文件名」）。不能放宽成「断点路径在该目录之下」：先传到 /data/sub/ 中断、
+/// 再改传 /data/ 时会被当成同一个任务，预检说可以续传，实际新位置没有任何数据，旧临时文件也成了孤儿。
+fn path_matches_checkpoint(checkpoint_path: &str, resolved: &str, user_input: &str, source_name: &str) -> bool {
+    let cp = checkpoint_path.trim();
+    let base = user_input.trim().trim_end_matches('/');
+    cp == resolved.trim() || cp == user_input.trim() || cp == base || cp == format!("{base}/{source_name}")
 }
 
-fn local_paths_compatible(
-    checkpoint_local: &str,
-    resolved_local: &str,
-    user_local: &str,
-) -> bool {
-    let cp = checkpoint_local.trim();
-    let resolved = resolved_local.trim();
-    let user = user_local.trim();
-
-    if cp == resolved || cp == user {
-        return true;
-    }
-
-    let base = user.trim_end_matches(|c| c == '/' || c == '\\');
-    cp == base || cp.starts_with(&format!("{base}/")) || cp.starts_with(&format!("{base}\\"))
+/// 路径的最后一段（文件名）；取不到时为空串，此时只按完整路径比较。
+fn file_name_of(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
 }
 
 fn send_desktop_notification(app: &AppHandle, title: &str, body: &str) {
@@ -570,7 +601,7 @@ fn create_remote_dir(request: CreateRemoteDirRequest) -> Result<RemoteDirListing
 
 /// 在访达中显示应用的数据位置（设置页里那几行路径），方便反馈问题时找到日志。
 /// 只接受固定的几种位置而不是任意路径：界面只需要打开这几处，不给网页层留下「打开任意文件」的入口。
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_app_location(app: AppHandle, location: String) -> Result<(), String> {
     let path = match location.as_str() {
         "data" => storage::app_data_dir(),
@@ -596,7 +627,7 @@ fn notify_batch_result(app: AppHandle, title: String, body: String) {
 }
 
 /// 批量传输结束时由前端整体记一条历史（逐个文件在批量中不记，见 StartUploadRequest::in_batch）。
-#[tauri::command]
+#[tauri::command(async)]
 fn record_batch_history(entry: history::UploadHistoryEntry) -> Result<(), String> {
     history::record_batch(entry)
 }
@@ -619,7 +650,7 @@ fn remote_paths_exist(request: ExpandRemotePathsRequest) -> Result<Vec<bool>, St
 }
 
 /// 批量下载前统计本地已有多少同名文件。
-#[tauri::command]
+#[tauri::command(async)]
 fn local_paths_exist(paths: Vec<String>) -> Vec<bool> {
     paths.iter().map(|p| std::path::Path::new(p).exists()).collect()
 }
@@ -763,7 +794,23 @@ struct ClearCheckpointOutcome {
 /// 清除上传断点，并删掉它在服务器上的临时文件（已无法续传）。只有当前连接正是断点所属的服务器时
 /// 才连过去删；否则或删除失败时仍清除断点，并把残留位置告诉用户。
 #[tauri::command(async)]
-fn clear_saved_checkpoint(request: Option<ConnectionRequest>) -> Result<ClearCheckpointOutcome, String> {
+fn clear_saved_checkpoint(
+    runtime: State<'_, Mutex<UploadRuntime>>,
+    request: Option<ConnectionRequest>,
+) -> Result<ClearCheckpointOutcome, String> {
+    // 传输线程正在往这个断点对应的临时文件里写：此时删掉它，传完后才会在替换阶段莫名失败。
+    if runtime.lock().map_err(|e| e.to_string())?.is_running {
+        return Err(crate::tr!(
+            "上传进行中，请先取消再清除断点",
+            "An upload is in progress; cancel it before clearing the checkpoint"
+        )
+        .into());
+    }
+    discard_upload_checkpoint(request)
+}
+
+/// 命令的实际工作，与「是否正在传输」的检查分开，端到端测试可以不经 Tauri 状态直接调用。
+fn discard_upload_checkpoint(request: Option<ConnectionRequest>) -> Result<ClearCheckpointOutcome, String> {
     let checkpoint = load_checkpoint().ok().flatten();
     clear_checkpoint()?;
     let Some(cp) = checkpoint.filter(|cp| cp.staged) else {
@@ -798,8 +845,20 @@ fn get_saved_download_checkpoint() -> Result<Option<DownloadCheckpoint>, String>
 }
 
 /// 清除下载断点，并删掉本地的临时文件（已无法续传）。
-#[tauri::command]
-fn clear_saved_download_checkpoint() -> Result<(), String> {
+#[tauri::command(async)]
+fn clear_saved_download_checkpoint(runtime: State<'_, Mutex<DownloadRuntime>>) -> Result<(), String> {
+    // 理由同 clear_saved_checkpoint：不能删掉传输线程正在写的临时文件。
+    if runtime.lock().map_err(|e| e.to_string())?.is_running {
+        return Err(crate::tr!(
+            "下载进行中，请先取消再清除断点",
+            "A download is in progress; cancel it before clearing the checkpoint"
+        )
+        .into());
+    }
+    discard_download_checkpoint()
+}
+
+fn discard_download_checkpoint() -> Result<(), String> {
     let checkpoint = load_download_checkpoint().ok().flatten();
     clear_download_checkpoint()?;
     if let Some(cp) = checkpoint.filter(|cp| cp.staged) {
@@ -943,7 +1002,7 @@ fn delete_connection_profile(id: String) -> Result<(), String> {
     delete_profile(id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_upload_history() -> Result<Vec<history::UploadHistoryEntry>, String> {
     list_history()
 }
@@ -1101,154 +1160,152 @@ fn probe_remote_upload(request: ProbeUploadRequest) -> Result<RemoteUploadProbe,
         jump: request.jump.clone(),
     };
     let config = build_connection_config(&conn)?;
-    let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
+    // 复用测试连接 / 上一次预检留下的会话，成功后再留给紧接着的传输线程：
+    // 从点击开始到出现进度之间不必再为每一步各做一次完整握手。
+    let (session, abort) = sftp::acquire_session(&config).map_err(|e| e.to_string())?;
+    let probe = (|| -> Result<RemoteUploadProbe, String> {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
 
-    let actual_remote_path =
-        resolve_upload_target(&sftp, &resolved_remote_path, &local_path).map_err(|e| e.to_string())?;
+        let actual_remote_path =
+            resolve_upload_target(&sftp, &resolved_remote_path, &local_path).map_err(|e| e.to_string())?;
 
-    let parent_hint = remote_parent_status(&sftp, &actual_remote_path);
+        let parent_hint = remote_parent_status(&sftp, &actual_remote_path);
 
-    let remote_size = match sftp.stat(std::path::Path::new(&actual_remote_path)) {
-        Ok(stat) => stat.size.unwrap_or(0),
-        Err(_) => 0,
-    };
-    let remote_exists = remote_size > 0;
+        // 是否存在以 stat 成功为准而不是大小：0 字节的远端文件同样会被替换，也要走覆盖确认。
+        let remote_stat = sftp.stat(std::path::Path::new(&actual_remote_path)).ok();
+        let remote_exists = remote_stat.is_some();
+        let remote_size = remote_stat.and_then(|stat| stat.size).unwrap_or(0);
 
-    let checkpoint = load_checkpoint().ok().flatten();
-    let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
-        cp.local_path == request.local_path
-            && remote_paths_compatible(&cp.remote_path, &actual_remote_path, &request.remote_path)
-            && cp.host == request.host
-            && cp.port == request.port
-            && cp.username == request.username
-    });
-    // 新传输先写临时文件；只有旧版本留下的断点仍直接写在目标文件里（见 UploadCheckpoint::staged）。
-    let staged = matching_checkpoint.map_or(true, |cp| cp.staged);
-    // 已在远端、可续传或可就地复用的字节：staged 时在临时文件里，目标文件本身要等替换时才释放空间。
-    let reusable_bytes = if staged {
-        sftp.stat(std::path::Path::new(&staging_path(&actual_remote_path)))
-            .ok()
-            .and_then(|st| st.size)
-            .unwrap_or(0)
-    } else {
-        remote_size
-    };
-    let verified_bytes = matching_checkpoint
-        .map(|cp| {
-            if cp.verified_bytes > 0 {
-                cp.verified_bytes
-            } else {
-                cp.uploaded_bytes
-            }
-        })
-        .unwrap_or(0);
+        let checkpoint = load_checkpoint().ok().flatten();
+        let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
+            cp.local_path == request.local_path
+                && path_matches_checkpoint(&cp.remote_path, &actual_remote_path, &request.remote_path, file_name_of(&request.local_path))
+                && cp.host == request.host
+                && cp.port == request.port
+                && cp.username == request.username
+        });
+        // 新传输先写临时文件；只有旧版本留下的断点仍直接写在目标文件里（见 UploadCheckpoint::staged）。
+        let staged = matching_checkpoint.is_none_or(|cp| cp.staged);
+        // 已在远端、可就地复用的字节。临时文件的大小不能算数：并行传输时各连接往文件的不同位置写，
+        // 文件大小很快接近完整大小，实际写进去的却只有一部分；真正占了空间的以断点记录（verified_bytes）为准。
+        // 旧版断点直接写目标文件，目标现有的字节会被原地覆盖，不需要额外空间。
+        let reusable_bytes = if staged { 0 } else { remote_size };
+        let verified_bytes = matching_checkpoint
+            .map(|cp| {
+                if cp.verified_bytes > 0 {
+                    cp.verified_bytes
+                } else {
+                    cp.uploaded_bytes
+                }
+            })
+            .unwrap_or(0);
 
-    let preflight = upload_preflight(
-        &session,
-        &sftp,
-        &local_path,
-        &actual_remote_path,
-        local_size,
-        remote_size,
-        reusable_bytes,
-        verified_bytes,
-    );
+        let preflight = upload_preflight(
+            &session,
+            &sftp,
+            &local_path,
+            &actual_remote_path,
+            local_size,
+            remote_size,
+            reusable_bytes,
+            verified_bytes,
+        );
 
-    let (action, message) = if let Some(preflight) = preflight {
-        preflight
-    } else if checkpoint.as_ref().is_some_and(|cp| {
-        cp.failure_reason.as_deref() == Some("verify_read_failed")
-            && cp.uploaded_bytes >= cp.file_size
-    }) {
-        (
-            "verify_retry",
-            crate::tr!(
-                "传输已完成，仅需重试最终校验，无需从头重传",
-                "Transfer already complete; only the final verification will be retried, no full re-upload"
-            )
-            .into(),
-        )
-    } else if checkpoint.as_ref().is_some_and(|cp| {
-        cp.failure_reason.as_deref() == Some("hash_mismatch")
-            || (cp.status == CheckpointStatus::Failed
+        let (action, message) = if let Some(preflight) = preflight {
+            preflight
+        // 以下两个分支只看「属于这次传输」的断点：用全局断点的话，另一个文件留下的失败状态
+        // 会让这次传输被报成「仅需重试校验」并跳过覆盖确认，实际却是整份重传、替换远端文件。
+        } else if matching_checkpoint.is_some_and(|cp| {
+            // 数据已全部到位、只差校验/替换（见 can_resume_from），无论上次是断网、取消还是退出。
+            cp.file_size > 0
                 && cp.uploaded_bytes >= cp.file_size
-                && cp.failure_reason.as_deref() != Some("verify_read_failed"))
-    }) {
-        (
-            "full_reupload",
-            crate::tr!(
-                "上次校验未通过，将从头重传；远端原文件在新文件校验通过前保持不变",
-                "Last verification failed; the file will be uploaded again from scratch, and the existing remote file stays untouched until the new one is verified"
+                && cp.failure_reason.as_deref() != Some(FAILURE_HASH_MISMATCH)
+        }) {
+            (
+                "verify_retry",
+                crate::tr!(
+                    "传输已完成，仅需重试最终校验，无需从头重传",
+                    "Transfer already complete; only the final verification will be retried, no full re-upload"
+                )
+                .into(),
             )
-            .into(),
-        )
-    } else if verified_bytes > 0 && verified_bytes < local_size {
-        (
-            "resume",
-            crate::tr!(
-                format!(
-                    "将从已验证的 {} 字节处续传（约 {:.1} MB）",
-                    verified_bytes,
-                    verified_bytes as f64 / 1024.0 / 1024.0
-                ),
-                format!(
-                    "Will resume from {} already verified",
-                    activity::format_bytes(verified_bytes)
+        } else if matching_checkpoint.is_some_and(|cp| cp.failure_reason.as_deref() == Some(FAILURE_HASH_MISMATCH)) {
+            (
+                "full_reupload",
+                crate::tr!(
+                    "上次校验未通过，将从头重传；远端原文件在新文件校验通过前保持不变",
+                    "Last verification failed; the file will be uploaded again from scratch, and the existing remote file stays untouched until the new one is verified"
                 )
-            ),
-        )
-    } else if remote_exists && staged {
-        (
-            "overwrite",
-            crate::tr!(
-                format!(
-                    "远端已有文件（{}），传完并校验通过后才会替换，期间旧文件保持不变",
-                    activity::format_bytes(remote_size)
-                ),
-                format!(
-                    "Remote file already exists ({}); it is replaced only after the upload is verified, until then the old file stays untouched",
-                    activity::format_bytes(remote_size)
-                )
-            ),
-        )
-    } else if remote_exists {
-        (
-            "overwrite",
-            crate::tr!(
-                format!("远端已有文件（{} 字节），将覆盖重传", remote_size),
-                format!(
-                    "Remote file already exists ({}); it will be overwritten",
-                    activity::format_bytes(remote_size)
-                )
-            ),
-        )
-    } else {
-        (
-            "new",
-            crate::tr!(
-                "远端无此文件，将新建上传",
-                "Remote file does not exist; a new upload will be created"
+                .into(),
             )
-            .into(),
-        )
-    };
+        } else if verified_bytes > 0 && verified_bytes < local_size {
+            (
+                "resume",
+                // 说「已完成多少」而不是「从哪里续传」：并行传输后已完成的部分不一定是文件开头连续的一段。
+                crate::tr!(
+                    format!("已完成 {}，将继续传输剩余部分", activity::format_bytes(verified_bytes)),
+                    format!(
+                        "{} already transferred; the rest will be sent",
+                        activity::format_bytes(verified_bytes)
+                    )
+                ),
+            )
+        } else if remote_exists && staged {
+            (
+                "overwrite",
+                crate::tr!(
+                    format!(
+                        "远端已有文件（{}），传完并校验通过后才会替换，期间旧文件保持不变",
+                        activity::format_bytes(remote_size)
+                    ),
+                    format!(
+                        "Remote file already exists ({}); it is replaced only after the upload is verified, until then the old file stays untouched",
+                        activity::format_bytes(remote_size)
+                    )
+                ),
+            )
+        } else if remote_exists {
+            (
+                "overwrite",
+                crate::tr!(
+                    format!("远端已有文件（{} 字节），将覆盖重传", remote_size),
+                    format!(
+                        "Remote file already exists ({}); it will be overwritten",
+                        activity::format_bytes(remote_size)
+                    )
+                ),
+            )
+        } else {
+            (
+                "new",
+                crate::tr!(
+                    "远端无此文件，将新建上传",
+                    "Remote file does not exist; a new upload will be created"
+                )
+                .into(),
+            )
+        };
 
-    let message = if let Some(parent_msg) = parent_hint {
-        crate::tr!(format!("{message}。{parent_msg}"), format!("{message}. {parent_msg}"))
-    } else {
-        message
-    };
+        let message = if let Some(parent_msg) = parent_hint {
+            crate::tr!(format!("{message}。{parent_msg}"), format!("{message}. {parent_msg}"))
+        } else {
+            message
+        };
 
-    Ok(RemoteUploadProbe {
-        resolved_remote_path: actual_remote_path,
-        remote_exists,
-        remote_size,
-        local_size,
-        verified_bytes,
-        action: action.into(),
-        message,
-    })
+        Ok(RemoteUploadProbe {
+            resolved_remote_path: actual_remote_path,
+            remote_exists,
+            remote_size,
+            local_size,
+            verified_bytes,
+            action: action.into(),
+            message,
+        })
+    })();
+    if probe.is_ok() {
+        sftp::release_session(&config, session, abort);
+    }
+    probe
 }
 
 #[tauri::command(async)]
@@ -1274,162 +1331,159 @@ fn probe_remote_download(request: ProbeDownloadRequest) -> Result<RemoteDownload
         jump: request.jump.clone(),
     };
     let config = build_connection_config(&conn)?;
-    let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
+    // 复用测试连接 / 上一次预检留下的会话，成功后再留给紧接着的传输线程：
+    // 从点击开始到出现进度之间不必再为每一步各做一次完整握手。
+    let (session, abort) = sftp::acquire_session(&config).map_err(|e| e.to_string())?;
+    let probe = (|| -> Result<RemoteDownloadProbe, String> {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
 
-    let remote_path = request.remote_path.trim();
-    let remote_stat = sftp
-        .stat(std::path::Path::new(remote_path))
-        .map_err(|e| {
-            crate::tr!(
-                format!("远端路径错误：{remote_path} — 无法访问：{e}"),
-                format!("Remote path error: {remote_path} — cannot access: {e}")
-            )
-        })?;
-    if !remote_stat.is_file() {
-        return Err(crate::tr!(
-            format!("远端路径错误：{remote_path} — 请填写服务器上的文件路径，不能是目录"),
-            format!(
-                "Remote path error: {remote_path} — enter a file path on the server, not a directory"
-            )
-        ));
-    }
-    let remote_size = remote_stat.size.unwrap_or(0);
-    if remote_size == 0 {
-        return Err(crate::tr!("远端文件为空", "Remote file is empty").into());
-    }
+        let remote_path = request.remote_path.trim();
+        let remote_stat = sftp
+            .stat(std::path::Path::new(remote_path))
+            .map_err(|e| {
+                crate::tr!(
+                    format!("远端路径错误：{remote_path} — 无法访问：{e}"),
+                    format!("Remote path error: {remote_path} — cannot access: {e}")
+                )
+            })?;
+        if !remote_stat.is_file() {
+            return Err(crate::tr!(
+                format!("远端路径错误：{remote_path} — 请填写服务器上的文件路径，不能是目录"),
+                format!(
+                    "Remote path error: {remote_path} — enter a file path on the server, not a directory"
+                )
+            ));
+        }
+        let remote_size = remote_stat.size.unwrap_or(0);
 
-    let file_name = remote_file_name(remote_path).map_err(|e| e.to_string())?;
-    let resolved_local_path =
-        resolve_local_path(&request.local_path, &file_name).map_err(|e| e.to_string())?;
-    let local_size = std::fs::metadata(&resolved_local_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+        let file_name = remote_file_name(remote_path).map_err(|e| e.to_string())?;
+        let resolved_local_path =
+            resolve_local_path(&request.local_path, &file_name).map_err(|e| e.to_string())?;
+        let local_size = std::fs::metadata(&resolved_local_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
-    let checkpoint = load_download_checkpoint().ok().flatten();
-    let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
-        local_paths_compatible(&cp.local_path, &resolved_local_path, &request.local_path)
-            && remote_paths_compatible(&cp.remote_path, remote_path, remote_path)
-            && cp.host == request.host
-            && cp.port == request.port
-            && cp.username == request.username
-    });
-    // 与上传对称：新下载先写临时文件，可续传的字节在临时文件里；旧版断点仍在正式文件里。
-    let staged = matching_checkpoint.map_or(true, |cp| cp.staged);
-    let reusable_bytes = if staged {
-        std::fs::metadata(staging_path(&resolved_local_path)).map(|m| m.len()).unwrap_or(0)
-    } else {
-        local_size
-    };
-    let verified_bytes = matching_checkpoint
-        .map(|cp| {
-            if cp.verified_bytes > 0 {
-                cp.verified_bytes
-            } else {
-                cp.downloaded_bytes
-            }
-        })
-        .unwrap_or(0);
+        let checkpoint = load_download_checkpoint().ok().flatten();
+        let matching_checkpoint = checkpoint.as_ref().filter(|cp| {
+            path_matches_checkpoint(&cp.local_path, &resolved_local_path, &request.local_path, &file_name)
+                && cp.remote_path.trim() == remote_path
+                && cp.host == request.host
+                && cp.port == request.port
+                && cp.username == request.username
+        });
+        // 与上传对称：新下载先写临时文件，可续传的字节在临时文件里；旧版断点仍在正式文件里。
+        let staged = matching_checkpoint.is_none_or(|cp| cp.staged);
+        // 与上传预检相同：临时文件的大小不代表已写入的数据量，以断点记录为准。
+        let reusable_bytes = if staged { 0 } else { local_size };
+        let verified_bytes = matching_checkpoint
+            .map(|cp| {
+                if cp.verified_bytes > 0 {
+                    cp.verified_bytes
+                } else {
+                    cp.downloaded_bytes
+                }
+            })
+            .unwrap_or(0);
 
-    let local_exists = local_size > 0;
-    let preflight = download_preflight(
-        &session,
-        remote_path,
-        std::path::Path::new(&resolved_local_path),
-        remote_size,
-        local_size,
-        reusable_bytes,
-        verified_bytes,
-    );
-    let (action, message) = if let Some(preflight) = preflight {
-        preflight
-    } else if checkpoint.as_ref().is_some_and(|cp| {
-        cp.failure_reason.as_deref() == Some("verify_read_failed")
-            && cp.downloaded_bytes >= cp.file_size
-    }) {
-        (
-            "verify_retry",
-            crate::tr!(
-                "传输已完成，仅需重试最终校验，无需从头重下",
-                "Transfer already complete; only the final verification will be retried, no full re-download"
-            )
-            .into(),
-        )
-    } else if checkpoint.as_ref().is_some_and(|cp| {
-        cp.failure_reason.as_deref() == Some("hash_mismatch")
-            || (cp.status == CheckpointStatus::Failed
+        let local_exists = local_size > 0;
+        let preflight = download_preflight(
+            &session,
+            remote_path,
+            std::path::Path::new(&resolved_local_path),
+            remote_size,
+            local_size,
+            reusable_bytes,
+            verified_bytes,
+        );
+        let (action, message) = if let Some(preflight) = preflight {
+            preflight
+        // 与上传预检相同：只看属于这次下载的断点，别的文件留下的失败状态不能影响这里的结论。
+        } else if matching_checkpoint.is_some_and(|cp| {
+            // 数据已全部到位、只差校验/替换（见 can_resume_from），无论上次是断网、取消还是退出。
+            cp.file_size > 0
                 && cp.downloaded_bytes >= cp.file_size
-                && cp.failure_reason.as_deref() != Some("verify_read_failed"))
-    }) {
-        (
-            "full_redownload",
-            crate::tr!(
-                "上次校验未通过，将从头重下；本地原文件在新文件校验通过前保持不变",
-                "Last verification failed; the file will be downloaded again from scratch, and the existing local file stays untouched until the new one is verified"
+                && cp.failure_reason.as_deref() != Some(FAILURE_HASH_MISMATCH)
+        }) {
+            (
+                "verify_retry",
+                crate::tr!(
+                    "传输已完成，仅需重试最终校验，无需从头重下",
+                    "Transfer already complete; only the final verification will be retried, no full re-download"
+                )
+                .into(),
             )
-            .into(),
-        )
-    } else if verified_bytes > 0 && verified_bytes < remote_size {
-        (
-            "resume",
-            crate::tr!(
-                format!(
-                    "将从已验证的 {} 字节处续传（约 {:.1} MB）",
-                    verified_bytes,
-                    verified_bytes as f64 / 1024.0 / 1024.0
-                ),
-                format!(
-                    "Will resume from {} already verified",
-                    activity::format_bytes(verified_bytes)
+        } else if matching_checkpoint.is_some_and(|cp| cp.failure_reason.as_deref() == Some(FAILURE_HASH_MISMATCH)) {
+            (
+                "full_redownload",
+                crate::tr!(
+                    "上次校验未通过，将从头重下；本地原文件在新文件校验通过前保持不变",
+                    "Last verification failed; the file will be downloaded again from scratch, and the existing local file stays untouched until the new one is verified"
                 )
-            ),
-        )
-    } else if local_exists && staged {
-        (
-            "overwrite",
-            crate::tr!(
-                format!(
-                    "本地已有同名文件（{}），下载并校验通过后才会替换，期间旧文件保持不变",
-                    activity::format_bytes(local_size)
-                ),
-                format!(
-                    "A local file with this name already exists ({}); it is replaced only after the download is verified, until then it stays untouched",
-                    activity::format_bytes(local_size)
-                )
-            ),
-        )
-    } else if local_exists {
-        (
-            "overwrite",
-            crate::tr!(
-                format!("本地已有文件（{} 字节），将覆盖重下", local_size),
-                format!(
-                    "Local file already exists ({}); it will be overwritten",
-                    activity::format_bytes(local_size)
-                )
-            ),
-        )
-    } else {
-        (
-            "new",
-            crate::tr!(
-                "本地无此文件，将新建下载",
-                "Local file does not exist; a new download will be created"
+                .into(),
             )
-            .into(),
-        )
-    };
+        } else if verified_bytes > 0 && verified_bytes < remote_size {
+            (
+                "resume",
+                // 说「已完成多少」而不是「从哪里续传」：并行传输后已完成的部分不一定是文件开头连续的一段。
+                crate::tr!(
+                    format!("已完成 {}，将继续传输剩余部分", activity::format_bytes(verified_bytes)),
+                    format!(
+                        "{} already transferred; the rest will be sent",
+                        activity::format_bytes(verified_bytes)
+                    )
+                ),
+            )
+        } else if local_exists && staged {
+            (
+                "overwrite",
+                crate::tr!(
+                    format!(
+                        "本地已有同名文件（{}），下载并校验通过后才会替换，期间旧文件保持不变",
+                        activity::format_bytes(local_size)
+                    ),
+                    format!(
+                        "A local file with this name already exists ({}); it is replaced only after the download is verified, until then it stays untouched",
+                        activity::format_bytes(local_size)
+                    )
+                ),
+            )
+        } else if local_exists {
+            (
+                "overwrite",
+                crate::tr!(
+                    format!("本地已有文件（{} 字节），将覆盖重下", local_size),
+                    format!(
+                        "Local file already exists ({}); it will be overwritten",
+                        activity::format_bytes(local_size)
+                    )
+                ),
+            )
+        } else {
+            (
+                "new",
+                crate::tr!(
+                    "本地无此文件，将新建下载",
+                    "Local file does not exist; a new download will be created"
+                )
+                .into(),
+            )
+        };
 
-    Ok(RemoteDownloadProbe {
-        resolved_local_path,
-        resolved_remote_path: remote_path.to_string(),
-        remote_exists: true,
-        remote_size,
-        local_size,
-        verified_bytes,
-        action: action.into(),
-        message,
-    })
+        Ok(RemoteDownloadProbe {
+            resolved_local_path,
+            resolved_remote_path: remote_path.to_string(),
+            remote_exists: true,
+            remote_size,
+            local_size,
+            verified_bytes,
+            action: action.into(),
+            message,
+        })
+    })();
+    if probe.is_ok() {
+        sftp::release_session(&config, session, abort);
+    }
+    probe
 }
 
 #[tauri::command(async)]
@@ -1480,12 +1534,8 @@ fn cancel_upload(
         flag.store(true, Ordering::Relaxed);
     }
 
-    if let Some(holder) = &state.abort_socket {
-        if let Ok(guard) = holder.lock() {
-            if let Some(socket) = guard.as_ref() {
-                abort_socket(socket);
-            }
-        }
+    if let Some(aborts) = &state.abort_socket {
+        aborts.abort_all();
     }
 
     let _ = app.emit(
@@ -1497,6 +1547,7 @@ fn cancel_upload(
             message: crate::tr!("正在取消，正在中断连接...", "Cancelling, closing the connection...").into(),
             retry_count: 0,
             verify_summary: None,
+            done_ranges: None,
         },
     );
 
@@ -1504,37 +1555,6 @@ fn cancel_upload(
 }
 
 #[tauri::command(async)]
-fn reset_upload_state(runtime: State<'_, Mutex<UploadRuntime>>) -> Result<(), String> {
-    // 置取消位 + 中断在途 IO，取出 worker 句柄后释放锁再 join：
-    // worker 结束时会回锁 runtime 设 is_running=false，若持锁 join 会死锁。
-    let worker = {
-        let mut state = runtime.lock().map_err(|e| e.to_string())?;
-        if let Some(flag) = &state.cancel_flag {
-            flag.store(true, Ordering::Relaxed);
-        }
-        // 主动关闭 socket 让 worker 尽快跳出阻塞的网络 syscall，避免 join 长时间等待。
-        if let Some(holder) = &state.abort_socket {
-            if let Ok(guard) = holder.lock() {
-                if let Some(socket) = guard.as_ref() {
-                    abort_socket(socket);
-                }
-            }
-        }
-        state.worker.take()
-    };
-    // 等旧 worker 真正退出，确保它不再写断点文件，再放行新传输。
-    if let Some(handle) = worker {
-        let _ = handle.join();
-    }
-    let mut state = runtime.lock().map_err(|e| e.to_string())?;
-    state.is_running = false;
-    state.cancel_flag = None;
-    state.abort_socket = None;
-    state.worker = None;
-    Ok(())
-}
-
-#[tauri::command]
 fn start_upload(
     app: AppHandle,
     runtime: State<'_, Mutex<UploadRuntime>>,
@@ -1569,6 +1589,9 @@ fn start_upload(
         jump: request.jump.clone(),
     })?;
 
+    // 所有可能失败的准备工作都必须在写断点、置 is_running 之前完成：之后再出错的话
+    // 没有工作线程来复位状态，此后每次开始都会报「已有任务在进行中」。
+    let jump = build_jump_config(request.jump.as_deref())?;
     let auth_kind = match &auth {
         AuthMethod::Password(_) => AuthKind::Password,
         AuthMethod::PrivateKey { .. } => AuthKind::PrivateKey,
@@ -1584,7 +1607,7 @@ fn start_upload(
         } else {
             cp.uploaded_bytes
         };
-        remote_paths_compatible(&cp.remote_path, &resolved_remote_path, &request.remote_path)
+        path_matches_checkpoint(&cp.remote_path, &resolved_remote_path, &request.remote_path, file_name_of(&request.local_path))
             && cp.local_path == request.local_path
             && cp.host == request.host
             && cp.port == request.port
@@ -1667,7 +1690,18 @@ fn start_upload(
         staged: existing_checkpoint
             .as_ref()
             .filter(|_| should_resume)
-            .map_or(true, |cp| cp.staged),
+            .is_none_or(|cp| cp.staged),
+        // 续传时沿用断点里的记录；新传输从 0 开始，传输函数会在开头置为 true。
+        all_chunks_verified: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .is_some_and(|cp| cp.all_chunks_verified),
+        // 续传必须带上已完成的区间：并行传输的进度不是「开头连续的一段」，丢了它就会把没传的部分当成已传。
+        done_ranges: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .map(|cp| cp.done_ranges.clone())
+            .unwrap_or_default(),
     }));
 
     // 不续传时，旧断点即将被新断点覆盖，它在服务器上的临时文件再也续不上了：同一台服务器就在
@@ -1693,7 +1727,7 @@ fn start_upload(
     let strict_chunk_verify = Arc::new(AtomicBool::new(
         request.strict_chunk_verify.unwrap_or(true),
     ));
-    let abort_socket_holder = Arc::new(Mutex::new(None));
+    let abort_socket_holder = Arc::new(AbortHandles::default());
     state.cancel_flag = Some(cancel_flag.clone());
     state.abort_socket = Some(abort_socket_holder.clone());
     state.is_running = true;
@@ -1703,7 +1737,7 @@ fn start_upload(
         port: request.port,
         username: request.username.clone(),
         auth,
-        jump: build_jump_config(request.jump.as_deref())?,
+        jump,
     };
 
     let remote_path = resolved_remote_path;
@@ -1716,15 +1750,18 @@ fn start_upload(
     // 批量中的文件不逐个写历史、不逐个发通知：几百个文件会把历史挤满、把通知中心刷屏，
     // 整批结束时由前端统一记一条历史、发一条汇总通知。
     let report_per_file = !request.in_batch;
-    let worker = thread::spawn(move || {
+    let connections = request.connections.unwrap_or(DEFAULT_CONNECTIONS);
+    thread::spawn(move || {
+        // 最先声明、最后析构：线程以任何方式结束（含 panic）都会把运行状态复位。
+        let _reset = ResetRuntimeOnExit::<UploadRuntime>::new(&app);
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始上传 {} → {}:{}", local_path_string, host_for_history, remote_path),
                 format!("Upload started {} → {}:{}", local_path_string, host_for_history, remote_path)
             ));
         let milestones = Arc::new(ProgressMilestones::new("上传", "Uploaded"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_uploaded_bytes));
-        let stall_timeout = Duration::from_secs(UPLOAD_STALL_TIMEOUT_SECS);
-        let stall_secs = UPLOAD_STALL_TIMEOUT_SECS;
+        let stall_timeout = Duration::from_secs(TRANSFER_STALL_TIMEOUT_SECS);
+        let stall_secs = TRANSFER_STALL_TIMEOUT_SECS;
 
         let watchdog = spawn_stall_watchdog(
             heartbeat.clone(),
@@ -1760,6 +1797,7 @@ fn start_upload(
                             },
                             retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
@@ -1786,9 +1824,15 @@ fn start_upload(
                     let app = app.clone();
                     let heartbeat = heartbeat.clone();
                     let milestones = milestones.clone();
+                    let checkpoint = checkpoint_for_thread.clone();
                     move |uploaded, total, status, retry_count| {
                         sync_transfer_heartbeat(&heartbeat, uploaded, status);
                         milestones.observe(uploaded, total, status);
+                        // 「完成」事件只由工作线程收尾时发一次（带校验摘要）。这里再发一次的话，
+                        // 批量传输会把第二条算到下一个文件头上，传完后命令也会被触发两次。
+                        if status == "completed" {
+                            return;
+                        }
                         let retry_hint = if retry_count > 0 {
                             crate::tr!(
                                 format!(" · 重试 {retry_count} 次"),
@@ -1809,6 +1853,7 @@ fn start_upload(
                                 ),
                                 retry_count,
                                 verify_summary: None,
+                                done_ranges: Some(checkpoint.lock().map(|cp| cp.done_ranges.ranges().to_vec()).unwrap_or_default()),
                             },
                         );
                     }
@@ -1848,6 +1893,7 @@ fn start_upload(
                                 message: retry_message,
                                 retry_count,
                                 verify_summary: None,
+                                done_ranges: None,
                             },
                         );
                     }
@@ -1859,6 +1905,7 @@ fn start_upload(
                     }
                 }),
             },
+            connections,
         );
 
         watchdog.stop();
@@ -1916,6 +1963,7 @@ fn start_upload(
                             verify_summary: Some(completed_verify_summary(
                                 strict_chunk_verify_summary.load(Ordering::Relaxed),
                             )),
+                            done_ranges: None,
                         },
                     );
                 }
@@ -1967,6 +2015,7 @@ fn start_upload(
                             message,
                             retry_count: cp.retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
@@ -1975,20 +2024,7 @@ fn start_upload(
                 if let Ok(mut cp) = checkpoint_for_thread.lock() {
                     cp.status = CheckpointStatus::Failed;
                     let _ = save_checkpoint(&cp);
-                    let message = if cp.failure_reason.as_deref() == Some("verify_read_failed") {
-                        crate::tr!(
-                            format!(
-                                "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始上传」重试（已重试 {} 次）",
-                                cp.retry_count
-                            ),
-                            format!(
-                                "Network dropped during final verification; all chunks already verified, click \"Start upload\" to retry ({} retries so far)",
-                                cp.retry_count
-                            )
-                        )
-                    } else {
-                        format_upload_failure(&err, &cp.remote_path, cp.retry_count)
-                    };
+                    let message = format_upload_failure(&err, &cp.remote_path, cp.retry_count);
                     activity::error(activity::classify_failure(&message), message.clone());
                     if report_per_file {
                         record_upload_result(
@@ -2019,23 +2055,13 @@ fn start_upload(
                             message,
                             retry_count: cp.retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
             }
         }
-
-        if let Some(runtime) = app.try_state::<Mutex<UploadRuntime>>() {
-            if let Ok(mut state) = runtime.lock() {
-                state.is_running = false;
-                state.cancel_flag = None;
-                state.abort_socket = None;
-            }
-        }
     });
-
-    // 记录 worker 句柄，供 reset_upload_state join，避免与新传输并发写断点。
-    state.worker = Some(worker);
 
     Ok(())
 }
@@ -2054,12 +2080,8 @@ fn cancel_download(
         flag.store(true, Ordering::Relaxed);
     }
 
-    if let Some(holder) = &state.abort_socket {
-        if let Ok(guard) = holder.lock() {
-            if let Some(socket) = guard.as_ref() {
-                abort_socket(socket);
-            }
-        }
+    if let Some(aborts) = &state.abort_socket {
+        aborts.abort_all();
     }
 
     let _ = app.emit(
@@ -2071,37 +2093,10 @@ fn cancel_download(
             message: crate::tr!("正在取消，正在中断连接...", "Cancelling, closing the connection...").into(),
             retry_count: 0,
             verify_summary: None,
+            done_ranges: None,
         },
     );
 
-    Ok(())
-}
-
-#[tauri::command(async)]
-fn reset_download_state(runtime: State<'_, Mutex<DownloadRuntime>>) -> Result<(), String> {
-    // 见 reset_upload_state：取出 worker 句柄后释放锁再 join，避免死锁并杜绝并发写断点。
-    let worker = {
-        let mut state = runtime.lock().map_err(|e| e.to_string())?;
-        if let Some(flag) = &state.cancel_flag {
-            flag.store(true, Ordering::Relaxed);
-        }
-        if let Some(holder) = &state.abort_socket {
-            if let Ok(guard) = holder.lock() {
-                if let Some(socket) = guard.as_ref() {
-                    abort_socket(socket);
-                }
-            }
-        }
-        state.worker.take()
-    };
-    if let Some(handle) = worker {
-        let _ = handle.join();
-    }
-    let mut state = runtime.lock().map_err(|e| e.to_string())?;
-    state.is_running = false;
-    state.cancel_flag = None;
-    state.abort_socket = None;
-    state.worker = None;
     Ok(())
 }
 
@@ -2141,6 +2136,9 @@ fn start_download(
         jump: request.jump.clone(),
     })?;
 
+    // 所有可能失败的准备工作都必须在写断点、置 is_running 之前完成：之后再出错的话
+    // 没有工作线程来复位状态，此后每次开始都会报「已有任务在进行中」。
+    let jump = build_jump_config(request.jump.as_deref())?;
     let auth_kind = match &auth {
         AuthMethod::Password(_) => AuthKind::Password,
         AuthMethod::PrivateKey { .. } => AuthKind::PrivateKey,
@@ -2154,8 +2152,8 @@ fn start_download(
         } else {
             cp.downloaded_bytes
         };
-        local_paths_compatible(&cp.local_path, &resolved_local_path, &request.local_path)
-            && remote_paths_compatible(&cp.remote_path, &remote_path, &remote_path)
+        path_matches_checkpoint(&cp.local_path, &resolved_local_path, &request.local_path, file_name_of(&remote_path))
+            && cp.remote_path.trim() == remote_path
             && cp.host == request.host
             && cp.port == request.port
             && cp.username == request.username
@@ -2177,48 +2175,8 @@ fn start_download(
         let _ = clear_download_checkpoint();
     }
 
-    if should_resume {
-        let cp = existing_checkpoint.as_ref().unwrap();
-        let config = build_connection_config(&ConnectionRequest {
-            host: request.host.clone(),
-            port: request.port,
-            username: request.username.clone(),
-            auth_type: request.auth_type.clone(),
-            password: request.password.clone(),
-            key_path: request.key_path.clone(),
-            key_passphrase: request.key_passphrase.clone(),
-            jump: request.jump.clone(),
-        })?;
-        let (session, _) = connect_session(&config).map_err(|e| e.to_string())?;
-        let sftp = session.sftp().map_err(|e| e.to_string())?;
-        let stat = sftp
-            .stat(std::path::Path::new(&cp.remote_path))
-            .map_err(|e| {
-                crate::tr!(format!("无法读取远端文件: {e}"), format!("Cannot read remote file: {e}"))
-            })?;
-        let remote_size = stat.size.unwrap_or(0);
-        if cp.file_size != remote_size {
-            return Err(crate::tr!(
-                format!(
-                    "远端文件大小已变化（断点记录 {} 字节，当前 {} 字节），请清除断点后重新下载",
-                    cp.file_size, remote_size
-                ),
-                format!(
-                    "Remote file size changed (checkpoint {} bytes, now {} bytes); clear the checkpoint and download again",
-                    cp.file_size, remote_size
-                )
-            ));
-        }
-        if let Some(saved_mtime) = cp.remote_mtime {
-            if stat.mtime != Some(saved_mtime) {
-                return Err(crate::tr!(
-                    "远端文件已修改（修改时间变化），请清除断点后重新下载",
-                    "Remote file was modified (modification time changed); clear the checkpoint and download again"
-                )
-                .into());
-            }
-        }
-    }
+    // 「远端文件是否还是断点记录的那一个」由传输线程在每次连接后核对（见 sftp::download 的 remote_changed）：
+    // 放在这里的话要同步连一次服务器，弱网下一次握手超时就直接报错，绕过了无限重试。
 
     let (initial_downloaded_bytes, initial_verified_bytes, initial_retry_count) = if should_resume {
         let cp = existing_checkpoint.as_ref().unwrap();
@@ -2266,7 +2224,18 @@ fn start_download(
         staged: existing_checkpoint
             .as_ref()
             .filter(|_| should_resume)
-            .map_or(true, |cp| cp.staged),
+            .is_none_or(|cp| cp.staged),
+        // 续传时沿用断点里的记录；新传输从 0 开始，传输函数会在开头置为 true。
+        all_chunks_verified: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .is_some_and(|cp| cp.all_chunks_verified),
+        // 续传必须带上已完成的区间：并行传输的进度不是「开头连续的一段」，丢了它就会把没传的部分当成已传。
+        done_ranges: existing_checkpoint
+            .as_ref()
+            .filter(|_| should_resume)
+            .map(|cp| cp.done_ranges.clone())
+            .unwrap_or_default(),
     }));
 
     // 联网核对期间锁是放开的，写断点、登记 worker 前必须重新持锁并复查，
@@ -2287,7 +2256,7 @@ fn start_download(
     let strict_chunk_verify = Arc::new(AtomicBool::new(
         request.strict_chunk_verify.unwrap_or(true),
     ));
-    let abort_socket_holder = Arc::new(Mutex::new(None));
+    let abort_socket_holder = Arc::new(AbortHandles::default());
     state.cancel_flag = Some(cancel_flag.clone());
     state.abort_socket = Some(abort_socket_holder.clone());
     state.is_running = true;
@@ -2297,7 +2266,7 @@ fn start_download(
         port: request.port,
         username: request.username.clone(),
         auth,
-        jump: build_jump_config(request.jump.as_deref())?,
+        jump,
     };
 
     let local_path_string = request.local_path.clone();
@@ -2309,15 +2278,18 @@ fn start_download(
     // 批量中的文件不逐个写历史、不逐个发通知：几百个文件会把历史挤满、把通知中心刷屏，
     // 整批结束时由前端统一记一条历史、发一条汇总通知。
     let report_per_file = !request.in_batch;
-    let worker = thread::spawn(move || {
+    let connections = request.connections.unwrap_or(DEFAULT_CONNECTIONS);
+    thread::spawn(move || {
+        // 最先声明、最后析构：线程以任何方式结束（含 panic）都会把运行状态复位。
+        let _reset = ResetRuntimeOnExit::<DownloadRuntime>::new(&app);
         activity::info(activity::Category::Transfer, crate::tr!(
                 format!("开始下载 {}:{} → {}", host_for_history, remote_path, local_path_string),
                 format!("Download started {}:{} → {}", host_for_history, remote_path, local_path_string)
             ));
         let milestones = Arc::new(ProgressMilestones::new("下载", "Downloaded"));
         let heartbeat = Arc::new(ProgressHeartbeat::new(initial_downloaded_bytes));
-        let stall_timeout = Duration::from_secs(DOWNLOAD_STALL_TIMEOUT_SECS);
-        let stall_secs = DOWNLOAD_STALL_TIMEOUT_SECS;
+        let stall_timeout = Duration::from_secs(TRANSFER_STALL_TIMEOUT_SECS);
+        let stall_secs = TRANSFER_STALL_TIMEOUT_SECS;
 
         let watchdog = spawn_stall_watchdog(
             heartbeat.clone(),
@@ -2353,6 +2325,7 @@ fn start_download(
                             },
                             retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
@@ -2375,9 +2348,15 @@ fn start_download(
                     let app = app.clone();
                     let heartbeat = heartbeat.clone();
                     let milestones = milestones.clone();
+                    let checkpoint = checkpoint_for_thread.clone();
                     move |downloaded, total, status, retry_count| {
                         sync_transfer_heartbeat(&heartbeat, downloaded, status);
                         milestones.observe(downloaded, total, status);
+                        // 「完成」事件只由工作线程收尾时发一次（带校验摘要）。这里再发一次的话，
+                        // 批量传输会把第二条算到下一个文件头上，传完后命令也会被触发两次。
+                        if status == "completed" {
+                            return;
+                        }
                         let retry_hint = if retry_count > 0 {
                             crate::tr!(
                                 format!(" · 重试 {retry_count} 次"),
@@ -2398,6 +2377,7 @@ fn start_download(
                                 ),
                                 retry_count,
                                 verify_summary: None,
+                                done_ranges: Some(checkpoint.lock().map(|cp| cp.done_ranges.ranges().to_vec()).unwrap_or_default()),
                             },
                         );
                     }
@@ -2437,6 +2417,7 @@ fn start_download(
                                 message: retry_message,
                                 retry_count,
                                 verify_summary: None,
+                                done_ranges: None,
                             },
                         );
                     }
@@ -2448,6 +2429,7 @@ fn start_download(
                     }
                 }),
             },
+            connections,
         );
 
         watchdog.stop();
@@ -2505,6 +2487,7 @@ fn start_download(
                             verify_summary: Some(completed_verify_summary(
                                 strict_chunk_verify_summary.load(Ordering::Relaxed),
                             )),
+                            done_ranges: None,
                         },
                     );
                 }
@@ -2556,6 +2539,7 @@ fn start_download(
                             message,
                             retry_count: cp.retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
@@ -2564,20 +2548,7 @@ fn start_download(
                 if let Ok(mut cp) = checkpoint_for_thread.lock() {
                     cp.status = CheckpointStatus::Failed;
                     let _ = save_download_checkpoint(&cp);
-                    let message = if cp.failure_reason.as_deref() == Some("verify_read_failed") {
-                        crate::tr!(
-                            format!(
-                                "传完后校验时网络中断，各数据块均已校验通过，请直接点「开始下载」重试（已重试 {} 次）",
-                                cp.retry_count
-                            ),
-                            format!(
-                                "Network dropped during final verification; all chunks already verified, click \"Start download\" to retry ({} retries so far)",
-                                cp.retry_count
-                            )
-                        )
-                    } else {
-                        format_download_failure(&err, &cp.remote_path, cp.retry_count)
-                    };
+                    let message = format_download_failure(&err, &cp.remote_path, cp.retry_count);
                     activity::error(activity::classify_failure(&message), message.clone());
                     if report_per_file {
                         record_download_result(
@@ -2608,28 +2579,17 @@ fn start_download(
                             message,
                             retry_count: cp.retry_count,
                             verify_summary: None,
+                            done_ranges: None,
                         },
                     );
                 }
             }
         }
-
-        if let Some(runtime) = app.try_state::<Mutex<DownloadRuntime>>() {
-            if let Ok(mut state) = runtime.lock() {
-                state.is_running = false;
-                state.cancel_flag = None;
-                state.abort_socket = None;
-            }
-        }
     });
-
-    // 记录 worker 句柄，供 reset_download_state join，避免与新传输并发写断点。
-    state.worker = Some(worker);
 
     Ok(())
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// 把进度折算成里程碑写进活动日志：每 10% 一条，不逐块刷屏；
 /// 首个进度（续传起点）只作为基准，不会一口气补记之前已完成的里程碑。
 struct ProgressMilestones {
@@ -2777,8 +2737,6 @@ pub fn run() {
             trust_host_key,
             start_upload,
             start_download,
-            reset_upload_state,
-            reset_download_state,
             cancel_upload,
             cancel_download,
             get_transfer_running,
@@ -2793,13 +2751,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verify_read_failure_at_full_size_resumes_instead_of_restarting() {
+    fn fully_transferred_checkpoint_resumes_instead_of_restarting() {
         const SIZE: u64 = 10 * 1024 * 1024;
-        assert!(can_resume_from(SIZE, SIZE, Some(FAILURE_VERIFY_READ)));
+        assert!(can_resume_from(SIZE, SIZE, Some("verify_read_failed")));
         assert!(can_resume_from(SIZE / 2, SIZE, None));
-        // 全部传完但失败原因不是校验读取失败（如哈希不一致）不能续传，应从头重传。
-        assert!(!can_resume_from(SIZE, SIZE, Some("hash_mismatch")));
-        assert!(!can_resume_from(SIZE, SIZE, None));
+        // 传完后在校验/替换阶段被取消或退出：没有失败原因，同样只需补完剩下的步骤。
+        assert!(can_resume_from(SIZE, SIZE, None));
+        // 哈希不一致说明数据是坏的，必须从头重传。
+        assert!(!can_resume_from(SIZE, SIZE, Some(FAILURE_HASH_MISMATCH)));
         assert!(!can_resume_from(0, SIZE, None));
+        assert!(!can_resume_from(SIZE + 1, SIZE, None));
+    }
+
+    #[test]
+    fn checkpoint_path_must_be_the_same_target() {
+        // 完整路径、目录（带或不带斜杠）都指向同一个目标。
+        assert!(path_matches_checkpoint("/data/a.jar", "/data/a.jar", "/data/a.jar", "a.jar"));
+        assert!(path_matches_checkpoint("/data/a.jar", "/data/", "/data/", "a.jar"));
+        assert!(path_matches_checkpoint("/data/a.jar", "/data", "/data", "a.jar"));
+        // 同一文件改传到上级目录：不是同一个目标。
+        assert!(!path_matches_checkpoint("/data/sub/a.jar", "/data/a.jar", "/data/", "a.jar"));
     }
 }

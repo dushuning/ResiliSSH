@@ -1,4 +1,4 @@
-use super::host_key::verify_host_key;
+use super::host_key::{prefer_known_host_key_types, verify_host_key};
 use super::tunnel;
 use crate::activity::{self, Category};
 use ssh2::Session;
@@ -45,7 +45,10 @@ impl ConnectionConfig {
 pub enum ConnectError {
     Tcp(String),
     Handshake(String),
+    /// 认证过程本身没走完（超时、断线等），重连后可能成功。
     Auth(String),
+    /// 服务器明确拒绝了凭据，或私钥文件本身无法使用：重连多少次结果都一样。
+    AuthRejected(String),
     HostKeyUnknown(String),
     HostKeyChanged(String),
     HostKeyCheck(String),
@@ -62,7 +65,8 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Handshake(e) => {
                 crate::tr!(format!("SSH 握手失败: {e}"), format!("SSH handshake failed: {e}"))
             }
-            ConnectError::Auth(e) => {
+            // 两种认证错误对用户是同一句话，区别只在是否值得重试（见 is_permanent）。
+            ConnectError::Auth(e) | ConnectError::AuthRejected(e) => {
                 crate::tr!(format!("认证失败: {e}"), format!("Authentication failed: {e}"))
             }
             ConnectError::HostKeyUnknown(fp) => crate::tr!(
@@ -93,10 +97,12 @@ impl std::error::Error for ConnectError {}
 
 impl ConnectError {
     /// 主机密钥问题不会因重连自愈：未知主机需要用户确认，指纹变化更不能自动重试，
-    /// 否则弱网重试循环会对着可疑服务器无限握手。
+    /// 否则弱网重试循环会对着可疑服务器无限握手。凭据被明确拒绝同理：每十几秒拿同一个
+    /// 错误密码再试一次，除了触发服务器的 fail2ban / 账户锁定之外没有任何作用。
     pub fn is_permanent(&self) -> bool {
         match self {
-            ConnectError::HostKeyUnknown(_)
+            ConnectError::AuthRejected(_)
+            | ConnectError::HostKeyUnknown(_)
             | ConnectError::HostKeyChanged(_)
             | ConnectError::HostKeyCheck(_)
             | ConnectError::JumpForwardDenied(_) => true,
@@ -115,12 +121,63 @@ pub fn is_sftp_not_found(err: &ssh2::Error) -> bool {
     matches!(err.code(), ssh2::ErrorCode::SFTP(SFTP_FX_NO_SUCH_FILE))
 }
 
-const SSH_SOCKET_TIMEOUT_SECS: u64 = 90;
+/// 握手 + 认证整体的上限（见 new_session）。比单次操作超时宽：极差的链路上密钥交换本身就要好几个往返。
+const SSH_HANDSHAKE_TIMEOUT_SECS: u64 = 90;
 /// 单次 TCP 建连上限。系统默认可能等 75s 以上，期间无法取消；
 /// 超时后交给外层重试循环，所以这里不会让弱网任务失败，只是让每次尝试可控、可取消。
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 20;
 const SSH_OPERATION_TIMEOUT_MS: u64 = 30_000;
+/// 需要 keepalive 的场合（见 enable_keepalive）使用的间隔。
 const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 30;
+/// libssh2 的认证类错误码（libssh2.h）：私钥文件读不了或口令不对 / 服务器拒绝凭据 / 公钥不被接受。
+const LIBSSH2_ERROR_FILE: i32 = -16;
+const LIBSSH2_ERROR_AUTHENTICATION_FAILED: i32 = -18;
+const LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED: i32 = -19;
+
+/// 把认证阶段的 libssh2 错误分成「被拒绝」和「没走完」：前者重试无益，后者（超时、断线）必须继续重试。
+fn auth_error(err: ssh2::Error) -> ConnectError {
+    let rejected = matches!(
+        err.code(),
+        ssh2::ErrorCode::Session(
+            LIBSSH2_ERROR_FILE | LIBSSH2_ERROR_AUTHENTICATION_FAILED | LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED
+        )
+    );
+    if rejected {
+        ConnectError::AuthRejected(err.to_string())
+    } else {
+        ConnectError::Auth(err.to_string())
+    }
+}
+
+/// libssh2 的自动 keepalive 默认关闭，只在连接上长时间没有自己流量的场合打开
+/// （本地算哈希、等远端命令输出、跳板机转发线程）。原因：开着它时，libssh2 每次阻塞等待
+/// 最多只等到「下一次该发 keepalive 的时刻」就按超时返回（_libssh2_wait_socket），
+/// 传输中任何一次跨过这个时刻的停顿都会被当成超时、触发整条连接重连——弱网下正是最常见的情况。
+pub(super) fn enable_keepalive(session: &Session) {
+    session.set_keepalive(true, SSH_KEEPALIVE_INTERVAL_SECS);
+}
+
+pub(super) fn disable_keepalive(session: &Session) {
+    session.set_keepalive(false, 0);
+}
+
+/// 会话暂时没活干、但稍后还要用时（并行传输中主连接等其他连接传完）定期调用：按间隔发一个 keepalive，
+/// 免得 NAT / 防火墙 / 跳板机转发线程把这条安静的连接当成死连接掐掉。调用期间不在 libssh2 的
+/// 阻塞等待里，所以不受「keepalive 让等待提前超时」的影响；发完立刻恢复关闭状态。
+pub(super) fn keepalive_while_idle(session: &Session) {
+    enable_keepalive(session);
+    if let Err(e) = session.keepalive_send() {
+        log::debug!("keepalive on idle session failed: {e}");
+    }
+    disable_keepalive(session);
+}
+
+/// 把会话的单次操作超时恢复为默认值（探活等场合会临时改短）。
+pub(super) fn set_operation_timeout(session: &Session, timeout_ms: u64) {
+    session.set_timeout(timeout_ms as u32);
+}
+
+pub(super) const DEFAULT_OPERATION_TIMEOUT_MS: u64 = SSH_OPERATION_TIMEOUT_MS;
 
 /// 域名可能解析出多个地址（IPv4/IPv6），逐个尝试，全部失败时报告最后一个错误。
 fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
@@ -153,17 +210,26 @@ struct Transport {
 }
 
 fn socket_error(e: std::io::Error) -> ConnectError {
-    ConnectError::Tcp(format!("socket setup failed: {e}"))
+    ConnectError::Tcp(crate::tr!(format!("连接初始化失败: {e}"), format!("Socket setup failed: {e}")))
+}
+
+/// libssh2 握手时会把连接切成非阻塞，socket 自身的读写超时对它不起作用；不设会话超时的话，
+/// TCP 连上后对端一直不回应（单向黑洞、sshd 卡死）时握手和认证会无限期阻塞，而此时取消和
+/// 无响应看门狗都还拿不到连接、打不断它。认证通过后再换成更短的单次操作超时。
+/// 握手前还要按已记录的主机密钥类型调整协商顺序（见 prefer_known_host_key_types）。
+fn new_session(host: &str, port: u16) -> Result<Session, ConnectError> {
+    let session = Session::new().map_err(|e| ConnectError::Handshake(e.to_string()))?;
+    session.set_timeout((SSH_HANDSHAKE_TIMEOUT_SECS * 1000) as u32);
+    prefer_known_host_key_types(&session, host, port);
+    Ok(session)
 }
 
 fn handshake_direct(host: &str, port: u16) -> Result<Transport, ConnectError> {
     let tcp = connect_with_timeout(host, port)?;
-    tcp.set_read_timeout(Some(Duration::from_secs(SSH_SOCKET_TIMEOUT_SECS))).map_err(socket_error)?;
-    tcp.set_write_timeout(Some(Duration::from_secs(SSH_SOCKET_TIMEOUT_SECS))).map_err(socket_error)?;
     let abort = tcp.try_clone().map_err(socket_error)?;
     let poll_fd = OwnedFd::from(tcp.try_clone().map_err(socket_error)?);
 
-    let mut session = Session::new().map_err(|e| ConnectError::Handshake(e.to_string()))?;
+    let mut session = new_session(host, port)?;
     session.set_tcp_stream(tcp);
     session.handshake().map_err(|e| ConnectError::Handshake(e.to_string()))?;
     Ok(Transport { session, abort, poll_fd })
@@ -175,11 +241,9 @@ fn handshake_via(jump: &ConnectionConfig, host: &str, port: u16) -> Result<Trans
     let wrap = |source: ConnectError| ConnectError::Jump { hop: jump.endpoint(), source: Box::new(source) };
     let (hop, _) = establish(jump).map_err(wrap)?;
     let stream = tunnel::open(hop.session, hop.poll_fd, host, port).map_err(wrap)?;
-    stream.set_read_timeout(Some(Duration::from_secs(SSH_SOCKET_TIMEOUT_SECS))).map_err(socket_error)?;
-    stream.set_write_timeout(Some(Duration::from_secs(SSH_SOCKET_TIMEOUT_SECS))).map_err(socket_error)?;
     let poll_fd = OwnedFd::from(stream.try_clone().map_err(socket_error)?);
 
-    let mut session = Session::new().map_err(|e| ConnectError::Handshake(e.to_string()))?;
+    let mut session = new_session(host, port)?;
     session.set_tcp_stream(stream);
     session.handshake().map_err(|e| ConnectError::Handshake(e.to_string()))?;
     Ok(Transport { session, abort: hop.abort, poll_fd })
@@ -240,7 +304,7 @@ fn record_connect_failure(target: &str, err: &ConnectError) {
         ConnectError::Handshake(e) => {
             activity::warn(Category::Network, crate::tr!(format!("SSH 握手失败 {target}：{e}"), format!("SSH handshake failed for {target}: {e}")))
         }
-        ConnectError::Auth(e) => activity::error(Category::Auth, crate::tr!(format!("认证失败 {target}：{e}"), format!("Authentication failed for {target}: {e}"))),
+        ConnectError::Auth(e) | ConnectError::AuthRejected(e) => activity::error(Category::Auth, crate::tr!(format!("认证失败 {target}：{e}"), format!("Authentication failed for {target}: {e}"))),
         ConnectError::HostKeyUnknown(fp) => activity::warn(
             Category::HostKey,
             crate::tr!(
@@ -275,7 +339,7 @@ fn establish(config: &ConnectionConfig) -> Result<(Transport, &'static str), Con
         AuthMethod::Password(password) => {
             session
                 .userauth_password(&config.username, password)
-                .map_err(|e| ConnectError::Auth(e.to_string()))?;
+                .map_err(auth_error)?;
             crate::tr!("密码认证", "password auth")
         }
         AuthMethod::PrivateKey { key_path, passphrase } => {
@@ -284,13 +348,12 @@ fn establish(config: &ConnectionConfig) -> Result<(Transport, &'static str), Con
     };
 
     if !session.authenticated() {
-        return Err(ConnectError::Auth(
+        return Err(ConnectError::AuthRejected(
             crate::tr!("服务器拒绝了提供的凭据", "The server rejected the credentials").into(),
         ));
     }
 
     session.set_timeout(SSH_OPERATION_TIMEOUT_MS as u32);
-    session.set_keepalive(true, SSH_KEEPALIVE_INTERVAL_SECS);
     Ok((transport, auth_label))
 }
 
@@ -329,7 +392,7 @@ fn auth_with_key_file(
 ) -> Result<(), ConnectError> {
     session
         .userauth_pubkey_file(username, None, Path::new(key_path), passphrase)
-        .map_err(|e| ConnectError::Auth(e.to_string()))?;
+        .map_err(auth_error)?;
     Ok(())
 }
 
@@ -337,14 +400,64 @@ pub fn abort_socket(socket: &TcpStream) {
     let _ = socket.shutdown(Shutdown::Both);
 }
 
+/// 一次传输用到的所有连接的「可打断」副本。并行传输时不止一条连接：取消、无响应看门狗、
+/// 网络切换都要能把它们一起打断，让各自阻塞中的网络 IO 立刻返回。
+#[derive(Default)]
+pub struct AbortHandles {
+    sockets: std::sync::Mutex<Vec<(u64, TcpStream)>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl AbortHandles {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(u64, TcpStream)>> {
+        // 持锁期间只增删列表项；锁中毒时列表仍然可用，而此时更需要能打断连接。
+        self.sockets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 登记一条连接，返回之后用来注销它的编号。
+    pub fn register(&self, socket: TcpStream) -> u64 {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock().push((id, socket));
+        id
+    }
+
+    /// 连接不再使用时注销，并交还它的 socket 副本（会话要放回连接池时需要）。
+    pub fn remove(&self, id: u64) -> Option<TcpStream> {
+        let mut sockets = self.lock();
+        let index = sockets.iter().position(|(socket_id, _)| *socket_id == id)?;
+        Some(sockets.swap_remove(index).1)
+    }
+
+    pub fn abort_all(&self) {
+        for (_, socket) in self.lock().iter() {
+            abort_socket(socket);
+        }
+    }
+
+    /// 各连接本机一侧的地址，用来判断网络切换后它们是否已经失效。
+    pub fn local_addrs(&self) -> Vec<std::net::IpAddr> {
+        self.lock().iter().filter_map(|(_, socket)| socket.local_addr().ok()).map(|addr| addr.ip()).collect()
+    }
+
+    /// 当前登记的连接数（端到端测试用来确认并行确实发生）。
+    #[cfg(test)]
+    pub fn count(&self) -> usize {
+        self.lock().len()
+    }
+}
+
 /// 验证 SSH 握手、认证与 SFTP 子系统可用。
 pub fn test_connection(config: &ConnectionConfig) -> Result<String, ConnectError> {
-    let (session, _) = connect_session(config)?;
+    // 测试连接总是新建：用户要验证的正是「现在能不能连上」，复用旧会话会掩盖问题。
+    let (session, abort) = connect_session(config)?;
     let sftp = session
         .sftp()
         .map_err(|e| ConnectError::Handshake(crate::tr!(format!("SFTP 子系统不可用: {e}"), format!("SFTP subsystem unavailable: {e}"))))?;
     sftp.stat(Path::new("."))
         .map_err(|e| ConnectError::Handshake(crate::tr!(format!("SFTP 访问失败: {e}"), format!("SFTP access failed: {e}"))))?;
+    // 测试通过后用户多半紧接着就开始传输，把这条已认证的连接留给下一步用。
+    drop(sftp);
+    super::pool::release(config, session, abort);
     let target = config.endpoint();
     Ok(match config.jump.as_ref().map(|j| j.endpoint()) {
         Some(via) => crate::tr!(

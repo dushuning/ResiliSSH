@@ -5,8 +5,11 @@ mod errors;
 
 pub use errors::is_remote_path_message;
 mod host_key;
+mod plan;
+mod pool;
 mod preflight;
 mod remote_command;
+mod remote_hash;
 mod transfer_common;
 mod tunnel;
 mod upload;
@@ -16,11 +19,19 @@ pub use browse::{
     RemoteDirListing,
 };
 pub use client::{
-    abort_socket, connect_session, is_sftp_not_found, open_handshake, test_connection, AuthMethod,
+    abort_socket, is_sftp_not_found, open_handshake, test_connection, AbortHandles, AuthMethod, ConnectError,
     ConnectionConfig,
     MAX_JUMP_HOPS,
 };
+#[cfg(test)]
+pub(crate) use client::connect_session;
 pub use host_key::{app_known_hosts_path, inspect_host_key, trust_host_key, HostKeyInfo};
+pub use plan::{RangeSet, DEFAULT_CONNECTIONS};
+#[cfg(test)]
+pub(crate) use remote_hash::{remote_file_sha256, BlockHasher};
+pub use pool::{acquire as acquire_session, release as release_session, with_session};
+#[cfg(test)]
+pub(crate) use pool::{clear as clear_session_pool, has_idle as session_pool_has_idle};
 pub use preflight::{
     bytes_needed, local_free_bytes, local_sha256, remote_free_bytes, remote_sha256,
 };

@@ -1,4 +1,4 @@
-use crate::storage::{new_id, read_json_file, write_json_file};
+use crate::storage::{lock_store, new_id, read_json_store, write_json_file};
 use serde::{Deserialize, Serialize};
 
 const HISTORY_FILE: &str = "upload-history.json";
@@ -44,24 +44,14 @@ fn default_direction() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 struct HistoryStore {
     entries: Vec<UploadHistoryEntry>,
 }
 
-impl Default for HistoryStore {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-}
 
 fn load_store() -> Result<HistoryStore, String> {
-    match read_json_file(HISTORY_FILE) {
-        Ok(store) => Ok(store),
-        Err(err) if err.contains("not found") => Ok(HistoryStore::default()),
-        Err(err) => Err(err),
-    }
+    read_json_store(HISTORY_FILE)
 }
 
 fn save_store(store: &HistoryStore) -> Result<(), String> {
@@ -76,6 +66,7 @@ pub fn list_history() -> Result<Vec<UploadHistoryEntry>, String> {
 }
 
 pub fn append_history(entry: UploadHistoryEntry) -> Result<(), String> {
+    let _guard = lock_store();
     let mut store = load_store()?;
     store.entries.insert(0, entry);
     store.entries.truncate(MAX_HISTORY_ENTRIES);

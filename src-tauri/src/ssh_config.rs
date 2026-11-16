@@ -35,7 +35,8 @@ fn ssh_config_path() -> Result<PathBuf, String> {
     Ok(home.join(".ssh").join("config"))
 }
 
-fn expand_path(path: &str) -> String {
+/// 展开开头的 `~`。OpenSSH 配置和用户手输的私钥路径都常这么写，而 libssh2 只认真实路径。
+pub(crate) fn expand_home(path: &str) -> String {
     if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped).to_string_lossy().to_string();
@@ -117,7 +118,16 @@ fn parse_ssh_config(content: &str) -> Vec<SshHostEntry> {
             }
             "identityfile" if current.is_some() => {
                 if let Some(value) = parts.next() {
-                    current.as_mut().unwrap().identity_file = Some(expand_path(value));
+                    current.as_mut().unwrap().identity_file = Some(expand_home(value));
+                }
+            }
+            // Match 块的选项只在其条件成立时生效，不属于上一个 Host：结束当前 Host，
+            // 否则块里的 User / Port / IdentityFile 会覆盖上一个 Host 的值。
+            "match" => {
+                if let Some(entry) = current.take() {
+                    if !entry.alias.contains('*') && !entry.alias.contains('?') {
+                        entries.push(entry);
+                    }
                 }
             }
             _ => {}
@@ -154,6 +164,15 @@ Host myserver
         assert_eq!(hosts[0].port, Some(2222));
         assert!(hosts[0].identity_file.as_ref().unwrap().ends_with(".ssh/id_ed25519"));
         assert_eq!(hosts[0].proxy_jump, None);
+    }
+
+    #[test]
+    fn match_block_options_do_not_leak_into_previous_host() {
+        let content = "Host app\n  HostName 10.0.0.5\n  User deploy\n\nMatch user root\n  User root\n  Port 2200\n";
+        let hosts = parse_ssh_config(content);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+        assert_eq!(hosts[0].port, None);
     }
 
     #[test]

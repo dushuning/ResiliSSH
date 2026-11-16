@@ -4,10 +4,13 @@ version = "1.2.0"
 description = "ResiliSSH — macOS SFTP upload/download with weak-network resume"
 authors = ["cabbage"]
 edition = "2021"
+# 包里有两个可执行文件（图形界面与命令行 resiliss），`cargo run` / tauri 默认运行图形界面。
+default-run = "sshutil"
 
 [lib]
 name = "sshutil_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+# 只做 macOS 桌面端：cdylib / staticlib 是移动端才需要的产物，开着只会让每次（尤其是 LTO 的 release）构建多链接两遍。
+crate-type = ["lib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

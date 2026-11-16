@@ -1,6 +1,6 @@
 use crate::checkpoint::AuthKind;
 use crate::secrets::{delete_secret, load_secret, store_secret, SecretKind};
-use crate::storage::{new_id, read_json_file, write_json_file};
+use crate::storage::{lock_store, new_id, read_json_store, write_json_file};
 use serde::{Deserialize, Serialize};
 
 const PROFILES_FILE: &str = "profiles.json";
@@ -42,24 +42,14 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 struct ProfileStore {
     profiles: Vec<ConnectionProfile>,
 }
 
-impl Default for ProfileStore {
-    fn default() -> Self {
-        Self {
-            profiles: Vec::new(),
-        }
-    }
-}
 
 fn load_store() -> Result<ProfileStore, String> {
-    let mut store: ProfileStore = match read_json_file(PROFILES_FILE) {
-        Ok(store) => store,
-        Err(err) if err.contains("not found") => return Ok(ProfileStore::default()),
-        Err(err) => return Err(err),
-    };
+    let mut store: ProfileStore = read_json_store(PROFILES_FILE)?;
     if migrate_plaintext_secrets(&mut store) {
         save_store(&store)?;
     }
@@ -138,6 +128,10 @@ pub fn list_profiles() -> Result<Vec<ConnectionProfile>, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct SaveProfileRequest {
+    /// 正在编辑的服务器；新建时为空。按 id 而不是按名称定位：否则改名会变成「另存一份」，
+    /// 收藏目录、常用命令都留在旧条目上；新建时起了已有的名字又会悄悄覆盖那一台。
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -184,20 +178,6 @@ fn validate_jump(
     Ok(())
 }
 
-fn expand_key_path(path: &str) -> String {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped).to_string_lossy().to_string();
-        }
-    }
-    if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().to_string();
-        }
-    }
-    path.to_string()
-}
-
 pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, String> {
     let name = request.name.trim();
     let host = request.host.trim();
@@ -228,7 +208,7 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
             .ok_or_else(|| {
                 crate::tr!("私钥认证需要填写私钥路径", "Private key auth requires a private key path").to_string()
             })?;
-        if !std::path::Path::new(&expand_key_path(key_path)).exists() {
+        if !std::path::Path::new(&crate::ssh_config::expand_home(key_path)).exists() {
             return Err(crate::tr!(
                 format!("私钥文件不存在: {key_path}"),
                 format!("Private key file does not exist: {key_path}")
@@ -236,8 +216,26 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         }
     }
 
+    let _guard = lock_store();
     let mut store = load_store()?;
-    let existing = store.profiles.iter().find(|p| p.name == name).cloned();
+    let existing = match request.id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => Some(
+            store
+                .profiles
+                .iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .ok_or_else(|| crate::tr!("连接配置不存在", "Connection profile not found").to_string())?,
+        ),
+        None => None,
+    };
+    let editing_id = existing.as_ref().map(|p| p.id.as_str());
+    if store.profiles.iter().any(|p| p.name == name && Some(p.id.as_str()) != editing_id) {
+        return Err(crate::tr!(
+            format!("已有名为「{name}」的服务器，请换一个名称"),
+            format!("A server named \"{name}\" already exists; choose a different name")
+        ));
+    }
     let profile_id = existing
         .as_ref()
         .map(|p| p.id.clone())
@@ -255,9 +253,16 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
             .and_then(|p| load_secret(&p.id, kind))
             .filter(|v| !v.is_empty())
     };
-    let password = non_empty(request.password).or_else(|| fallback(SecretKind::Password));
-    let key_passphrase =
-        non_empty(request.key_passphrase).or_else(|| fallback(SecretKind::KeyPassphrase));
+    // 只保留当前认证方式用得到的那一项：密码登录改成私钥登录后，旧密码不该再留在钥匙串里（反之亦然）。
+    let uses_password = matches!(auth_kind, AuthKind::Password);
+    let typed_password = non_empty(request.password).filter(|_| uses_password);
+    let typed_passphrase = non_empty(request.key_passphrase).filter(|_| !uses_password);
+    let password = typed_password
+        .clone()
+        .or_else(|| uses_password.then(|| fallback(SecretKind::Password)).flatten());
+    let key_passphrase = typed_passphrase
+        .clone()
+        .or_else(|| (!uses_password).then(|| fallback(SecretKind::KeyPassphrase)).flatten());
 
     // 只有要记住密码时才要求必须填写；不记住时允许先保存服务器，连接时再输入。
     if remember && matches!(auth_kind, AuthKind::Password) && password.is_none() {
@@ -281,10 +286,16 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
     });
 
     // 先写钥匙串再写 JSON：钥匙串失败时整个保存失败，绝不退回明文落盘。
-    // 不记住时传 None，persist_secret 会删除之前存过的条目，避免「取消勾选」后旧密码仍留在钥匙串里。
-    let stored = |value: &Option<String>| if remember { value.clone() } else { None };
-    persist_secret(&profile_id, SecretKind::Password, stored(&password).as_deref())?;
-    persist_secret(&profile_id, SecretKind::KeyPassphrase, stored(&key_passphrase).as_deref())?;
+    // 三种情况：用户新输入了值 → 写入；不记住或这种认证方式用不到 → 删除旧条目
+    // （「取消勾选」或换认证方式后旧密码不能残留）；沿用钥匙串里原有的值 → 不动它，
+    // 原样重写一遍没有意义，还可能多弹一次系统授权框。
+    let sync_secret = |kind: SecretKind, typed: &Option<String>, effective: &Option<String>| match typed {
+        Some(value) if remember => persist_secret(&profile_id, kind, Some(value)),
+        _ if remember && effective.is_some() => Ok(()),
+        _ => persist_secret(&profile_id, kind, None),
+    };
+    sync_secret(SecretKind::Password, &typed_password, &password)?;
+    sync_secret(SecretKind::KeyPassphrase, &typed_passphrase, &key_passphrase)?;
 
     let profile = ConnectionProfile {
         id: profile_id,
@@ -303,7 +314,7 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
         jump_profile_id,
     };
 
-    store.profiles.retain(|p| p.name != profile.name);
+    store.profiles.retain(|p| p.id != profile.id);
     store.profiles.push(profile.clone());
     save_store(&store)?;
     Ok(ConnectionProfile {
@@ -314,6 +325,7 @@ pub fn save_profile(request: SaveProfileRequest) -> Result<ConnectionProfile, St
 }
 
 pub fn delete_profile(id: String) -> Result<(), String> {
+    let _guard = lock_store();
     let mut store = load_store()?;
     // 删掉仍被引用的跳板机，依赖它的服务器会在下次连接时莫名失败；让用户先改掉引用。
     let dependents: Vec<&str> = store
@@ -363,6 +375,7 @@ fn normalize_list(items: Vec<String>) -> Vec<String> {
 
 /// 只更新收藏目录 / 常用命令，不触碰凭据：这些操作发生在传输页，不应要求重新输入密码。
 pub fn update_profile_extras(request: UpdateProfileExtrasRequest) -> Result<ConnectionProfile, String> {
+    let _guard = lock_store();
     let mut store = load_store()?;
     let profile = store
         .profiles

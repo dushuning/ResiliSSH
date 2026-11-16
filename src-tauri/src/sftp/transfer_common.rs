@@ -37,6 +37,8 @@ pub trait TransferCheckpoint {
     fn retry_count(&self) -> u32;
     fn set_retry_count(&mut self, count: u32);
     fn mark_failed(&mut self);
+    /// 目标端现有的每一块是否都做过读回比对（见各断点结构的同名字段）。
+    fn all_chunks_verified(&self) -> bool;
 }
 
 fn lock_error<E: TransferError>(err: impl std::fmt::Display) -> E {
@@ -122,6 +124,8 @@ pub fn effective_verified_bytes<C: TransferCheckpoint>(cp: &C) -> u64 {
 }
 
 /// 弱网可靠模式下每块都已读回比对过，全部块校验通过时整文件哈希只是重复劳动，可以跳过。
+/// 前提是「每一块」都读回过：先用快速模式传了一部分、再切到可靠模式续传时，前面那部分
+/// 从未校验，必须照常做整文件哈希——所以看的是断点里的记录，而不只是当前的模式。
 pub fn should_skip_full_file_hash<C: TransferCheckpoint>(
     strict_chunk_verify: &AtomicBool,
     checkpoint: &Mutex<C>,
@@ -131,7 +135,16 @@ pub fn should_skip_full_file_hash<C: TransferCheckpoint>(
         return Ok(false);
     }
     let cp = checkpoint.lock().map_err(lock_error)?;
-    Ok(cp.verified_bytes() == file_size && cp.transferred_bytes() >= file_size)
+    Ok(cp.all_chunks_verified() && cp.verified_bytes() == file_size && cp.transferred_bytes() >= file_size)
+}
+
+/// 离开作用域时关掉 keepalive，包括中途出错或被取消提前返回的路径。
+struct KeepaliveGuard<'a>(&'a Session);
+
+impl Drop for KeepaliveGuard<'_> {
+    fn drop(&mut self) {
+        super::client::disable_keepalive(self.0);
+    }
 }
 
 /// 哈希大文件可能要几十秒，期间 SSH 连接上没有任何流量；顺带发 keepalive，
@@ -145,6 +158,9 @@ pub fn sha256_local_file<C: TransferCheckpoint>(
     let mut file = File::open(path).map_err(|e| C::Error::local_io(e.to_string()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; HASH_READ_BUFFER_SIZE];
+    // 只在这段「连接上没有任何流量」的时间里开 keepalive，算完立刻关掉（原因见 client::enable_keepalive）。
+    super::client::enable_keepalive(session);
+    let _restore = KeepaliveGuard(session);
     loop {
         ensure_not_cancelled(cancel_flag, checkpoint)?;
         // keepalive_send 内部按 set_keepalive 的间隔节流，每轮调用并不会真的每次发包。

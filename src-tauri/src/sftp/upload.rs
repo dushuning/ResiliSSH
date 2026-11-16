@@ -5,19 +5,26 @@ use super::transfer_common::{
     should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
     HASH_READ_BUFFER_SIZE, hex_encode,
 };
-use super::client::{connect_session, is_sftp_not_found, ConnectError, ConnectionConfig};
+use super::client::{
+    connect_session, is_sftp_not_found, keepalive_while_idle, AbortHandles, ConnectError, ConnectionConfig,
+};
+use super::plan::{effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES};
+use super::remote_hash::{remote_block_hashes, remote_copy, remote_file_sha256, BlockHasher};
+use super::browse::join_remote_path;
+use super::pool;
 use super::preflight::shell_quote;
 pub use super::transfer_common::{is_staging_file, staging_path};
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
-use crate::retry::{next_backoff_ms, INITIAL_BACKOFF_MS};
+use crate::retry::Backoff;
 use sha2::{Digest, Sha256};
 use ssh2::{File as RemoteFile, FileStat, OpenFlags, OpenType, Session, Sftp};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// 写入分片大小的上下限。libssh2 会把单次写入的数据流水线发送，分片越大，每个往返在途的数据越多：
 /// 实测 100 ms 往返延迟下 5 MB 上传，64 KB 分片 12.5 s、256 KB 6.0 s、1 MB 4.2 s。
@@ -48,6 +55,8 @@ pub enum UploadError {
     HashMismatch,
     ChunkVerifyMismatch { offset: u64, len: u64 },
     LocalIo(String),
+    /// 本地文件在传输途中被改写：已传的部分和后传的部分来自不同版本，结果不可信。
+    LocalFileChanged,
     Connect(ConnectError),
     Sftp(String),
 }
@@ -84,6 +93,11 @@ impl std::fmt::Display for UploadError {
             UploadError::LocalIo(e) => {
                 crate::tr!(format!("本地文件读取失败: {e}"), format!("Failed to read local file: {e}"))
             }
+            UploadError::LocalFileChanged => crate::tr!(
+                "本地文件在上传过程中被修改，已停止。请等文件不再变化后重新上传",
+                "The local file was modified during the upload, so the upload was stopped. Upload again once the file is no longer changing"
+            )
+            .to_string(),
             UploadError::Connect(e) => crate::tr!(format!("连接失败: {e}"), format!("Connection failed: {e}")),
             UploadError::Sftp(e) => crate::tr!(format!("SFTP 错误: {e}"), format!("SFTP error: {e}")),
         };
@@ -135,6 +149,15 @@ impl TransferCheckpoint for UploadCheckpoint {
     fn mark_failed(&mut self) {
         self.status = CheckpointStatus::Failed;
     }
+    fn all_chunks_verified(&self) -> bool {
+        self.all_chunks_verified
+    }
+}
+
+/// 本地文件的大小与修改时间，用来发现「传输途中文件被改写」。
+fn local_fingerprint(path: &Path) -> Result<(u64, Option<std::time::SystemTime>), UploadError> {
+    let meta = std::fs::metadata(path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+    Ok((meta.len(), meta.modified().ok()))
 }
 
 /// 远端填目录时自动拼接本地文件名；连接后若发现路径是已存在目录，也会自动拼接。
@@ -161,14 +184,6 @@ fn append_local_filename(dir_path: &str, local_path: &Path) -> Result<String, Up
                 crate::tr!("无法读取本地文件名", "Cannot read the local file name").into(),
             ))?;
     Ok(format!("{dir_path}{file_name}"))
-}
-
-fn join_remote_path(base: &str, file_name: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{file_name}")
-    } else {
-        format!("{base}/{file_name}")
-    }
 }
 
 fn is_remote_directory(sftp: &Sftp, path: &Path) -> bool {
@@ -202,13 +217,7 @@ pub fn resolve_upload_target(
 
     let path = Path::new(trimmed);
     if is_remote_directory(sftp, path) {
-        let file_name = local_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| UploadError::InvalidRemotePath(
-                crate::tr!("无法读取本地文件名", "Cannot read the local file name").into(),
-            ))?;
-        let resolved = join_remote_path(trimmed, file_name);
+        let resolved = append_local_filename(&join_remote_path(trimmed, ""), local_path)?;
         log::info!("remote path is directory, upload target: {resolved}");
         return Ok(resolved);
     }
@@ -276,13 +285,18 @@ fn ensure_remote_parent_directories(sftp: &Sftp, remote_file: &str) -> Result<()
         return Ok(());
     }
 
+    // 相对路径（相对 SFTP 起始目录，通常是家目录）必须保持相对：一律补上开头的 `/`
+    // 会去根目录下建目录，普通用户直接得到「权限不足」，root 则会建出多余的目录。
+    let absolute = parent_str.starts_with('/');
     let parts: Vec<&str> = parent_str.split('/').filter(|p| !p.is_empty()).collect();
     let mut current = String::new();
     for part in parts {
-        current = if current.is_empty() {
+        current = if !current.is_empty() {
+            format!("{current}/{part}")
+        } else if absolute {
             format!("/{part}")
         } else {
-            format!("{current}/{part}")
+            part.to_string()
         };
         let dir = Path::new(&current);
         if sftp.stat(dir).is_ok() {
@@ -350,6 +364,15 @@ pub(crate) fn promote_staged_file(
     }
 
     let existing = sftp.stat(Path::new(final_path)).ok();
+    // 目标是目录时 `mv` 会把临时文件挪进目录里并返回成功，文件就此「消失」在一个隐藏文件名下。
+    // 正常流程在连接后已把目录解析成「目录/文件名」，这里是最后一道防线。
+    if existing.as_ref().is_some_and(|st| st.is_dir()) {
+        log::error!("refusing to replace directory {final_path} with staged file {part}");
+        return Err(UploadError::InvalidRemotePath(crate::tr!(
+            format!("{final_path} 是一个目录，无法用上传的文件替换它"),
+            format!("{final_path} is a directory and cannot be replaced by the uploaded file")
+        )));
+    }
     // 覆盖已有文件时沿用它的权限（如脚本的可执行位），否则替换后会变成新建文件的默认权限。
     if let Some(mode) = existing.as_ref().and_then(|st| st.perm).map(|perm| perm & PERMISSION_BITS) {
         let attrs = FileStat { size: None, uid: None, gid: None, perm: Some(mode), atime: None, mtime: None };
@@ -384,21 +407,96 @@ pub(crate) fn promote_staged_file(
 }
 
 fn replace_with_mv(session: &Session, part: &str, final_path: &str) -> bool {
-    let command = format!("mv -f -- {} {}", shell_quote(part), shell_quote(final_path));
+    // 合并 stderr：失败原因（如 Permission denied）只出现在 stderr 上，不合并日志里就是空的。
+    let command = format!("mv -f -- {} {} 2>&1", shell_quote(part), shell_quote(final_path));
     let Ok(mut channel) = session.channel_session() else { return false };
     if channel.exec(&command).is_err() {
         return false;
     }
     let mut output = String::new();
-    let _ = channel.read_to_string(&mut output);
-    let _ = channel.wait_close();
-    let ok = channel.exit_status().is_ok_and(|code| code == 0);
+    // 没收到退出码时 libssh2 的 exit_status 默认是 0：连接在结果返回前断开会被误当成成功。
+    // 所以必须读完输出并等到通道正常关闭，退出码才可信；否则交给调用方重新 stat 判断。
+    let finished = channel.read_to_string(&mut output).is_ok() && channel.wait_close().is_ok();
+    let ok = finished && channel.exit_status().is_ok_and(|code| code == 0);
     if !ok {
         log::warn!("remote mv failed for {final_path}: {}", output.trim());
     }
     ok
 }
 
+/// 没有任务可领、但别的连接还在传时，多久再看一眼队列。
+const PLAN_POLL: Duration = Duration::from_millis(100);
+
+/// 一次上传中各连接共享的状态。
+struct UploadShared<'a> {
+    local_path: &'a Path,
+    local_size: u64,
+    cancel: &'a AtomicBool,
+    strict: &'a AtomicBool,
+    checkpoint: &'a Mutex<UploadCheckpoint>,
+    callbacks: &'a UploadCallbacks,
+    aborts: &'a AbortHandles,
+    plan: TransferPlan<UploadError>,
+    /// 准备阶段确定的（最终目标, 实际写入的文件）；主连接重连后不必重新确定。
+    target: Mutex<Option<(String, String)>>,
+}
+
+impl UploadShared<'_> {
+    /// 汇报进度：已完成的块加上各连接正在传的那一块里已传的部分。
+    fn report(&self, status: &str) {
+        let (done, retries) = self
+            .checkpoint
+            .lock()
+            .map(|cp| (cp.uploaded_bytes, cp.retry_count))
+            .unwrap_or((0, 0));
+        let transferred = (done + self.plan.partial_bytes()).min(self.local_size);
+        (self.callbacks.on_progress)(transferred, self.local_size, status, retries);
+    }
+
+    /// 一块已写入（并按当前模式校验过）：记入断点并落盘。
+    fn complete_block(&self, offset: u64, len: u64, read_back: bool) -> Result<(), UploadError> {
+        let mut cp = self.checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
+        cp.done_ranges.insert(offset, offset + len);
+        let total = cp.done_ranges.total();
+        cp.uploaded_bytes = total;
+        cp.verified_bytes = total;
+        cp.all_chunks_verified &= read_back;
+        save_checkpoint(&cp).map_err(UploadError::Sftp)
+    }
+
+    fn transferred(&self) -> u64 {
+        self.checkpoint.lock().map(|cp| cp.uploaded_bytes).unwrap_or(0)
+    }
+}
+
+/// 重连也不会好的错误：停止重试，把断点留给用户处理。
+fn is_permanent(err: &UploadError) -> bool {
+    match err {
+        UploadError::Cancelled | UploadError::ChunkVerifyMismatch { .. } => false,
+        // 判定用变体里的原始内容：Display 会再套一层「SFTP 错误: 」前缀，
+        // 套上之后 is_permanent_sftp_error 就认不出路径外壳，路径里带 auth 之类的字样会被误判成永久错误。
+        UploadError::Sftp(raw) => is_permanent_sftp_error(raw),
+        UploadError::Connect(e) => e.is_permanent(),
+        UploadError::InvalidRemotePath(_)
+        | UploadError::RemoteLargerThanLocal { .. }
+        | UploadError::ResumeBoundaryMismatch { .. }
+        | UploadError::SizeMismatch { .. }
+        | UploadError::HashMismatch
+        | UploadError::LocalFileChanged
+        | UploadError::LocalIo(_) => true,
+    }
+}
+
+/// 断点里记录的已完成区间。旧版断点只有「已校验到第几字节」一个数，换算成文件开头的一段。
+fn checkpoint_ranges(cp: &UploadCheckpoint) -> RangeSet {
+    if cp.done_ranges.is_empty() {
+        RangeSet::prefix(effective_verified_bytes(cp))
+    } else {
+        cp.done_ranges.clone()
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // 与下载侧对称的入口，参数逐个对应调用方持有的状态。
 pub fn upload_with_resume(
     config: ConnectionConfig,
     local_path: &Path,
@@ -406,56 +504,103 @@ pub fn upload_with_resume(
     cancel_flag: Arc<AtomicBool>,
     force_overwrite: Arc<AtomicBool>,
     strict_chunk_verify: Arc<AtomicBool>,
-    abort_socket_holder: Arc<Mutex<Option<TcpStream>>>,
+    aborts: Arc<AbortHandles>,
     checkpoint: Arc<Mutex<UploadCheckpoint>>,
     callbacks: UploadCallbacks,
+    connections: usize,
 ) -> Result<(), UploadError> {
     let resolved_remote_path = resolve_remote_path(remote_path, local_path)?;
-    let local_size = std::fs::metadata(local_path)
-        .map_err(|e| UploadError::LocalIo(e.to_string()))?
-        .len();
+    let started_fingerprint = local_fingerprint(local_path)?;
+    let local_size = started_fingerprint.0;
 
-    {
+    let staged = {
         let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
         cp.file_size = local_size;
         cp.remote_path = resolved_remote_path.clone();
         cp.status = CheckpointStatus::InProgress;
-    }
+        // 数据写到哪里：新传输写临时文件，校验通过后再替换目标；旧版断点继续直接写目标。
+        cp.staged
+    };
 
-    // 数据写到哪里：新传输写临时文件，校验通过后再替换目标；旧版断点继续直接写目标。
-    let staged = checkpoint.lock().map(|cp| cp.staged).unwrap_or(false);
-    let write_path = if staged { staging_path(&resolved_remote_path) } else { resolved_remote_path.clone() };
-    // 已校验通过、只差替换这一步。替换失败（多为断网）时只重试替换，不重传数据。
-    let mut verified_complete = false;
+    let shared = UploadShared {
+        local_path,
+        local_size,
+        cancel: &cancel_flag,
+        strict: &strict_chunk_verify,
+        checkpoint: &checkpoint,
+        callbacks: &callbacks,
+        aborts: &aborts,
+        plan: TransferPlan::new(),
+        target: Mutex::new(None),
+    };
+    let helpers = effective_connections(connections, local_size) - 1;
 
-    let mut backoff_ms = INITIAL_BACKOFF_MS;
-    let mut session: Option<Session> = None;
+    thread::scope(|scope| {
+        for index in 1..=helpers {
+            let (config, shared) = (&config, &shared);
+            let spawned = thread::Builder::new()
+                .name(format!("upload-conn-{index}"))
+                .spawn_scoped(scope, move || helper_loop(config, shared, index));
+            if let Err(e) = spawned {
+                // 起不了线程只是少一条并行连接，主连接照常传完。
+                log::warn!("cannot start parallel upload connection {index}: {e}");
+            }
+        }
+        let result =
+            lead_loop(&config, &shared, &resolved_remote_path, staged, started_fingerprint, &force_overwrite);
+        shared.plan.finish();
+        if result.is_err() {
+            // 失败或取消：别让辅助连接在阻塞的网络 IO 里再等上几十秒才发现该退出了。
+            aborts.abort_all();
+        }
+        result
+    })
+}
+
+/// 主连接：负责准备、对用户可见的重连提示、最终校验与替换；传输阶段与辅助连接一样从队列领任务。
+fn lead_loop(
+    config: &ConnectionConfig,
+    shared: &UploadShared<'_>,
+    resolved_remote_path: &str,
+    staged: bool,
+    started_fingerprint: (u64, Option<std::time::SystemTime>),
+    force_overwrite: &AtomicBool,
+) -> Result<(), UploadError> {
+    let (checkpoint, callbacks, local_size) = (shared.checkpoint, shared.callbacks, shared.local_size);
+    // 临时文件路径必须由「连接后解析出的最终目标」推出，不能用用户填的路径算：
+    // 用户填的若是已存在的目录，临时文件会建到上一级，替换时被 mv 挪进目录里却报告成功。
+    let write_path_for = |final_path: &str| if staged { staging_path(final_path) } else { final_path.to_string() };
+    // 已校验通过、只差替换这一步时记下最终目标。替换失败（多为断网）时只重试替换，不重传数据。
+    let mut verified_target: Option<String> = None;
+    let mut backoff = Backoff::new();
+    let mut session: Option<(Session, u64)> = None;
+    // 第一次连接优先接手预检刚用过的会话，省掉一次完整握手；之后的重连一律新建。
+    let mut first_connect = true;
+    // 分片大小跨重连保留：慢速链路上每次重连都从默认值重新试探，第一片就可能超时。
+    let mut write_slice = INITIAL_WRITE_SLICE;
 
     loop {
-        ensure_not_cancelled(&cancel_flag, &checkpoint)?;
+        ensure_not_cancelled(shared.cancel, checkpoint)?;
 
         if session.is_none() {
-            match connect_session(&config) {
-                Ok((s, abort_socket)) => {
-                    backoff_ms = INITIAL_BACKOFF_MS;
-                    *abort_socket_holder
-                        .lock()
-                        .map_err(|e| UploadError::Sftp(e.to_string()))? = Some(abort_socket);
-                    session = Some(s);
-                }
+            let connected = if std::mem::take(&mut first_connect) {
+                pool::acquire(config)
+            } else {
+                connect_session(config)
+            };
+            match connected {
+                Ok((s, abort_socket)) => session = Some((s, shared.aborts.register(abort_socket))),
                 Err(err) => {
-                    if cancel_flag.load(Ordering::Relaxed) {
+                    if shared.cancel.load(Ordering::Relaxed) {
                         return Err(UploadError::Cancelled);
                     }
                     if err.is_permanent() {
                         log::error!("connect failed permanently, stop retrying: {err}");
                         return Err(UploadError::Connect(err));
                     }
-                    let retry_count = increment_retry_count(&checkpoint)?;
-                    let uploaded_bytes = checkpoint
-                        .lock()
-                        .map(|cp| cp.uploaded_bytes)
-                        .unwrap_or(0);
+                    let retry_count = increment_retry_count(checkpoint)?;
+                    let uploaded_bytes = shared.transferred();
+                    let backoff_ms = backoff.next_delay_ms(uploaded_bytes);
                     let message = if uploaded_bytes > 0 {
                         crate::tr!(
                             format!(
@@ -473,117 +618,499 @@ pub fn upload_with_resume(
                     };
                     log::warn!("upload retry #{retry_count}: {message}");
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                    sleep_backoff::<UploadError>(&cancel_flag, backoff_ms)?;
-                    backoff_ms = next_backoff_ms(backoff_ms);
+                    sleep_backoff::<UploadError>(shared.cancel, backoff_ms)?;
                     continue;
                 }
             }
         }
 
-        let active_session = session.as_mut().unwrap();
-        let transfer_result = if verified_complete {
-            promote_staged_file(active_session, &write_path, &resolved_remote_path, local_size).map(|()| true)
+        let (active_session, _) = session.as_ref().unwrap();
+        let transfer_result = if let Some(final_path) = &verified_target {
+            promote_staged_file(active_session, &write_path_for(final_path), final_path, local_size)
+                .map(|()| final_path.clone())
         } else {
-            transfer_chunks(
-                active_session,
-                local_path,
-                &write_path,
-                local_size,
-                &cancel_flag,
-                &force_overwrite,
-                &strict_chunk_verify,
-                &checkpoint,
-                &callbacks,
-            )
+            lead_transfer(active_session, shared, resolved_remote_path, staged, force_overwrite, &mut write_slice)
+                // 校验与传输放在同一个结果里：校验阶段的网络错误和传输中的一样，交给下面的重试分支
+                // 重连后再校验一次，而不是让一个已经传完的文件以失败告终。
+                .and_then(|final_path| {
+                    // 逐块校验只能证明「写进去的等于当时读到的」。文件若在途中被改写，各块来自不同版本，
+                    // 每一块都能通过校验，拼起来却不是任何一个版本；所以必须先确认源文件没变。
+                    if local_fingerprint(shared.local_path)? != started_fingerprint {
+                        log::error!("local file changed during upload: {}", shared.local_path.display());
+                        return Err(UploadError::LocalFileChanged);
+                    }
+                    if should_skip_full_file_hash(shared.strict, checkpoint, local_size)? {
+                        log::info!("all {local_size} bytes chunk-verified, skip full-file SHA-256");
+                    } else {
+                        (callbacks.on_progress)(local_size, local_size, "verifying", current_retry_count(checkpoint));
+                        verify_upload_integrity(
+                            active_session,
+                            shared.local_path,
+                            &write_path_for(&final_path),
+                            local_size,
+                            shared.cancel,
+                            checkpoint,
+                        )?;
+                    }
+                    Ok(final_path)
+                })
         };
 
         match transfer_result {
-            // 替换完成（只有 staged 上传会走到这里）。
-            Ok(true) if verified_complete => {
-                finish_upload(&checkpoint, &callbacks, local_size, current_retry_count(&checkpoint))?;
-                return Ok(());
+            // 数据已校验、但还在临时文件里：下一轮只做替换。
+            Ok(final_path) if staged && verified_target.is_none() => {
+                log::info!("staged upload verified, replacing {final_path}");
+                verified_target = Some(final_path);
             }
-            Ok(true) => {
-                let retry_count = if should_skip_full_file_hash(&strict_chunk_verify, &checkpoint, local_size)? {
-                    log::info!("all {local_size} bytes chunk-verified, skip full-file SHA-256 read");
-                    current_retry_count(&checkpoint)
-                } else {
-                    (callbacks.on_progress)(local_size, local_size, "verifying", current_retry_count(&checkpoint));
-                    verify_upload_integrity(
-                        active_session,
-                        local_path,
-                        &write_path,
-                        local_size,
-                        &cancel_flag,
-                        &checkpoint,
-                    )?
-                };
-                if staged {
-                    verified_complete = true;
-                    log::info!("staged upload verified, replacing {resolved_remote_path}");
-                    continue;
+            Ok(_) => {
+                finish_upload(checkpoint, callbacks, local_size, current_retry_count(checkpoint))?;
+                // 会话还完好：留给紧接着的下一步（批量中的下一个文件、传完后命令）复用。
+                if let Some((session, abort_id)) = session.take() {
+                    if let Some(abort) = shared.aborts.remove(abort_id) {
+                        pool::release(config, session, abort);
+                    }
                 }
-                finish_upload(&checkpoint, &callbacks, local_size, retry_count)?;
                 return Ok(());
-            }
-            Ok(false) => {
-                backoff_ms = INITIAL_BACKOFF_MS;
             }
             Err(UploadError::Cancelled) => {
-                checkpoint
-                    .lock()
-                    .map_err(|e| UploadError::Sftp(e.to_string()))?
-                    .status = CheckpointStatus::Failed;
+                checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?.status = CheckpointStatus::Failed;
                 return Err(UploadError::Cancelled);
             }
-            Err(
-                UploadError::InvalidRemotePath(_)
-                | UploadError::RemoteLargerThanLocal { .. }
-                | UploadError::ResumeBoundaryMismatch { .. }
-                | UploadError::SizeMismatch { .. }
-                | UploadError::HashMismatch
-                | UploadError::LocalIo(_),
-            ) => {
-                checkpoint
-                    .lock()
-                    .map_err(|e| UploadError::Sftp(e.to_string()))?
-                    .status = CheckpointStatus::Failed;
-                return Err(transfer_result.err().unwrap());
-            }
-            Err(UploadError::Connect(_) | UploadError::Sftp(_) | UploadError::ChunkVerifyMismatch { .. }) => {
-                if cancel_flag.load(Ordering::Relaxed) {
+            Err(err) => {
+                if shared.cancel.load(Ordering::Relaxed) {
                     return Err(UploadError::Cancelled);
                 }
-
-                let detail = transfer_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-                if is_permanent_sftp_error(&detail) {
-                    checkpoint
-                        .lock()
-                        .map_err(|e| UploadError::Sftp(e.to_string()))?
-                        .status = CheckpointStatus::Failed;
-                    return Err(transfer_result.err().unwrap());
+                if is_permanent(&err) {
+                    checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?.status =
+                        CheckpointStatus::Failed;
+                    return Err(err);
                 }
 
-                let retry_count = increment_retry_count(&checkpoint)?;
-                session = None;
-                *abort_socket_holder
-                    .lock()
-                    .map_err(|e| UploadError::Sftp(e.to_string()))? = None;
+                let retry_count = increment_retry_count(checkpoint)?;
+                if let Some((_, abort_id)) = session.take() {
+                    shared.aborts.remove(abort_id);
+                }
+                let backoff_ms = backoff.next_delay_ms(shared.transferred());
                 let message = crate::tr!(
-                    format!("传输中断（{detail}），{backoff_ms}ms 后重连续传"),
-                    format!("Transfer interrupted ({detail}), reconnecting to resume in {backoff_ms}ms")
+                    format!("传输中断（{err}），{backoff_ms}ms 后重连续传"),
+                    format!("Transfer interrupted ({err}), reconnecting to resume in {backoff_ms}ms")
                 );
                 log::warn!("upload retry #{retry_count}: {message}");
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
-                sleep_backoff::<UploadError>(&cancel_flag, backoff_ms)?;
-                backoff_ms = next_backoff_ms(backoff_ms);
+                sleep_backoff::<UploadError>(shared.cancel, backoff_ms)?;
+            }
+        }
+    }
+}
+
+/// 主连接一轮的工作：必要时做准备，然后传到所有块完成为止，返回最终目标路径。
+fn lead_transfer(
+    session: &Session,
+    shared: &UploadShared<'_>,
+    resolved_remote_path: &str,
+    staged: bool,
+    force_overwrite: &AtomicBool,
+    write_slice: &mut usize,
+) -> Result<String, UploadError> {
+    let sftp = session.sftp().map_err(|e| UploadError::Sftp(e.to_string()))?;
+    let lock_target = || shared.target.lock().map_err(|e| UploadError::Sftp(e.to_string()));
+    let existing = lock_target()?.clone();
+    let (final_path, write_path) = match existing {
+        Some(target) => target,
+        None => {
+            let target = prepare_upload(session, &sftp, shared, resolved_remote_path, staged, force_overwrite)?;
+            *lock_target()? = Some(target.clone());
+            target
+        }
+    };
+
+    pump_pieces(session, &sftp, &write_path, shared, write_slice)?;
+    if let Some(fatal) = shared.plan.take_fatal() {
+        return Err(fatal);
+    }
+
+    // 所有块都已完成：用路径 stat 核对最终大小。
+    let final_size = sftp
+        .stat(Path::new(&write_path))
+        .map_err(|e| UploadError::Sftp(e.to_string()))?
+        .size
+        .unwrap_or(0);
+    if final_size != shared.local_size {
+        return Err(UploadError::SizeMismatch { local: shared.local_size, remote: final_size });
+    }
+    Ok(final_path)
+}
+
+/// 传输开始前的一次性准备：确定最终目标、核对断点声称的进度是否还成立、把剩余部分排进队列。
+/// 只在一次上传的第一次成功连接时做；之后主连接重连时，内存里的计划就是准确的进度。
+fn prepare_upload(
+    session: &Session,
+    sftp: &Sftp,
+    shared: &UploadShared<'_>,
+    resolved_remote_path: &str,
+    staged: bool,
+    force_overwrite: &AtomicBool,
+) -> Result<(String, String), UploadError> {
+    let (checkpoint, local_size) = (shared.checkpoint, shared.local_size);
+    let lock = || checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()));
+
+    let final_path = resolve_upload_target(sftp, resolved_remote_path, shared.local_path)?;
+    if final_path != resolved_remote_path {
+        let mut cp = lock()?;
+        cp.remote_path = final_path.clone();
+        save_checkpoint(&cp).map_err(UploadError::Sftp)?;
+        log::info!("resolved upload target: {final_path}");
+    }
+    ensure_remote_parent_directories(sftp, &final_path)?;
+    let write_path = if staged { staging_path(&final_path) } else { final_path.clone() };
+
+    // 只有「不存在」才视为没有数据；其他 stat 失败交给重试循环重连，
+    // 否则一次超时就会把断点归零、把已传的数据清掉。
+    let remote_size = match sftp.stat(Path::new(&write_path)) {
+        Ok(stat) => Some(stat.size.unwrap_or(0)),
+        Err(e) if is_sftp_not_found(&e) => None,
+        Err(e) => {
+            log::warn!("stat remote failed (will retry): path={write_path} err={e}");
+            return Err(UploadError::Sftp(e.to_string()));
+        }
+    };
+
+    let force = force_overwrite.swap(false, Ordering::Relaxed);
+    let mut done = if force { RangeSet::default() } else { checkpoint_ranges(&*lock()?) };
+    // 旧版断点直接写目标文件：目标比本地还大，说明它不是这次上传留下的，不能在上面接着写。
+    if !staged && !force && remote_size.is_some_and(|size| size > local_size) {
+        return Err(UploadError::RemoteLargerThanLocal { remote: remote_size.unwrap_or(0), local: local_size });
+    }
+    // 远端实际没有那么多数据（文件被外部删改、断点过期）：超出的进度作废。
+    done.truncate(remote_size.unwrap_or(0));
+
+    let fresh = done.is_empty();
+    if fresh && staged && !force && local_size >= DELTA_MIN_BYTES {
+        done = seed_from_existing_target(session, sftp, shared, &final_path, &write_path);
+    }
+
+    if done.is_empty() {
+        if force {
+            log::info!("overwriting existing remote file: {write_path}");
+        }
+        // 从头开始：建一个空文件，顺带清掉这个路径上可能残留的旧数据。
+        sftp.open_mode(
+            Path::new(&write_path),
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            NEW_FILE_MODE,
+            OpenType::File,
+        )
+        .map_err(|e| UploadError::Sftp(format_remote_sftp_error(&e.to_string(), &write_path)))?;
+    } else {
+        if remote_size.is_some_and(|size| size > local_size) {
+            truncate_remote_file(sftp, &write_path, local_size)?;
+        }
+        verify_resume_boundaries(session, sftp, shared, &write_path, &done)?;
+    }
+
+    {
+        let mut cp = lock()?;
+        let total = done.total();
+        cp.uploaded_bytes = total;
+        cp.verified_bytes = total;
+        // 重新开始干活：上一轮（如校验读取失败）留下的失败标记不再成立。
+        cp.status = CheckpointStatus::InProgress;
+        cp.failure_reason = None;
+        if fresh {
+            // 从头开始时还没有任何未经校验的数据（从旧版本沿用的块是按哈希逐块比对过的）；
+            // 之后只要有一块没校验就会被置回 false。
+            cp.all_chunks_verified = true;
+        }
+        cp.done_ranges = done.clone();
+        save_checkpoint(&cp).map_err(UploadError::Sftp)?;
+    }
+
+    // 每次开始都记录从哪里接着传：用户能在日志里看到断点续传确实生效、没有从头再来。
+    log_resume_point(done.total(), local_size);
+    shared.plan.start(&done.gaps(local_size));
+    shared.report("uploading");
+    Ok((final_path, write_path))
+}
+
+/// 目标位置已有旧版本时，只传发生变化的块：在服务器上把旧文件复制成临时文件，让服务器算出每一块的
+/// 哈希，与本地逐块比对，相同的块直接算作已完成。对「同一个大文件改了一部分再传」的场景
+/// （镜像、数据库导出、追加写的归档）能省下大部分流量；内容整体移位或重新压缩过的文件则基本没有相同的块，
+/// 那时只是多花了服务器本地的一次复制。任何一步走不通都返回空集合，调用方按从头上传处理。
+fn seed_from_existing_target(
+    session: &Session,
+    sftp: &Sftp,
+    shared: &UploadShared<'_>,
+    final_path: &str,
+    write_path: &str,
+) -> RangeSet {
+    use crate::activity::{format_bytes, info, Category};
+    let nothing = RangeSet::default();
+    let on_activity = &shared.callbacks.on_activity;
+    let Some(existing_size) = sftp
+        .stat(Path::new(final_path))
+        .ok()
+        .filter(|stat| stat.is_file())
+        .and_then(|stat| stat.size)
+        .filter(|size| *size >= CHUNK_SIZE)
+    else {
+        return nothing;
+    };
+    let blocks = existing_size.min(shared.local_size) / CHUNK_SIZE;
+    info(
+        Category::Transfer,
+        crate::tr!(
+            format!("目标位置已有旧版本，正在比对哪些部分没有变化（{}）", format_bytes(blocks * CHUNK_SIZE)),
+            format!("An older version exists at the target; checking which parts are unchanged ({})", format_bytes(blocks * CHUNK_SIZE))
+        ),
+    );
+    if !remote_copy(session, final_path, write_path, existing_size, shared.cancel, on_activity) {
+        log::info!("server-side copy unavailable, uploading {final_path} in full");
+        return nothing;
+    }
+    let Some(remote_hashes) = remote_block_hashes(session, write_path, blocks, shared.cancel, on_activity) else {
+        return nothing;
+    };
+    // 临时文件不能比新文件长：多出来的尾巴是旧版本的内容。
+    if existing_size > shared.local_size && truncate_remote_file(sftp, write_path, shared.local_size).is_err() {
+        return nothing;
+    }
+
+    let Ok(mut local_file) = File::open(shared.local_path) else { return nothing };
+    let mut buffer = vec![0_u8; CHUNK_SIZE as usize];
+    let mut same = RangeSet::default();
+    for (index, remote_hash) in remote_hashes.iter().enumerate() {
+        if shared.cancel.load(Ordering::Relaxed) || local_file.read_exact(&mut buffer).is_err() {
+            return nothing;
+        }
+        on_activity();
+        if sha256_bytes(&buffer) == *remote_hash {
+            let start = index as u64 * CHUNK_SIZE;
+            same.insert(start, start + CHUNK_SIZE);
+        }
+    }
+    info(
+        Category::Transfer,
+        crate::tr!(
+            format!("{} 与旧版本相同，无需重传", format_bytes(same.total())),
+            format!("{} unchanged from the older version; no need to send it again", format_bytes(same.total()))
+        ),
+    );
+    same
+}
+
+/// 续传前抽查：每个已完成区间的最后一块，远端内容必须与本地一致。
+/// 断点可能已经过期（远端文件被别的程序改写、本地文件换了内容），在其上接着传只会得到一个坏文件。
+fn verify_resume_boundaries(
+    session: &Session,
+    sftp: &Sftp,
+    shared: &UploadShared<'_>,
+    write_path: &str,
+    done: &RangeSet,
+) -> Result<(), UploadError> {
+    let mut local_file = File::open(shared.local_path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+    let mut remote_file = sftp
+        .open_mode(Path::new(write_path), OpenFlags::READ, 0, OpenType::File)
+        .map_err(|e| UploadError::Sftp(e.to_string()))?;
+    let mut hasher = BlockHasher::start(session, write_path);
+    let mut buffer = vec![0_u8; CHUNK_SIZE as usize];
+    for &(_, end) in done.ranges() {
+        let start = align_down(end - 1);
+        let len = (end - start) as usize;
+        local_file.seek(SeekFrom::Start(start)).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+        local_file.read_exact(&mut buffer[..len]).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+        let remote_hash = remote_block_hash(&mut remote_file, &mut hasher, start, len as u64, shared)?;
+        if sha256_bytes(&buffer[..len]) != remote_hash {
+            return Err(UploadError::ResumeBoundaryMismatch { offset: end });
+        }
+        log::info!("resume boundary verified at offset {end}");
+    }
+    Ok(())
+}
+
+/// 远端 `[offset, offset+len)` 的 SHA-256：优先让服务器自己算（几乎不占带宽），
+/// 这条路走不通时把这一块读回来算。
+fn remote_block_hash(
+    remote_file: &mut RemoteFile,
+    hasher: &mut Option<BlockHasher>,
+    offset: u64,
+    len: u64,
+    shared: &UploadShared<'_>,
+) -> Result<[u8; 32], UploadError> {
+    let on_activity = &shared.callbacks.on_activity;
+    on_activity();
+    if let Some(active) = hasher.as_mut() {
+        match active.hash(offset, len, shared.cancel) {
+            Ok(hash) => return Ok(hash),
+            Err(e) => {
+                log::info!("remote block hasher unavailable ({e}), reading blocks back instead");
+                *hasher = None;
+            }
+        }
+    }
+    sha256_remote_handle_range(remote_file, offset, len, Some(on_activity))
+}
+
+/// 每写完一块立即核对远端内容；不一致则报错，这一块会被重新传。
+fn verify_written_block(
+    remote_file: &mut RemoteFile,
+    hasher: &mut Option<BlockHasher>,
+    local_bytes: &[u8],
+    offset: u64,
+    shared: &UploadShared<'_>,
+) -> Result<(), UploadError> {
+    let len = local_bytes.len() as u64;
+    let local_hash = sha256_bytes(local_bytes);
+    let used_remote_hasher = hasher.is_some();
+    let mut remote_hash = remote_block_hash(remote_file, hasher, offset, len, shared)?;
+    if local_hash != remote_hash && used_remote_hasher && hasher.is_some() {
+        // 服务器端算出来的不一致：下结论前先按老办法读回来确认一次，
+        // 免得因为那条捷径自身的问题（例如工具输出异常）把好数据判成坏的；确认是它的问题就不再用它。
+        remote_hash = sha256_remote_handle_range(remote_file, offset, len, Some(&shared.callbacks.on_activity))?;
+        if local_hash == remote_hash {
+            log::warn!("remote block hasher disagreed with read-back at offset {offset}; disabling it");
+            *hasher = None;
+        }
+    }
+    if local_hash == remote_hash {
+        log::info!("chunk verified offset={offset} len={len} hash={}", hex_encode(&local_hash));
+        return Ok(());
+    }
+    log::error!(
+        "chunk hash mismatch offset={offset} len={len} local={} remote={}",
+        hex_encode(&local_hash),
+        hex_encode(&remote_hash)
+    );
+    Err(UploadError::ChunkVerifyMismatch { offset, len })
+}
+
+/// 从队列里不断领任务并传输，直到全部完成。主连接和辅助连接共用。
+/// 一个连接只打开一次远端文件，所有块复用同一个句柄：此前每块都要 stat + open + close，
+/// 读回校验再 open + close，每 MB 多出约 5 次往返，高延迟链路上 1 GB 文件要多花二十多分钟。
+fn pump_pieces(
+    session: &Session,
+    sftp: &Sftp,
+    write_path: &str,
+    shared: &UploadShared<'_>,
+    write_slice: &mut usize,
+) -> Result<(), UploadError> {
+    let mut local_file = File::open(shared.local_path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+    let mut remote_file: Option<RemoteFile> = None;
+    // 服务器端哈希进程按需启动（只有逐块校验才用得到），每个连接一个。
+    let mut hasher: Option<BlockHasher> = None;
+    let mut hasher_started = false;
+    let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
+
+    loop {
+        if shared.cancel.load(Ordering::Relaxed) {
+            return Err(UploadError::Cancelled);
+        }
+        let mut piece = match shared.plan.claim() {
+            Claim::Piece(piece) => piece,
+            Claim::Wait => {
+                keepalive_while_idle(session);
+                thread::sleep(PLAN_POLL);
+                continue;
+            }
+            Claim::Done => break,
+        };
+        if remote_file.is_none() {
+            remote_file = Some(open_remote_for_upload(sftp, write_path)?);
+        }
+        let remote = remote_file.as_mut().unwrap();
+
+        while piece.next < piece.end {
+            if shared.cancel.load(Ordering::Relaxed) {
+                return Err(UploadError::Cancelled);
+            }
+            let offset = piece.next;
+            let chunk_len = CHUNK_SIZE.min(piece.end - offset) as usize;
+            let chunk = &mut chunk_buffer[..chunk_len];
+            local_file.seek(SeekFrom::Start(offset)).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+            local_file.read_exact(chunk).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+
+            let write_started = Instant::now();
+            write_remote_chunk(remote, offset, chunk, *write_slice, |absolute| {
+                piece.set_partial(absolute - offset);
+                shared.report("uploading");
+            })?;
+            *write_slice = next_write_slice(chunk_len, write_started.elapsed());
+
+            let read_back = shared.strict.load(Ordering::Relaxed);
+            if read_back {
+                if !std::mem::replace(&mut hasher_started, true) {
+                    hasher = BlockHasher::start(session, write_path);
+                }
+                shared.report("chunk_verifying");
+                verify_written_block(remote, &mut hasher, chunk, offset, shared)?;
+            }
+
+            shared.complete_block(offset, chunk_len as u64, read_back)?;
+            piece.advance(chunk_len as u64);
+            shared.report("uploading");
+        }
+    }
+
+    // 关闭句柄让服务器完成所有写入，之后才能用路径 stat 核对最终大小。
+    if let Some(mut file) = remote_file {
+        file.close().map_err(|e| UploadError::Sftp(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// 辅助连接：只在有任务可领时才建立连接，默默地传、默默地重连；它的失败不打扰用户
+/// （主连接还在工作，进度仍在前进），只有「重连也不会好」的错误才交给主连接上报。
+fn helper_loop(config: &ConnectionConfig, shared: &UploadShared<'_>, index: usize) {
+    let mut backoff = Backoff::new();
+    let mut write_slice = INITIAL_WRITE_SLICE;
+    loop {
+        if shared.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        match shared.plan.status() {
+            PlanStatus::Done => return,
+            PlanStatus::Wait => {
+                thread::sleep(PLAN_POLL);
+                continue;
+            }
+            PlanStatus::Work => {}
+        }
+        let Some((_, write_path)) = shared.target.lock().ok().and_then(|target| target.clone()) else {
+            return;
+        };
+
+        let result = connect_session(config).map_err(UploadError::Connect).and_then(|(session, abort)| {
+            let abort_id = shared.aborts.register(abort);
+            let result = session
+                .sftp()
+                .map_err(|e| UploadError::Sftp(e.to_string()))
+                .and_then(|sftp| pump_pieces(&session, &sftp, &write_path, shared, &mut write_slice));
+            shared.aborts.remove(abort_id);
+            result
+        });
+        match result {
+            Ok(()) | Err(UploadError::Cancelled) => return,
+            Err(err) if is_permanent(&err) => {
+                log::error!("parallel upload connection {index} failed permanently: {err}");
+                // 连不上（如服务器限制了同一来源的连接数）只是少一条并行连接；
+                // 传输过程中的永久错误（权限、路径）则对整个任务成立，交给主连接上报。
+                if !matches!(err, UploadError::Connect(_)) {
+                    shared.plan.fail(err);
+                }
+                return;
+            }
+            Err(err) => {
+                let delay = backoff.next_delay_ms(shared.transferred());
+                log::warn!("parallel upload connection {index} interrupted ({err}), retrying in {delay}ms");
+                if sleep_backoff::<UploadError>(shared.cancel, delay).is_err() {
+                    return;
+                }
             }
         }
     }
 }
 
 fn finish_upload(
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
+    checkpoint: &Mutex<UploadCheckpoint>,
     callbacks: &UploadCallbacks,
     local_size: u64,
     retry_count: u32,
@@ -599,24 +1126,23 @@ fn finish_upload(
 }
 
 fn verify_upload_integrity(
-    session: &mut Session,
+    session: &Session,
     local_path: &Path,
     remote_path: &str,
     local_size: u64,
-    cancel_flag: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
+    cancel_flag: &AtomicBool,
+    checkpoint: &Mutex<UploadCheckpoint>,
 ) -> Result<u32, UploadError> {
     ensure_not_cancelled(cancel_flag, checkpoint)?;
 
     let local_hash = sha256_local_file(session, local_path, cancel_flag, checkpoint)?;
     let sftp = session.sftp().map_err(|e| UploadError::Sftp(e.to_string()))?;
-    let remote_hash = match sha256_remote_file(
-        &sftp,
-        remote_path,
-        local_size,
-        cancel_flag,
-        checkpoint,
-    ) {
+    // 优先让服务器自己算：整个文件读回来再算等于把流量翻倍。走不通（不能执行命令等）才读回。
+    let remote_result = match remote_file_sha256(session, remote_path, local_size, cancel_flag) {
+        Some(hash) => Ok(hash),
+        None => sha256_remote_file(&sftp, remote_path, local_size, cancel_flag, checkpoint),
+    };
+    let remote_hash = match remote_result {
         Ok(hash) => hash,
         Err(UploadError::Sftp(detail)) => {
             log::warn!("full-file remote read failed during verify: {detail}");
@@ -624,13 +1150,10 @@ fn verify_upload_integrity(
             cp.failure_reason = Some("verify_read_failed".into());
             cp.status = CheckpointStatus::Failed;
             let _ = save_checkpoint(&cp);
+            // 这个错误会进入重试循环自动重连再校验；只有用户取消或退出应用时才会停在这里。
             return Err(UploadError::Sftp(crate::tr!(
-                format!(
-                    "传完后校验时读取远端失败（弱网常见），数据块已全部校验通过，可点「开始上传」仅重试校验: {detail}"
-                ),
-                format!(
-                    "Failed to read the remote file for final verification (common on weak networks); all chunks already verified, click \"Start upload\" to retry verification only: {detail}"
-                )
+                format!("数据已传完，最终校验时读取远端失败: {detail}"),
+                format!("All data was sent, but reading the remote file for final verification failed: {detail}")
             )));
         }
         Err(err) => return Err(err),
@@ -647,6 +1170,7 @@ fn verify_upload_integrity(
             let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
             cp.uploaded_bytes = 0;
             cp.verified_bytes = 0;
+            cp.done_ranges = RangeSet::default();
             cp.failure_reason = Some("hash_mismatch".into());
             cp.status = CheckpointStatus::Failed;
             let _ = save_checkpoint(&cp);
@@ -659,19 +1183,6 @@ fn verify_upload_integrity(
     Ok(current_retry_count(checkpoint))
 }
 
-/// 给定断点可信续传位置与远端实际字节数，返回安全的续传偏移。
-/// 远端不少于可信位置时直接用可信位置；否则夹紧到远端块对齐位置——
-/// 否则续传边界校验会 read_exact 读过远端 EOF，抛出非永久错误而无限重连死循环。
-fn safe_resume_offset(trusted: u64, remote_size: u64) -> u64 {
-    if remote_size >= trusted {
-        trusted
-    } else {
-        align_down(remote_size)
-    }
-}
-
-
-
 fn truncate_remote_file(sftp: &Sftp, remote_path: &str, size: u64) -> Result<(), UploadError> {
     let stat = FileStat {
         size: Some(size),
@@ -683,83 +1194,6 @@ fn truncate_remote_file(sftp: &Sftp, remote_path: &str, size: u64) -> Result<(),
     };
     sftp.setstat(Path::new(remote_path), stat)
         .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    Ok(())
-}
-
-fn prepare_resume_offset(
-    sftp: &Sftp,
-    remote_path: &str,
-    remote_stat_size: u64,
-    force_overwrite: &AtomicBool,
-) -> Result<u64, UploadError> {
-    if force_overwrite.swap(false, Ordering::Relaxed) {
-        log::info!("overwriting existing remote file: {remote_path}");
-        if remote_stat_size > 0 {
-            if let Ok(stat) = sftp.stat(Path::new(remote_path)) {
-                if stat.is_file() {
-                    let _ = sftp.unlink(Path::new(remote_path));
-                }
-            }
-        }
-        return Ok(0);
-    }
-
-    let resume_offset = align_down(remote_stat_size);
-    if resume_offset != remote_stat_size {
-        log::warn!(
-            "remote size {remote_stat_size} is not chunk-aligned, rewind to {resume_offset}"
-        );
-        truncate_remote_file(sftp, remote_path, resume_offset)?;
-    }
-
-    Ok(resume_offset)
-}
-
-fn verify_resume_boundary(
-    sftp: &Sftp,
-    local_path: &Path,
-    remote_path: &str,
-    resume_offset: u64,
-) -> Result<(), UploadError> {
-    if resume_offset == 0 {
-        return Ok(());
-    }
-
-    let verify_len = CHUNK_SIZE.min(resume_offset);
-    let local_start = resume_offset - verify_len;
-
-    let mut local_buf = vec![0_u8; verify_len as usize];
-    let mut local_file = File::open(local_path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
-    local_file
-        .seek(SeekFrom::Start(local_start))
-        .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-    local_file
-        .read_exact(&mut local_buf)
-        .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-
-    let mut remote_file = sftp
-        .open_mode(
-            Path::new(remote_path),
-            OpenFlags::READ,
-            0,
-            OpenType::File,
-        )
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    let mut remote_buf = vec![0_u8; verify_len as usize];
-    remote_file
-        .seek(SeekFrom::Start(local_start))
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    remote_file
-        .read_exact(&mut remote_buf)
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-
-    if local_buf != remote_buf {
-        return Err(UploadError::ResumeBoundaryMismatch {
-            offset: resume_offset,
-        });
-    }
-
-    log::info!("resume boundary verified at offset {resume_offset}");
     Ok(())
 }
 
@@ -802,89 +1236,6 @@ fn sha256_remote_handle_range(
     Ok(hasher.finalize().into())
 }
 
-/// 每写完一块立即读回比对 SHA-256，失败则截断远端并拒绝推进 verified 断点。
-fn verify_written_chunk(
-    sftp: &Sftp,
-    remote_file: &mut RemoteFile,
-    local_bytes: &[u8],
-    remote_path: &str,
-    offset: u64,
-    len: u64,
-    on_activity: &dyn Fn(),
-) -> Result<(), UploadError> {
-    if len == 0 {
-        return Ok(());
-    }
-
-    // 本地块内容已在内存缓冲，直接哈希；远端侧必须真读回，这正是要验证的目标。
-    let local_hash = sha256_bytes(local_bytes);
-    on_activity();
-    let remote_hash = sha256_remote_handle_range(remote_file, offset, len, Some(on_activity))?;
-
-    if local_hash == remote_hash {
-        log::info!(
-            "chunk verified offset={offset} len={len} hash={}",
-            hex_encode(&local_hash)
-        );
-        return Ok(());
-    }
-
-    log::error!(
-        "chunk hash mismatch offset={offset} len={len} local={} remote={}",
-        hex_encode(&local_hash),
-        hex_encode(&remote_hash)
-    );
-    truncate_remote_file(sftp, remote_path, offset)?;
-    Err(UploadError::ChunkVerifyMismatch { offset, len })
-}
-
-fn resolve_resume_offset(
-    sftp: &Sftp,
-    remote_path: &str,
-    remote_stat_size: u64,
-    force_overwrite: &AtomicBool,
-    checkpoint: &UploadCheckpoint,
-) -> Result<u64, UploadError> {
-    if force_overwrite.load(Ordering::Relaxed) {
-        return prepare_resume_offset(sftp, remote_path, remote_stat_size, force_overwrite);
-    }
-
-    let trusted = effective_verified_bytes(checkpoint);
-    if trusted > 0 && !force_overwrite.load(Ordering::Relaxed) {
-        // 远端多于可信位置：多出的部分未经校验，先截断回可信位置。
-        if remote_stat_size > trusted {
-            log::warn!(
-                "remote has {remote_stat_size} bytes but only {trusted} verified, truncate"
-            );
-            truncate_remote_file(sftp, remote_path, trusted)?;
-        }
-        let safe = safe_resume_offset(trusted, remote_stat_size);
-        if safe < trusted {
-            // 远端字节比断点声称的可信位置还少（文件被外部删改/替换、断点过期），
-            // 回退到远端真实拥有的块对齐位置，让边界校验重新确认这一块。
-            log::warn!(
-                "remote has only {remote_stat_size} bytes but checkpoint trusts {trusted}; \
-                 checkpoint stale, resume from block-aligned {safe}"
-            );
-        }
-        return Ok(safe);
-    }
-
-    if remote_stat_size > 0 {
-        log::info!(
-            "checkpoint has no verified progress but remote has {remote_stat_size} bytes, remove remote file"
-        );
-        if let Ok(stat) = sftp.stat(Path::new(remote_path)) {
-            if stat.is_file() {
-                let _ = sftp.unlink(Path::new(remote_path));
-            }
-        }
-        return Ok(0);
-    }
-
-    prepare_resume_offset(sftp, remote_path, remote_stat_size, force_overwrite)
-}
-
 /// 每次（重）连接后记录从哪里开始：用户能在日志里看到断点续传确实生效、没有从头再来。
 pub(super) fn log_resume_point(offset: u64, total: u64) {
     use crate::activity::{format_bytes, info, Category};
@@ -904,18 +1255,19 @@ pub(super) fn log_resume_point(offset: u64, total: u64) {
     }
 }
 
-/// 一次连接只打开一次远端文件，所有块复用同一个句柄：此前每块都要 stat + open + close，
-/// 读回校验再 open + close，每 MB 多出约 5 次往返，高延迟链路上 1 GB 文件要多花二十多分钟。
-/// 写入与读回走同一个句柄：同一 SFTP 通道上的请求由服务器按序处理，读到的一定是刚写入的数据。
-/// 从 0 开始传时截断（覆盖远端旧文件）；续传时保留已有内容。
-fn open_remote_for_upload(sftp: &Sftp, remote_path: &str, fresh: bool) -> Result<RemoteFile, UploadError> {
-    let flags = if fresh {
-        OpenFlags::WRITE | OpenFlags::READ | OpenFlags::CREATE | OpenFlags::TRUNCATE
-    } else {
-        OpenFlags::WRITE | OpenFlags::READ | OpenFlags::CREATE
-    };
-    sftp.open_mode(Path::new(remote_path), flags, 0o644, OpenType::File)
-        .map_err(|e| UploadError::Sftp(e.to_string()))
+/// 新建文件的权限（实际结果还会被服务器的 umask 收紧；替换已有文件时会改用旧文件的权限）。
+const NEW_FILE_MODE: i32 = 0o644;
+
+/// 打开实际写入的文件。写入与读回走同一个句柄：同一 SFTP 通道上的请求由服务器按序处理，
+/// 读到的一定是刚写入的数据。不带 TRUNCATE：文件由准备阶段建好，各连接往各自的位置写。
+fn open_remote_for_upload(sftp: &Sftp, remote_path: &str) -> Result<RemoteFile, UploadError> {
+    sftp.open_mode(
+        Path::new(remote_path),
+        OpenFlags::WRITE | OpenFlags::READ | OpenFlags::CREATE,
+        NEW_FILE_MODE,
+        OpenType::File,
+    )
+    .map_err(|e| UploadError::Sftp(e.to_string()))
 }
 
 /// 根据上一块的实测写入速度决定下一块的分片大小（取 2 的幂，避免尺寸频繁抖动）。
@@ -957,159 +1309,6 @@ fn write_remote_chunk<F: FnMut(u64)>(
     Ok(())
 }
 
-fn transfer_chunks(
-    session: &mut Session,
-    local_path: &Path,
-    remote_path: &str,
-    local_size: u64,
-    cancel_flag: &Arc<AtomicBool>,
-    force_overwrite: &Arc<AtomicBool>,
-    strict_chunk_verify: &Arc<AtomicBool>,
-    checkpoint: &Arc<Mutex<UploadCheckpoint>>,
-    callbacks: &UploadCallbacks,
-) -> Result<bool, UploadError> {
-    let sftp = session
-        .sftp()
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-
-    let actual_remote_path = resolve_upload_target(&sftp, remote_path, local_path)?;
-    if actual_remote_path != remote_path {
-        let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
-        cp.remote_path = actual_remote_path.clone();
-        save_checkpoint(&cp).map_err(|e| UploadError::Sftp(e))?;
-        log::info!("resolved upload target: {actual_remote_path}");
-    }
-
-    ensure_remote_parent_directories(&sftp, &actual_remote_path)?;
-
-    // 只有「不存在」才视为 0 字节；其他 stat 失败交给重试循环重连，
-    // 否则一次超时就会让 resolve_resume_offset 把断点归零并截断远端文件。
-    let remote_stat_size = match sftp.stat(Path::new(&actual_remote_path)) {
-        Ok(stat) => stat.size.unwrap_or(0),
-        Err(e) if is_sftp_not_found(&e) => 0,
-        Err(e) => {
-            log::warn!("stat remote failed (will retry): path={actual_remote_path} err={e}");
-            return Err(UploadError::Sftp(e.to_string()));
-        }
-    };
-
-    if remote_stat_size > local_size && !force_overwrite.load(Ordering::Relaxed) {
-        return Err(UploadError::RemoteLargerThanLocal {
-            remote: remote_stat_size,
-            local: local_size,
-        });
-    }
-
-    let checkpoint_snapshot = checkpoint
-        .lock()
-        .map_err(|e| UploadError::Sftp(e.to_string()))?
-        .clone();
-
-    let mut offset = resolve_resume_offset(
-        &sftp,
-        &actual_remote_path,
-        remote_stat_size,
-        force_overwrite,
-        &checkpoint_snapshot,
-    )?;
-
-    if offset > 0 {
-        verify_resume_boundary(&sftp, local_path, &actual_remote_path, offset)?;
-    }
-    log_resume_point(offset, local_size);
-
-    {
-        let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
-        cp.uploaded_bytes = offset;
-        cp.verified_bytes = offset;
-    }
-
-    let retry_count = current_retry_count(checkpoint);
-    (callbacks.on_progress)(offset, local_size, "uploading", retry_count);
-
-    let mut local_file = File::open(local_path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
-    local_file
-        .seek(SeekFrom::Start(offset))
-        .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-
-    let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
-    let mut remote_file = open_remote_for_upload(&sftp, &actual_remote_path, offset == 0)?;
-    let mut write_slice = INITIAL_WRITE_SLICE;
-
-    while offset < local_size {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(UploadError::Cancelled);
-        }
-
-        let remaining = local_size - offset;
-        let chunk_len = (CHUNK_SIZE as u64).min(remaining) as usize;
-
-        local_file
-            .read_exact(&mut chunk_buffer[..chunk_len])
-            .map_err(|e| UploadError::LocalIo(e.to_string()))?;
-
-        let chunk_start = offset;
-
-        let write_started = std::time::Instant::now();
-        write_remote_chunk(
-            &mut remote_file,
-            offset,
-            &chunk_buffer[..chunk_len],
-            write_slice,
-            |absolute| {
-                (callbacks.on_progress)(absolute, local_size, "uploading", retry_count);
-            },
-        )?;
-        write_slice = next_write_slice(chunk_len, write_started.elapsed());
-
-        if strict_chunk_verify.load(Ordering::Relaxed) {
-            (callbacks.on_progress)(
-                chunk_start,
-                local_size,
-                "chunk_verifying",
-                retry_count,
-            );
-            verify_written_chunk(
-                &sftp,
-                &mut remote_file,
-                &chunk_buffer[..chunk_len],
-                &actual_remote_path,
-                chunk_start,
-                chunk_len as u64,
-                &callbacks.on_activity,
-            )?;
-        }
-
-        offset += chunk_len as u64;
-        {
-            let mut cp = checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
-            cp.uploaded_bytes = offset;
-            cp.verified_bytes = offset;
-            save_checkpoint(&cp).map_err(|e| UploadError::Sftp(e))?;
-        }
-        (callbacks.on_progress)(offset, local_size, "uploading", retry_count);
-    }
-
-    // 关闭句柄让服务器完成所有写入，再用路径 stat 核对最终大小。
-    remote_file
-        .close()
-        .map_err(|e| UploadError::Sftp(e.to_string()))?;
-    let final_size = sftp
-        .stat(Path::new(&actual_remote_path))
-        .map_err(|e| UploadError::Sftp(e.to_string()))?
-        .size
-        .unwrap_or(0);
-
-    if final_size != local_size {
-        return Err(UploadError::SizeMismatch {
-            local: local_size,
-            remote: final_size,
-        });
-    }
-
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,21 +1346,5 @@ mod tests {
         let wrapped = format_remote_sftp_error("Timed out waiting on socket", "/tmp/a.jar");
         assert!(!is_permanent_sftp_error(&wrapped));
         assert!(!is_permanent_sftp_error("Timed out waiting on socket"));
-    }
-
-    // 回归：远端字节 < 断点可信位置时必须夹紧到远端块对齐位置，
-    // 否则边界校验读过 EOF 会无限重连死循环。
-    #[test]
-    fn safe_resume_offset_clamps_when_remote_shorter_than_checkpoint() {
-        // 远端足够：用可信位置
-        assert_eq!(safe_resume_offset(2 * CHUNK_SIZE, 5 * CHUNK_SIZE), 2 * CHUNK_SIZE);
-        assert_eq!(safe_resume_offset(2 * CHUNK_SIZE, 2 * CHUNK_SIZE), 2 * CHUNK_SIZE);
-        // 远端更短：夹紧到远端块对齐位置
-        assert_eq!(
-            safe_resume_offset(5 * CHUNK_SIZE, 2 * CHUNK_SIZE + 123),
-            2 * CHUNK_SIZE
-        );
-        // 远端只剩不足一块：从头开始
-        assert_eq!(safe_resume_offset(5 * CHUNK_SIZE, 42), 0);
     }
 }

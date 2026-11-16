@@ -1,5 +1,4 @@
-use crate::sftp::abort_socket;
-use std::net::TcpStream;
+use crate::sftp::AbortHandles;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,7 +77,7 @@ impl StallWatchdog {
 pub fn spawn_stall_watchdog(
     heartbeat: Arc<ProgressHeartbeat>,
     cancel_flag: Arc<AtomicBool>,
-    abort_socket_holder: Arc<Mutex<Option<TcpStream>>>,
+    aborts: Arc<AbortHandles>,
     stall_timeout: Duration,
     on_stall: impl Fn(u64) + Send + 'static,
 ) -> StallWatchdog {
@@ -93,6 +92,21 @@ pub fn spawn_stall_watchdog(
                 break;
             }
 
+            // 连接所用的本机地址没了（换网络、VPN 重连）：这些连接不可能再通，
+            // 不必等到无响应阈值，立刻打断让重试循环在新网络上重连。
+            let network_changed = crate::netwatch::local_addresses()
+                .is_some_and(|present| crate::netwatch::any_address_gone(&aborts.local_addrs(), &present));
+            if network_changed {
+                log::warn!("local address of an active connection disappeared, reconnecting now");
+                crate::activity::warn(
+                    crate::activity::Category::Network,
+                    crate::tr!("检测到网络切换，立即重新连接", "Network change detected; reconnecting now"),
+                );
+                aborts.abort_all();
+                heartbeat.defer_next_check();
+                continue;
+            }
+
             let Some(stalled_bytes) = heartbeat.stalled_for(stall_timeout) else {
                 continue;
             };
@@ -102,11 +116,8 @@ pub fn spawn_stall_watchdog(
                 stall_timeout
             );
 
-            if let Ok(guard) = abort_socket_holder.lock() {
-                if let Some(socket) = guard.as_ref() {
-                    abort_socket(socket);
-                }
-            }
+            // 并行传输时每条连接都要打断：只断一条的话，其余连接仍卡在各自的阻塞 IO 里。
+            aborts.abort_all();
 
             heartbeat.defer_next_check();
             on_stall(stalled_bytes);

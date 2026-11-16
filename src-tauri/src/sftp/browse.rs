@@ -1,8 +1,10 @@
-use super::client::{connect_session, ConnectionConfig};
+use super::client::{is_sftp_not_found, ConnectionConfig};
+use super::pool;
 use super::transfer_common::is_staging_file;
 use crate::local_files::{is_ignored_name, ExpandedPaths, LocalEntry, MAX_EXPANDED_FILES};
 use serde::Serialize;
 use ssh2::Sftp;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,16 +22,20 @@ pub struct RemoteDirListing {
     pub entries: Vec<RemoteDirEntry>,
 }
 
+/// 新建目录的权限（实际结果还会被服务器的 umask 收紧）。
+const NEW_DIRECTORY_MODE: i32 = 0o755;
+
 /// 列出远端目录；path 为空时从用户 SFTP 主目录开始。
 pub fn list_remote_directory(
     config: &ConnectionConfig,
     path: Option<&str>,
 ) -> Result<RemoteDirListing, String> {
-    let (session, _) = connect_session(config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
-
-    let listing_path = resolve_listing_path(&sftp, path)?;
-    read_directory_listing(&sftp, &listing_path)
+    // 浏览时每点一层目录都会走到这里：复用上一次的会话，不必每次重新握手。
+    pool::with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        let listing_path = resolve_listing_path(&sftp, path)?;
+        read_directory_listing(&sftp, &listing_path)
+    })
 }
 
 /// 在 parent_path 下新建目录并返回刷新后的列表。
@@ -39,33 +45,39 @@ pub fn create_remote_directory(
     dir_name: &str,
 ) -> Result<RemoteDirListing, String> {
     let name = validate_dir_name(dir_name)?;
-    let (session, _) = connect_session(config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
+    pool::with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        let parent = resolve_listing_path(&sftp, Some(parent_path))?;
+        let new_path = join_remote_path(&parent, name);
 
-    let parent = resolve_listing_path(&sftp, Some(parent_path))?;
-    let new_path = join_remote_path(&parent, name);
+        if sftp.stat(Path::new(&new_path)).is_ok() {
+            return Err(crate::tr!(format!("「{name}」已存在"), format!("\"{name}\" already exists")));
+        }
 
-    if sftp.stat(Path::new(&new_path)).is_ok() {
-        return Err(crate::tr!(format!("「{name}」已存在"), format!("\"{name}\" already exists")));
-    }
+        sftp.mkdir(Path::new(&new_path), NEW_DIRECTORY_MODE)
+            .map_err(|e| crate::tr!(format!("创建目录失败: {e}"), format!("Failed to create directory: {e}")))?;
 
-    sftp.mkdir(Path::new(&new_path), 0o755)
-        .map_err(|e| crate::tr!(format!("创建目录失败: {e}"), format!("Failed to create directory: {e}")))?;
-
-    read_directory_listing(&sftp, &parent)
+        read_directory_listing(&sftp, &parent)
+    })
 }
 
 /// 把下载时选中的远端路径展开成文件列表：文件原样保留，文件夹递归展开，并记录每个文件
 /// 相对所选文件夹的目录，用于在本地还原同样的结构。规则与本地展开（上传）一致。
 /// 返回的 `path` 是远端路径；复用 LocalEntry 只是为了让前端两个方向用同一种数据结构。
 pub fn expand_remote_paths(config: &ConnectionConfig, paths: &[String]) -> Result<ExpandedPaths, String> {
-    let (session, _) = connect_session(config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
+    pool::with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        Ok(expand_paths(&sftp, paths))
+    })
+}
+
+fn expand_paths(sftp: &Sftp, paths: &[String]) -> ExpandedPaths {
     let mut out = ExpandedPaths { entries: Vec::new(), truncated: false, unreadable_dirs: Vec::new() };
     for raw in paths {
         let path = trim_trailing_slash(raw.trim());
-        // lstat：不跟随符号链接，避免链接成环或把目录树之外的内容下载下来。
-        let stat = match sftp.lstat(Path::new(path)) {
+        // 用户亲手选中的条目跟随符号链接（stat）：选中一个指向文件或目录的链接，意图就是下载它指向的内容，
+        // 不跟随的话它既不是文件也不是目录，会被一声不响地丢掉。递归进入目录后则不再跟随（见 walk_remote）。
+        let stat = match sftp.stat(Path::new(path)) {
             Ok(stat) => stat,
             Err(e) => {
                 log::warn!("cannot stat remote path {path}: {e}");
@@ -76,7 +88,7 @@ pub fn expand_remote_paths(config: &ConnectionConfig, paths: &[String]) -> Resul
         if stat.is_file() {
             push_remote_file(&mut out, path, String::new(), stat.size.unwrap_or(0));
         } else if stat.is_dir() {
-            walk_remote(&sftp, path, &entry_name(Path::new(path)), &mut out);
+            walk_remote(sftp, path, &entry_name(Path::new(path)), &mut out);
         }
         if out.entries.len() >= MAX_EXPANDED_FILES {
             out.truncated = true;
@@ -84,30 +96,39 @@ pub fn expand_remote_paths(config: &ConnectionConfig, paths: &[String]) -> Resul
         }
     }
     out.entries.truncate(MAX_EXPANDED_FILES);
-    Ok(out)
+    out
 }
 
 /// 批量传输开始前统计哪些目标文件已存在，用于一次性确认。按目录列举而不是逐个 stat：
 /// 弱网下每次 stat 都是一个往返，几百个文件要等几十秒；同一目录的文件只需一次列举。
-/// 目录不存在或读不了时视为其中的文件都不存在（之后传输时会按需创建目录）。
+/// 目录不存在时视为其中的文件都不存在（之后传输时会按需创建目录）；其他错误（超时、断线、无权限）
+/// 必须报出来：当成「都不存在」的话，覆盖确认会被悄悄跳过。
 pub fn remote_paths_exist(config: &ConnectionConfig, paths: &[String]) -> Result<Vec<bool>, String> {
-    let (session, _) = connect_session(config).map_err(|e| e.to_string())?;
-    let sftp = session.sftp().map_err(|e| e.to_string())?;
-    let mut listings: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
-    Ok(paths
-        .iter()
-        .map(|path| {
+    pool::with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        let mut listings: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut exists = Vec::with_capacity(paths.len());
+        for path in paths {
             let (dir, name) = path.rsplit_once('/').unwrap_or((".", path.as_str()));
             let dir = if dir.is_empty() { "/" } else { dir };
-            let names = listings.entry(dir.to_string()).or_insert_with(|| {
-                sftp.readdir(Path::new(dir))
-                    .map(|entries| entries.iter().map(|(p, _)| entry_name(p)).collect())
-                    .unwrap_or_default()
-            });
-            names.contains(name)
-        })
-        .collect())
+            if !listings.contains_key(dir) {
+                let names = match sftp.readdir(Path::new(dir)) {
+                    Ok(entries) => entries.iter().map(|(p, _)| entry_name(p)).collect(),
+                    Err(e) if is_sftp_not_found(&e) => HashSet::new(),
+                    Err(e) => {
+                        log::warn!("cannot list remote dir {dir} for overwrite check: {e}");
+                        return Err(crate::tr!(
+                            format!("无法列出目录「{dir}」: {e}"),
+                            format!("Cannot list directory \"{dir}\": {e}")
+                        ));
+                    }
+                };
+                listings.insert(dir.to_string(), names);
+            }
+            exists.push(listings[dir].contains(name));
+        }
+        Ok(exists)
+    })
 }
 
 fn trim_trailing_slash(path: &str) -> &str {
@@ -228,6 +249,13 @@ fn read_directory_listing(sftp: &Sftp, dir_path: &str) -> Result<RemoteDirListin
             continue;
         }
         let full_path = join_remote_path(dir_path, &name);
+        // READDIR 给的是链接自身的属性：指向目录的符号链接要再 stat 一次才知道它是目录，
+        // 否则会显示成文件、双击也进不去。链接已失效时保留原属性。
+        let file_stat = if file_stat.file_type().is_symlink() {
+            sftp.stat(Path::new(&full_path)).unwrap_or(file_stat)
+        } else {
+            file_stat
+        };
         entries.push(RemoteDirEntry {
             name,
             path: full_path,
@@ -256,7 +284,7 @@ fn entry_name(path: &Path) -> String {
         .to_string()
 }
 
-fn join_remote_path(base: &str, name: &str) -> String {
+pub(super) fn join_remote_path(base: &str, name: &str) -> String {
     if base.ends_with('/') {
         format!("{base}{name}")
     } else {

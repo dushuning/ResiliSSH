@@ -76,6 +76,7 @@ fn parse_df_available_kb(output: &str) -> Option<u64> {
     fields.get(pct.checked_sub(1)?)?.parse().ok()
 }
 
+/// POSIX shell 单引号转义：单引号内一切按字面量处理，唯一要处理的是单引号本身。
 pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }

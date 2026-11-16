@@ -3,7 +3,8 @@
 //! 命令模板里的变量由这里替换并做 shell 单引号转义：文件名可能含空格、引号或 `;`，
 //! 直接拼接字符串轻则命令出错，重则执行了文件名里夹带的内容。
 
-use super::client::{connect_session, ConnectionConfig};
+use super::client::ConnectionConfig;
+use super::preflight::shell_quote;
 use crate::activity::{self, Category};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -11,9 +12,11 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// 命令长时间没有任何输出才算超时（不是总时长）：重启类命令可能安静地跑几分钟。
-const COMMAND_IDLE_TIMEOUT_MS: u32 = 10 * 60 * 1000;
+const COMMAND_IDLE_TIMEOUT_MINUTES: u64 = 10;
+const COMMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(COMMAND_IDLE_TIMEOUT_MINUTES * 60);
 /// 结果页只展示末尾若干行：出错信息几乎总在最后。
 const OUTPUT_TAIL_LINES: usize = 40;
 /// 写进活动日志的行数上限，防止 `tail -f` 之类的命令把日志刷爆。
@@ -46,11 +49,6 @@ impl CommandOutcome {
     }
 }
 
-/// POSIX shell 单引号转义：单引号内一切按字面量处理，唯一要处理的是单引号本身。
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 /// 只替换已知变量名，模板里其他花括号（如 `${HOME}`、awk 脚本）原样保留。
 pub fn expand_template(template: &str, ctx: &CommandContext) -> String {
     let files = ctx
@@ -59,11 +57,32 @@ pub fn expand_template(template: &str, ctx: &CommandContext) -> String {
         .map(|f| shell_quote(f))
         .collect::<Vec<_>>()
         .join(" ");
-    template
-        .replace("{remote_dir}", &shell_quote(&ctx.remote_dir))
-        .replace("{file_name}", &shell_quote(&ctx.file_name))
-        .replace("{remote_path}", &shell_quote(&ctx.remote_path))
-        .replace("{files}", &files)
+    let variables = [
+        ("{remote_dir}", shell_quote(&ctx.remote_dir)),
+        ("{file_name}", shell_quote(&ctx.file_name)),
+        ("{remote_path}", shell_quote(&ctx.remote_path)),
+        ("{files}", files),
+    ];
+    // 单遍扫描、只替换模板里出现的占位符：连续 replace 会把「已替换进去的值」再扫一遍，
+    // 文件名里若带 `{files}` 之类的字样就会被二次展开、把引号拆开，夹带的内容随之被执行。
+    let mut expanded = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        expanded.push_str(&rest[..start]);
+        rest = &rest[start..];
+        match variables.iter().find(|(name, _)| rest.starts_with(name)) {
+            Some((name, value)) => {
+                expanded.push_str(value);
+                rest = &rest[name.len()..];
+            }
+            None => {
+                expanded.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    expanded.push_str(rest);
+    expanded
 }
 
 /// 用 `sh -c` 包一层并合并 stderr：只读一个流，避免 stdout/stderr 分别阻塞造成死锁，
@@ -83,11 +102,14 @@ pub fn run_remote_command(
     let command = expand_template(template, ctx);
     activity::info(Category::Command, crate::tr!(format!("开始执行：{command}"), format!("Running: {command}")));
 
-    let (session, socket) = connect_session(config).map_err(|e| e.to_string())?;
+    // 传输刚结束时会话还留在池里，直接接着用，命令不必等一次新的握手。
+    let (session, socket) = super::pool::acquire(config).map_err(|e| e.to_string())?;
     if let Ok(mut holder) = abort_socket.lock() {
         *holder = Some(socket);
     }
-    session.set_timeout(COMMAND_IDLE_TIMEOUT_MS);
+    // 等命令输出时连接可能安静很久，需要 keepalive 维持 NAT / 防火墙上的连接；
+    // 它带来的「读取提前超时」由下面的循环自己计时来消化。
+    super::client::enable_keepalive(&session);
 
     let mut channel = session
         .channel_session()
@@ -98,9 +120,12 @@ pub fn run_remote_command(
 
     let mut tail: VecDeque<String> = VecDeque::with_capacity(OUTPUT_TAIL_LINES);
     let mut logged = 0_usize;
-    let mut pending = String::new();
+    // 按字节累积、凑齐一行再解码：一次读取的边界可能落在多字节字符（如中文）中间，
+    // 逐次解码会把这个字符拆成两个乱码。
+    let mut pending: Vec<u8> = Vec::new();
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
     let mut timed_out = false;
+    let mut last_output = Instant::now();
 
     let mut emit = |line: &str, tail: &mut VecDeque<String>, logged: &mut usize| {
         let line = line.trim_end_matches('\r');
@@ -122,10 +147,11 @@ pub fn run_remote_command(
         match channel.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
-                pending.push_str(&String::from_utf8_lossy(&buffer[..n]));
-                while let Some(pos) = pending.find('\n') {
-                    let line: String = pending.drain(..=pos).collect();
-                    emit(line.trim_end_matches('\n'), &mut tail, &mut logged);
+                last_output = Instant::now();
+                pending.extend_from_slice(&buffer[..n]);
+                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=pos).collect();
+                    emit(String::from_utf8_lossy(&line[..pos]).as_ref(), &mut tail, &mut logged);
                 }
             }
             Err(e) => {
@@ -133,6 +159,12 @@ pub fn run_remote_command(
                     break;
                 }
                 if e.kind() == std::io::ErrorKind::TimedOut {
+                    // 会话的单次读取超时远短于这里允许的静默时长（并且 libssh2 在该发 keepalive 的
+                    // 时刻也会让读取以超时返回），所以一次超时只说明「这段时间没输出」：
+                    // 自己计时，静默满 COMMAND_IDLE_TIMEOUT 才放弃，否则安静跑几十秒的重启脚本会被误判。
+                    if last_output.elapsed() < COMMAND_IDLE_TIMEOUT {
+                        continue;
+                    }
                     timed_out = true;
                     break;
                 }
@@ -144,8 +176,7 @@ pub fn run_remote_command(
         }
     }
     if !pending.is_empty() {
-        let rest = std::mem::take(&mut pending);
-        emit(&rest, &mut tail, &mut logged);
+        emit(String::from_utf8_lossy(&pending).as_ref(), &mut tail, &mut logged);
     }
     if logged > MAX_LOGGED_LINES {
         activity::info(
@@ -184,8 +215,8 @@ fn record_outcome(outcome: &CommandOutcome) {
             ));
     } else if outcome.timed_out {
         activity::error(Category::Command, crate::tr!(
-                "命令超过 10 分钟没有任何输出，已停止等待",
-                "Command produced no output for 10 minutes; stopped waiting"
+                format!("命令超过 {COMMAND_IDLE_TIMEOUT_MINUTES} 分钟没有任何输出，已停止等待"),
+                format!("Command produced no output for {COMMAND_IDLE_TIMEOUT_MINUTES} minutes; stopped waiting")
             ));
     } else if outcome.succeeded() {
         activity::success(Category::Command, crate::tr!("命令执行成功（退出码 0）", "Command succeeded (exit code 0)"));
@@ -232,6 +263,19 @@ mod tests {
         let mut c = ctx();
         c.file_name = "x; rm -rf ~".into();
         assert_eq!(expand_template("ls {file_name}", &c), "ls 'x; rm -rf ~'");
+    }
+
+    #[test]
+    fn placeholder_inside_a_value_is_not_expanded_again() {
+        let mut c = ctx();
+        c.file_name = "a;echo PWNED;#.txt".into();
+        c.files = vec![c.file_name.clone(), "{files}".into()];
+        // 文件名里的 `{files}` 必须保持字面量，仍在同一对单引号内。
+        c.remote_path = "/opt/{files}".into();
+        assert_eq!(
+            expand_template("echo {remote_path} {file_name} {files}", &c),
+            "echo '/opt/{files}' 'a;echo PWNED;#.txt' 'a;echo PWNED;#.txt' '{files}'"
+        );
     }
 
     #[test]
