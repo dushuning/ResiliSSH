@@ -8,15 +8,14 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "icon": "tauri icon assets/brand/icon.svg -o src-tauri/icons && cp src-tauri/icons/128x128@2x.png public/app-logo.png",
+    "icon": "tauri icon assets/brand/icon.svg -o src-tauri/icons && rm -rf src-tauri/icons/android src-tauri/icons/ios src-tauri/icons/Square*Logo.png src-tauri/icons/StoreLogo.png && cp src-tauri/icons/128x128@2x.png public/app-logo.png",
     "app:debug": "tauri build --debug",
     "app": "tauri build",
     "check:i18n": "node scripts/check-i18n.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.4.0",
-    "@tauri-apps/plugin-dialog": "^2.2.0",
-    "@tauri-apps/plugin-notification": "^2.3.3"
+    "@tauri-apps/plugin-dialog": "^2.2.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.4.0",

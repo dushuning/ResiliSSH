@@ -1,12 +1,11 @@
 # Dependencies
 node_modules/
 
-# Tooling
-.icon-venv/
-
 # Build
 dist/
 src-tauri/target/
+# 每次构建由 tauri-build 重新生成
+src-tauri/gen/schemas/
 
 # OS
 .DS_Store
