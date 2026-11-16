@@ -344,13 +344,19 @@ input[type="radio"] {
   opacity: 0.45;
 }
 
+/* 主操作用品牌渐变（取自应用图标），是界面里唯一的强调色块：每一页只有一个，一眼就能找到。 */
 .btn-primary {
-  background: var(--accent);
+  background: var(--brand-gradient);
   color: #fff;
+  box-shadow: var(--shadow-primary);
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  filter: brightness(1.08);
+}
+
+.btn-primary:active:not(:disabled) {
+  filter: brightness(0.94);
 }
 
 .btn-secondary {
@@ -378,6 +384,42 @@ input[type="radio"] {
   background: transparent;
   color: var(--accent-text);
   font-size: 12px;
+}
+
+/* 实心红：只用于确认框里不可撤销的主操作。 */
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* 只有图标的方形按钮。 */
+.btn-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: default;
+}
+
+.icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .btn-danger-soft {
@@ -590,23 +632,58 @@ input[type="radio"] {
   text-align: right;
 }
 
+/* 还没选文件时，拖拽区是这一页的视觉焦点：居中、留白充足，一眼看出「把东西放到这里」。 */
 .drop-zone {
-  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 22px 16px 14px;
   border: 1.5px dashed var(--border);
   border-radius: var(--radius-l);
+  background: var(--bg-elevated);
   transition: border-color 0.15s, background 0.15s;
+}
+
+.drop-zone-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.drop-zone-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.drop-zone-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 手动输入路径是次要入口：弱化成一行不抢眼的输入框。 */
+.drop-zone-path {
+  max-width: 420px;
+  margin-top: 4px;
+  border-color: var(--border-subtle);
+  background: transparent;
+  font-size: 12px;
+  text-align: center;
+}
+
+.drop-zone-path:focus {
+  background: var(--bg-input);
+  text-align: left;
 }
 
 .drop-zone.drag-over {
   border-color: var(--accent);
   background: var(--accent-soft);
-}
-
-.drop-hint {
-  margin: 8px 0 0;
-  font-size: 11.5px;
-  color: var(--text-tertiary);
-  text-align: center;
 }
 
 .file-chip {
@@ -871,16 +948,6 @@ input[type="radio"] {
 
 .state-panel.neutral {
   background: var(--bg-elevated);
-}
-
-.command-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
 }
 
 #postCommand {
@@ -1410,7 +1477,7 @@ input[type="radio"] {
 }
 
 .server-item.selected {
-  background: var(--accent);
+  background: var(--brand-gradient);
   color: #fff;
 }
 
@@ -1979,6 +2046,48 @@ input[type="radio"] {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* 确认框：左侧图标按语气着色（提示 / 有代价 / 危险），一眼看出这是哪一类问题。 */
+.modal-confirm {
+  width: min(460px, 100%);
+}
+
+.modal-confirm-head {
+  display: flex;
+  gap: 14px;
+}
+
+.modal-confirm-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.modal-overlay[data-tone="warn"] .modal-icon {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.modal-overlay[data-tone="danger"] .modal-icon {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .modal-browse {

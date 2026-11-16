@@ -1,13 +1,14 @@
 // 单个文件的上传/下载流程：启动、进度事件处理、完成与失败的收尾。
 import { t } from "../i18n";
 import { icons } from "../ui/icons";
+import { downloadDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
 import { clarifyTransferError } from "./backendText";
 import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult, updateSaveCommandButton } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { TRANSFER_LOCK_SELECTORS, UI_STALL_WARN_MS } from "./constants";
-import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, forceOverwriteInput, languageHint, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
-import { formatBytes, formatDuration, prefersReducedMotion } from "./format";
+import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZoneIcon, hostInput, pickFileBtn, forceOverwriteInput, languageHint, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
+import { asDir, fileNameOf, formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
 import { isQueueSelection, updateBookmarkButton, updateResolvedPathHint } from "./paths";
 import { clearLastProbe, clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
@@ -197,17 +198,20 @@ export function updateTransferDirectionUI() {
   remotePathLabel.textContent = download ? t("远端文件") : t("远端路径");
   localPathInput.placeholder = download
     ? t("本地目录（以 / 结尾）或完整文件路径")
-    : t("选择或拖拽文件到此处");
+    : t("或粘贴本地路径");
   remotePathInput.placeholder = download
     ? "/home/user/file.jar"
     : t("/home/user/dir/ 或 /home/user/file.jar");
   pathHint.textContent = download
     ? t("保存路径填目录时自动拼接远端文件名")
     : t("以 / 结尾表示目录，会自动拼接文件名");
-  dropHint.textContent = download
-    ? t("点「选择…」指定保存目录")
-    : t("也可以直接把文件拖到窗口里");
+  dropHint.textContent = download ? t("选择下载后保存到的文件夹") : t("把文件或文件夹拖到这里");
+  // 下载时本地一侧选的是保存目录：图标、按钮文案跟着换，多余的「选择文件夹」收起（同一个按钮已经在选文件夹）。
+  dropZoneIcon.innerHTML = download ? icons.download : icons.upload;
+  pickFileBtn.textContent = download ? t("选择文件夹…") : t("选择文件…");
   pickFolderBtn.classList.toggle("hidden", download);
+  // 「传完后执行」是把文件送到服务器之后的动作，下载用不上。
+  document.querySelector("#commandField")!.classList.toggle("hidden", download);
   forceOverwriteLabel.textContent = t("强制从头覆盖");
   forceOverwriteInput.parentElement!.title = download
     ? t("忽略断点与本地已有文件，从头重新下载")
@@ -217,6 +221,27 @@ export function updateTransferDirectionUI() {
   updateRemoteBrowseModeUi();
   updateResolvedPathHint();
   updateTransferStatePanel();
+  void prefillDownloadDir();
+}
+
+
+/**
+ * 下载时保存位置默认填系统的「下载」文件夹：绝大多数下载就是要放到那里，
+ * 省掉每次都得先选一遍目录这一步；想存到别处照常点「更换」。已经填了路径时不动它。
+ */
+async function prefillDownloadDir() {
+  const applies = () => isDownloadMode() && !localPathInput.value.trim() && !isBusy();
+  if (!applies()) return;
+  try {
+    const dir = await downloadDir();
+    // 取目录是异步的：期间用户可能已经切回上传或自己填了路径。
+    if (!dir || !applies()) return;
+    localPathInput.value = asDir(dir);
+    localPathInput.dispatchEvent(new Event("input"));
+  } catch (error) {
+    // 取不到只是少一个默认值，用户仍可手动选择。
+    console.warn("cannot resolve the Downloads folder", error);
+  }
 }
 
 
@@ -230,7 +255,7 @@ export function isReliableMode(): boolean {
 
 export function updateModeHint() {
   modeHint.textContent = isReliableMode()
-    ? t("每块写完读回比对，略慢但最稳")
+    ? t("每块写完立即校验，最稳")
     : t("只在传完后整体校验，速度更快");
 }
 
@@ -275,7 +300,8 @@ export async function startOneDownload(): Promise<UploadStart> {
     showDownloadProbeResult(probe);
     state.runRemotePath = probe.resolved_remote_path;
     state.runLocalPath = probe.resolved_local_path;
-    state.runPostCommandTemplate = postCommandInput.value.trim();
+    // 传完后命令只用于上传，下载不执行（该字段在下载模式下是隐藏的）。
+    state.runPostCommandTemplate = "";
     return "identical";
   }
   const confirmed = await confirmDownloadAction(probe);
@@ -285,7 +311,7 @@ export async function startOneDownload(): Promise<UploadStart> {
     probe.action === "full_redownload" || forceOverwriteInput.checked;
   state.runRemotePath = probe.resolved_remote_path;
   state.runLocalPath = probe.resolved_local_path;
-  state.runPostCommandTemplate = postCommandInput.value.trim();
+  state.runPostCommandTemplate = "";
 
   setTransferring(true);
   state.retryCount = 0;
@@ -553,7 +579,13 @@ export function handleProgressUpdate(
       state.finishingRun = false;
       if (!state.isTransferring) {
         // 有传完后命令时，这里会同步进入「命令执行中」，下面的解锁判断仍是忙碌。
-        void finishSuccessfulRun(uploading ? t("上传完成") : t("下载完成"), message, stats, [state.runRemotePath]);
+        const title = uploading ? t("上传完成") : t("下载完成");
+        // 副标题写「什么传到了哪里」；后端消息只有带额外信息（如重试次数）时才值得再显示一遍。
+        const route = `${fileNameOf(state.runRemotePath)} → ${
+          uploading ? `${hostInput.value.trim()}:${state.runRemotePath}` : state.runLocalPath
+        }`;
+        const subtitle = message && message !== title ? `${route}\n${message}` : route;
+        void finishSuccessfulRun(title, subtitle, stats, [state.runRemotePath]);
       }
       syncBusyLock();
     }, prefersReducedMotion() ? 0 : COMPLETE_REVEAL_MS);

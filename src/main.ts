@@ -12,7 +12,7 @@ import { appendConsoleLine, commandStorageKey, openCommandMenu, toggleSavedComma
 import { connectionPayload, forgetJumpSecrets, prepareConnection, rememberForSession, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./app/connection";
 import { COPY_FEEDBACK_MS, DEFAULT_SSH_PORT, PAGE_ORDER } from "./app/constants";
 import { closeConfirm, showConfirm } from "./app/dialogs";
-import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, copyReceiptBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, saveReceiptBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
+import { activityLog, appVersion, useServerBtn, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, copyReceiptBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, saveReceiptBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
 import { describeError, fileNameOf, floorPercent, formatBytes } from "./app/format";
 import { clearCheckpointFor, loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
 import { showPage } from "./app/nav";
@@ -22,7 +22,7 @@ import { refreshLiveVisuals, setBadge, setProgressState, setStatus, showReconnec
 import { offerSavedBatchOnLaunch, startQueueFlow } from "./app/queue";
 import { clearSavedBatch } from "./app/savedBatch";
 import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
-import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, setJumpSelection, startNewServer } from "./app/servers";
+import { applyHostSelection, applyProfile, defaultProfileName, restoreLastServer, loadHosts, loadProfiles, setJumpSelection, startNewServer } from "./app/servers";
 import { applyParallelConnections, applyThemePreference, initLanguagePreference, initParallelConnections, initThemePreference } from "./app/settings";
 import { copyReceipt, saveReceipt } from "./app/receipt";
 import { isBusy, state } from "./app/state";
@@ -125,8 +125,11 @@ deleteProfileBtn.addEventListener("click", async () => {
     return;
   }
   const confirmed = await showConfirm(
-    t("删除连接"),
-    t("确定删除这个已保存的连接？"),
+    t("删除服务器"),
+    t("确定删除「{name}」？它的收藏目录和常用命令会一并删除，钥匙串里保存的密码也会清除。", {
+      name: profileNameInput.value.trim(),
+    }),
+    { ok: t("删除"), tone: "danger" },
   );
   if (!confirmed) return;
 
@@ -188,12 +191,12 @@ document.querySelectorAll('input[name="transferMode"]').forEach((input) => {
 });
 
 
-confirmCancel.addEventListener("click", () => closeConfirm(false));
+confirmCancel.addEventListener("click", () => closeConfirm("cancel"));
 
-confirmOk.addEventListener("click", () => closeConfirm(true));
+confirmOk.addEventListener("click", () => closeConfirm("ok"));
 
 confirmOverlay.addEventListener("click", (event) => {
-  if (event.target === confirmOverlay) closeConfirm(false);
+  if (event.target === confirmOverlay) closeConfirm("dismissed");
 });
 
 document.addEventListener("keydown", (event) => {
@@ -202,7 +205,7 @@ document.addEventListener("keydown", (event) => {
     confirmOverlay.classList.contains("is-visible") &&
     !state.confirmClosing
   ) {
-    closeConfirm(false);
+    closeConfirm("dismissed");
     return;
   }
   if (
@@ -218,6 +221,9 @@ browseRemoteBtn.addEventListener("click", () => {
   void openRemoteBrowseDialog();
 });
 
+
+// 页脚的「取消」与右上角的关闭按钮是同一个动作。
+document.querySelector("#remoteBrowseCancelBtn")!.addEventListener("click", () => remoteBrowseCloseBtn.click());
 
 remoteBrowseCloseBtn.addEventListener("click", () => {
   closeRemoteBrowseOverlay();
@@ -287,6 +293,10 @@ remoteBrowseNewDirName.addEventListener("keydown", (event) => {
     void createRemoteBrowseDir();
   }
 });
+
+
+// 服务器配好（或测试通过）之后的下一步就是去传文件：给一个直达的入口，不必再去侧边栏切页。
+useServerBtn.addEventListener("click", () => showPage("transfer"));
 
 
 testConnBtn.addEventListener("click", async () => {
@@ -576,7 +586,8 @@ clearCheckpointBtn.addEventListener("click", () => {
 void listen("transfer-close-requested", async () => {
   const ok = await showConfirm(
     t("传输进行中"),
-    t("关闭窗口将取消当前传输，已传输的部分会保留为断点。\n\n确定关闭吗？"),
+    t("关闭窗口将取消当前传输。已传输的部分会保留为断点，下次打开可以接着传。"),
+    { ok: t("关闭并取消传输"), cancel: t("继续传输"), tone: "danger" },
   );
   if (!ok) return;
 
@@ -600,6 +611,7 @@ async function startupSequence() {
   const settle = (task: Promise<unknown>) => task.catch(() => {});
   await settle(loadProfiles());
   await settle(restoreActiveCheckpoint());
+  await settle(restoreLastServer());
   await settle(syncTransferStateOnStartup());
   await offerResumeOnLaunch();
 }

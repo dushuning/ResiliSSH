@@ -185,6 +185,7 @@ async function ensureHopTrusted(hop: ConnectionPayload, isJumpHost: boolean): Pr
       isJumpHost ? t("首次连接该跳板机") : t("首次连接该服务器"),
       `${hostId}\n${info.key_type}\n${info.fingerprint}\n\n` +
         t("请与服务器管理员核对上面的指纹（服务器上可运行 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub）。确认信任后将记住该服务器。"),
+      { ok: t("信任并连接"), tone: "warn" },
     );
     if (!trusted) throw new Error(t("未信任该服务器，已取消连接"));
     await invoke("trust_host_key", {

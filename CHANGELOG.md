@@ -13,6 +13,9 @@
 - A batch can be continued after quitting the app.
 
 ### Changed
+- Interface refresh: the primary action and the selected server use the gradient of the app icon; the empty drop area is now the focal point of the Transfer page; confirmation dialogs name the action on the button ("Upload and replace", "Delete") with a red button for destructive ones, and the remote browser's primary button is "Choose this folder" instead of "Close".
+- Fewer steps: the last used server is selected on launch; downloads default to the Downloads folder; the Servers page has a "Use for transfer" shortcut; the result page says which file went where; the preflight summary sits below the form instead of pushing it around.
+- "Then run" is only offered for uploads. Dismissing the "continue the batch?" prompt with Esc keeps the batch for next time; only "Discard" drops it.
 - Much less waiting between "Test connection", pressing Start and seeing progress: the app now keeps the SSH connection it just used for up to 45 seconds and hands it to the next step (preflight, remote browser, the transfer itself, the next file of a batch, the post-transfer command) instead of doing a full handshake for each. A batch of many small files runs over one connection.
 - Pressing Start gives immediate feedback ("Connecting to the server…", "Checking the remote file…"); leaving a path field no longer triggers a duplicate preflight.
 - Inputs stay locked for a whole batch and while a post-transfer command runs, and a batch can be cancelled between files.

@@ -67,7 +67,28 @@ export function defaultProfileName(): string {
 }
 
 
+/** 记住上次用的服务器，下次启动直接选中它。 */
+const LAST_SERVER_STORAGE_KEY = "resiliss-last-server";
+
+/**
+ * 启动时选中上次用的服务器（只有一台时就选它）。大多数人反复往同一台服务器传，
+ * 每次打开都要先在下拉里选一遍是多余的一步；而且此时卡片上显示的「未保存的服务器」
+ * 会让人以为之前保存的配置丢了。已经由断点恢复选中了服务器时不覆盖。
+ */
+export async function restoreLastServer() {
+  if (profileSelect.value || state.savedProfiles.length === 0) return;
+  const lastId = localStorage.getItem(LAST_SERVER_STORAGE_KEY);
+  const profile =
+    state.savedProfiles.find((p) => p.id === lastId) ??
+    (state.savedProfiles.length === 1 ? state.savedProfiles[0] : undefined);
+  if (!profile) return;
+  profileSelect.value = profile.id;
+  await applyProfile(profile);
+}
+
+
 export async function applyProfile(profile: ConnectionProfile) {
+  localStorage.setItem(LAST_SERVER_STORAGE_KEY, profile.id);
   hostInput.value = profile.host;
   portInput.value = String(profile.port);
   usernameInput.value = profile.username;
@@ -94,11 +115,11 @@ export async function applyProfile(profile: ConnectionProfile) {
       passwordInput.value = cached.password;
       keyPassphraseInput.value = cached.passphrase;
       updateConnectionSummary();
-      setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "ok");
+      setConnectionStatus("", "ok");
       return;
     }
     // 「不保存密码、需要输入」已由密码框下方的说明讲清楚，这里不再重复一遍。
-    setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "normal");
+    setConnectionStatus("", "normal");
     return;
   }
   // 用户主动选择服务器时才读钥匙串：此时弹出系统授权框是可预期的。
@@ -112,12 +133,12 @@ export async function applyProfile(profile: ConnectionProfile) {
   if (profile.auth_kind === "password") {
     setConnectionStatus(
       secrets.password
-        ? t("已加载「{name}」，密码已自动填入", { name: profile.name })
+        ? ""
         : t("已加载「{name}」，请填写密码后点保存", { name: profile.name }),
       secrets.password ? "ok" : "normal",
     );
   } else {
-    setConnectionStatus(t("已加载「{name}」", { name: profile.name }), "ok");
+    setConnectionStatus("", "ok");
   }
 }
 

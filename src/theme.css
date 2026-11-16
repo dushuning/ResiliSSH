@@ -26,6 +26,9 @@
   --text-secondary: #4a4a4f;
   --text-tertiary: #8a8a8f;
 
+  /* 应用图标的青 → 蓝渐变，两端都压暗到白字可读的程度。 */
+  --brand-gradient: linear-gradient(135deg, #0c8ea6 0%, #0a61d8 100%);
+  --shadow-primary: 0 1px 2px rgba(10, 97, 216, 0.28);
   --accent: #0a6cde;
   --accent-hover: #0b78f0;
   --accent-soft: rgba(10, 108, 222, 0.1);
@@ -81,6 +84,8 @@
   --text-secondary: #c7c7cc;
   --text-tertiary: #8e8e93;
 
+  --brand-gradient: linear-gradient(135deg, #129db3 0%, #2b7cf0 100%);
+  --shadow-primary: 0 1px 2px rgba(0, 0, 0, 0.4);
   --accent: #2f8cff;
   --accent-hover: #4d9dff;
   --accent-soft: rgba(47, 140, 255, 0.16);

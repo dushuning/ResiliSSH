@@ -5,7 +5,7 @@ import { clarifyTransferError } from "./backendText";
 import { showCommandResult, updateSaveCommandButton } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { DEFAULT_SSH_PORT } from "./constants";
-import { showConfirm } from "./dialogs";
+import { showConfirm, showConfirmChoice } from "./dialogs";
 import { forceOverwriteInput, hostInput, localPathInput, portInput, postCommandInput, profileSelect, queueChip, remotePathInput, resultFiles, transferBtn, usernameInput } from "./dom";
 import { asDir, describeError, fileNameOf } from "./format";
 import { showPage } from "./nav";
@@ -40,7 +40,8 @@ export async function startQueueFlow() {
   if (!download) showStartPhase(t("正在检查远端文件…"));
 
   const queueStartedAt = Date.now();
-  const template = postCommandInput.value.trim();
+  // 传完后命令只用于上传（把文件送到服务器之后再做点什么）；下载时该字段是隐藏的，不能悄悄执行。
+  const template = download ? "" : postCommandInput.value.trim();
   const sources = download ? [...state.selectedDownloads] : [...state.selectedUploads];
   const relDirs = new Map(download ? state.downloadRelDirs : state.uploadRelDirs);
   const roots = [...(download ? state.downloadRoots : state.uploadRoots)];
@@ -326,7 +327,7 @@ export async function offerSavedBatchOnLaunch(): Promise<boolean> {
   }
 
   const counts = { remaining, total: batch.completedBefore + batch.files.length };
-  const resume = await showConfirm(
+  const choice = await showConfirmChoice(
     t("有未完成的批量传输"),
     (batch.direction === "download"
       ? t("上次的批量下载还有 {remaining} 个文件未完成（共 {total} 个），继续吗？", counts)
@@ -337,7 +338,9 @@ export async function offerSavedBatchOnLaunch(): Promise<boolean> {
       }),
     { ok: t("继续传输"), cancel: t("放弃") },
   );
-  if (!resume) {
+  // 没作答就关掉（Esc / 点遮罩）不等于放弃：保留记录，下次启动再问。只有明确点了「放弃」才丢掉。
+  if (choice === "dismissed") return true;
+  if (choice === "cancel") {
     console.info("saved batch discarded by user", { direction: batch.direction, remaining });
     clearSavedBatch();
     return true;

@@ -257,6 +257,7 @@ export async function clearCheckpointFor(direction: TransferDirection) {
     download
       ? t("确定清除下载断点？\n\n下次下载将从头开始，已下载的部分（临时文件）会一并删除；本地原有的同名文件不受影响。")
       : t("确定清除上传断点？\n\n下次上传将从头开始，服务器上已传的部分（临时文件）会一并删除；远端原有的同名文件不受影响。"),
+    { ok: t("清除断点"), tone: "danger" },
   );
   if (!confirmed) return;
 

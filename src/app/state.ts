@@ -74,7 +74,7 @@ export const state = {
   inflightProbe: null as { key: string; promise: Promise<RemoteUploadProbe | RemoteDownloadProbe> } | null,
   /** lastProbe 对应的预检目标；表单没变时失焦不必重新预检。lastProbe 清空时一并清空。 */
   lastProbeKey: null as string | null,
-  confirmResolver: null as ((value: boolean) => void) | null,
+  confirmResolver: null as ((value: "ok" | "cancel" | "dismissed") => void) | null,
   confirmClosing: false,
   /** 确认框关闭动画期间待完成的收尾；期间又弹出新确认框时要提前执行，不能让定时器作用到新框上。 */
   confirmPendingClose: null as { timer: number; settle: () => void } | null,

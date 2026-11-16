@@ -77,15 +77,6 @@ export function appTemplate(appName: string): string {
               <div class="onboarding-actions" id="onboardingActions"></div>
             </div>
 
-            <div id="transferStatePanel" class="state-panel hidden">
-              <div class="state-panel-main">
-                <div class="state-panel-title" id="statePanelTitle"></div>
-                <div class="state-panel-detail" id="statePanelDetail"></div>
-                <div class="state-panel-hint" id="statePanelHint"></div>
-              </div>
-              <button class="btn btn-link hidden" id="clearCheckpointBtn" type="button">${t("清除断点")}</button>
-            </div>
-
             <div class="field" id="localField">
               <div class="field-label"><label for="localPath" id="localPathLabel">${t("本地文件")}</label></div>
               <div id="fileChip" class="file-chip hidden">
@@ -97,12 +88,13 @@ export function appTemplate(appName: string): string {
                 <button class="btn btn-secondary btn-small" id="changeFileBtn" type="button">${t("更换")}</button>
               </div>
               <div class="drop-zone" id="dropZone">
-                <div class="input-row">
-                  <input id="localPath" placeholder="${t("选择或拖拽文件到此处")}" spellcheck="false" />
-                  <button class="btn btn-secondary" id="pickFileBtn" type="button">${t("选择…")}</button>
-                  <button class="btn btn-secondary" id="pickFolderBtn" type="button">${t("文件夹…")}</button>
+                <span class="drop-zone-icon" id="dropZoneIcon" aria-hidden="true">${icons.upload}</span>
+                <p class="drop-zone-title" id="dropHint">${t("把文件或文件夹拖到这里")}</p>
+                <div class="drop-zone-actions">
+                  <button class="btn btn-secondary" id="pickFileBtn" type="button">${t("选择文件…")}</button>
+                  <button class="btn btn-secondary" id="pickFolderBtn" type="button">${t("选择文件夹…")}</button>
                 </div>
-                <p class="drop-hint" id="dropHint">${t("也可以直接把文件拖到窗口里")}</p>
+                <input class="drop-zone-path" id="localPath" placeholder="${t("或粘贴本地路径")}" spellcheck="false" />
               </div>
             </div>
 
@@ -137,16 +129,31 @@ export function appTemplate(appName: string): string {
               </label>
             </div>
 
-            <div class="path-field" id="commandField">
-              <div class="input-row">
-                <label class="command-label" for="postCommand">${icons.terminal}${t("传完后执行")}</label>
-                <div class="path-input-wrap">
-                  <input id="postCommand" placeholder="${t("可选，如 sudo systemctl restart app")}" spellcheck="false" autocomplete="off" />
-                  <button class="path-star" id="saveCommandBtn" type="button" title="${t("保存为常用命令")}">${icons.star}</button>
-                </div>
-                <button class="btn btn-secondary" id="commandMenuBtn" type="button" aria-haspopup="menu">${t("常用")}${icons.chevronDown}</button>
+            <div class="field" id="commandField">
+              <div class="field-label">
+                <label for="postCommand">${t("传完后执行")}</label>
+                <span class="field-hint">${t("可选 · 校验通过后在服务器上运行")}</span>
               </div>
-              <div class="popover popover-up hidden" id="commandMenu" role="menu" aria-label="${t("常用命令")}"></div>
+              <div class="path-field">
+                <div class="input-row">
+                  <div class="path-input-wrap">
+                    <input id="postCommand" placeholder="sudo systemctl restart app" spellcheck="false" autocomplete="off" />
+                    <button class="path-star" id="saveCommandBtn" type="button" title="${t("保存为常用命令")}">${icons.star}</button>
+                  </div>
+                  <button class="btn btn-secondary" id="commandMenuBtn" type="button" aria-haspopup="menu">${t("常用")}${icons.chevronDown}</button>
+                </div>
+                <div class="popover popover-up hidden" id="commandMenu" role="menu" aria-label="${t("常用命令")}"></div>
+              </div>
+            </div>
+
+            <!-- 预检结论 / 断点状态放在表单之后：它时有时无，放在中间会让下面的字段上下跳。 -->
+            <div id="transferStatePanel" class="state-panel hidden">
+              <div class="state-panel-main">
+                <div class="state-panel-title" id="statePanelTitle"></div>
+                <div class="state-panel-detail" id="statePanelDetail"></div>
+                <div class="state-panel-hint" id="statePanelHint"></div>
+              </div>
+              <button class="btn btn-link hidden" id="clearCheckpointBtn" type="button">${t("清除断点")}</button>
             </div>
           </div>
 
@@ -285,6 +292,7 @@ export function appTemplate(appName: string): string {
             <div class="editor-actions">
               <button class="btn btn-danger-text" id="deleteProfileBtn" type="button">${t("删除")}</button>
               <span class="editor-actions-fill"></span>
+              <button class="btn btn-plain" id="useServerBtn" type="button">${t("用它传输")}${icons.chevronRight}</button>
               <button class="btn btn-secondary" id="testConnBtn" type="button">${t("测试连接")}</button>
               <button class="btn btn-primary" id="saveProfileBtn" type="button">${t("保存")}</button>
             </div>
@@ -389,9 +397,14 @@ export function appTemplate(appName: string): string {
   </div>
 
   <div id="confirmOverlay" class="modal-overlay hidden">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
-      <div class="modal-title" id="confirmTitle">${t("确认")}</div>
-      <div class="modal-body" id="confirmBody"></div>
+    <div class="modal modal-confirm" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
+      <div class="modal-confirm-head">
+        <div class="modal-icon" id="confirmIcon" aria-hidden="true"></div>
+        <div class="modal-confirm-text">
+          <div class="modal-title" id="confirmTitle">${t("确认")}</div>
+          <div class="modal-body" id="confirmBody"></div>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn btn-secondary" id="confirmCancel" type="button">${t("取消")}</button>
         <button class="btn btn-primary" id="confirmOk" type="button">${t("确定")}</button>
@@ -401,10 +414,14 @@ export function appTemplate(appName: string): string {
 
   <div id="remoteBrowseOverlay" class="modal-overlay hidden">
     <div class="modal modal-browse" role="dialog" aria-modal="true" aria-labelledby="remoteBrowseTitle">
-      <div class="modal-title" id="remoteBrowseTitle">${t("浏览远端目录")}</div>
+      <div class="modal-head">
+        <div class="modal-title" id="remoteBrowseTitle">${t("浏览远端目录")}</div>
+        <button class="icon-btn" id="remoteBrowseCloseBtn" type="button" title="${t("关闭")}" aria-label="${t("关闭")}">${icons.close}</button>
+      </div>
       <div class="input-row">
+        <button class="btn btn-secondary btn-icon" id="remoteBrowseUpBtn" type="button" title="${t("上级目录")}" aria-label="${t("上级目录")}">${icons.arrowUp}</button>
         <input id="remoteBrowsePath" type="text" spellcheck="false" />
-        <button class="btn btn-secondary btn-small" id="remoteBrowseGoBtn" type="button">${t("前往")}</button>
+        <button class="btn btn-secondary" id="remoteBrowseGoBtn" type="button">${t("前往")}</button>
       </div>
       <div class="remote-browse-status" id="remoteBrowseStatus"></div>
       <div class="remote-browse-hint-row">
@@ -421,11 +438,10 @@ export function appTemplate(appName: string): string {
         <button class="btn btn-plain btn-small" id="remoteBrowseCancelNewDirBtn" type="button">${t("取消")}</button>
       </div>
       <div class="modal-actions">
-        <button class="btn btn-secondary" id="remoteBrowseUpBtn" type="button">${t("上级目录")}</button>
-        <button class="btn btn-secondary" id="remoteBrowseNewDirBtn" type="button">${t("新建目录")}</button>
+        <button class="btn btn-secondary" id="remoteBrowseNewDirBtn" type="button">${icons.plus}${t("新建目录")}</button>
         <span class="editor-actions-fill"></span>
-        <button class="btn btn-secondary" id="remoteBrowseSelectDirBtn" type="button">${t("选择此目录")}</button>
-        <button class="btn btn-primary" id="remoteBrowseCloseBtn" type="button">${t("关闭")}</button>
+        <button class="btn btn-secondary" id="remoteBrowseCancelBtn" type="button">${t("取消")}</button>
+        <button class="btn btn-primary" id="remoteBrowseSelectDirBtn" type="button">${t("选择此目录")}</button>
       </div>
     </div>
   </div>

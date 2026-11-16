@@ -81,6 +81,9 @@ export const fileChipPath = document.querySelector<HTMLDivElement>("#fileChipPat
 export const changeFileBtn = document.querySelector<HTMLButtonElement>("#changeFileBtn")!;
 
 export const dropHint = document.querySelector<HTMLParagraphElement>("#dropHint")!;
+export const dropZoneIcon = document.querySelector<HTMLSpanElement>("#dropZoneIcon")!;
+export const pickFileBtn = document.querySelector<HTMLButtonElement>("#pickFileBtn")!;
+export const useServerBtn = document.querySelector<HTMLButtonElement>("#useServerBtn")!;
 
 export const pathHint = document.querySelector<HTMLParagraphElement>("#pathHint")!;
 
@@ -232,6 +235,7 @@ export const confirmBody = document.querySelector<HTMLDivElement>("#confirmBody"
 
 export const confirmCancel = document.querySelector<HTMLButtonElement>("#confirmCancel")!;
 
+export const confirmIcon = document.querySelector<HTMLDivElement>("#confirmIcon")!;
 export const confirmOk = document.querySelector<HTMLButtonElement>("#confirmOk")!;
 
 export const remoteBrowseOverlay = document.querySelector<HTMLDivElement>("#remoteBrowseOverlay")!;

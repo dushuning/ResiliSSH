@@ -282,6 +282,7 @@ export async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise
     return showConfirm(
       t("强制覆盖下载"),
       t("将从头重新下载，本地原文件在新文件校验通过后才会被替换。是否继续？"),
+      { ok: t("从头下载"), tone: "warn" },
     );
   }
 
@@ -289,6 +290,7 @@ export async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise
     return showConfirm(
       t("需要从头重下"),
       t("{message}\n\n将从头重新下载，是否继续？", { message: probe.message }),
+      { ok: t("从头下载"), tone: "warn" },
     );
   }
 
@@ -296,6 +298,7 @@ export async function confirmDownloadAction(probe: RemoteDownloadProbe): Promise
     return showConfirm(
       t("替换本地文件"),
       t("{message}\n\n本地已有同名文件，是否下载并替换它？", { message: probe.message }),
+      { ok: t("下载并替换"), tone: "warn" },
     );
   }
 
@@ -359,6 +362,7 @@ export async function confirmUploadAction(probe: RemoteUploadProbe): Promise<boo
     return showConfirm(
       t("强制覆盖上传"),
       t("将从头重新上传，远端原文件在新文件校验通过后才会被替换。是否继续？"),
+      { ok: t("从头上传"), tone: "warn" },
     );
   }
 
@@ -366,6 +370,7 @@ export async function confirmUploadAction(probe: RemoteUploadProbe): Promise<boo
     return showConfirm(
       t("需要从头重传"),
       t("{message}\n\n将从头重新上传，是否继续？", { message: probe.message }),
+      { ok: t("从头上传"), tone: "warn" },
     );
   }
 
@@ -373,6 +378,7 @@ export async function confirmUploadAction(probe: RemoteUploadProbe): Promise<boo
     return showConfirm(
       t("替换远端文件"),
       t("{message}\n\n远端已有同名文件，是否上传并替换它？", { message: probe.message }),
+      { ok: t("上传并替换"), tone: "warn" },
     );
   }
 
