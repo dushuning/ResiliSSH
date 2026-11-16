@@ -6,10 +6,6 @@ export function fileNameOf(path: string): string {
 }
 
 
-/**
- * 多文件上传：逐个走单文件流程。某个文件失败不影响后面的文件；用户取消则整个队列停止。
- * 传完后命令只在队列结束后执行一次——部署场景下应当全部传完再重启服务。
- */
 /** 目录路径统一以 / 结尾，拼子目录时不必再判断。 */
 export function asDir(path: string): string {
   const trimmed = path.trim();
@@ -18,7 +14,8 @@ export function asDir(path: string): string {
 
 
 export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
+  // 速度是除出来的小数，不取整会显示成 166.66666666666666 B/s。
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
@@ -59,10 +56,37 @@ export function formatEtaSeconds(seconds: number): string {
 }
 
 
+const PERCENT_MAX = 100;
+
+/**
+ * 整数百分比，全应用统一向下取整：四舍五入会让 99.5% 显示成「100%」，而此时传输还没结束。
+ * total 为 0（空文件）时返回 0，调用方不必各自防除零。
+ */
+export function floorPercent(done: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(PERCENT_MAX, Math.floor((done / total) * PERCENT_MAX)));
+}
+
+
 export function formatProgressPercent(transferred: number, total: number): string {
   if (total <= 0) return "";
-  const pct = Math.min(100, Math.round((transferred / total) * 100));
-  return `${pct}%`;
+  return `${floorPercent(transferred, total)}%`;
+}
+
+
+/**
+ * 断点里记录的路径与表单里填的路径是否指向同一个目标，与后端 path_matches_checkpoint 的规则一致：
+ * 完全相同，或表单填的是「直接包含」断点文件的那个目录。不能放宽成任意上级目录：
+ * 先传到 /data/sub/ 中断、再改传 /data/ 是另一个目标，后端会从头传，界面不能说「将续传」。
+ */
+export function pathCompatible(checkpointPath: string, formPath: string): boolean {
+  const cp = checkpointPath.trim();
+  const form = formPath.trim();
+  // 表单还没填时不算匹配：否则空字符串会成为任何路径的「上级目录」。
+  if (!form) return false;
+  if (cp === form) return true;
+  const base = form.replace(/\/+$/, "");
+  return cp === base || cp === `${base}/${fileNameOf(cp)}`;
 }
 
 

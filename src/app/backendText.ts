@@ -7,12 +7,17 @@ import { authTypeSelect, passwordInput, remotePathInput } from "./dom";
  * 仍是旧语言，所以两种都要认。与 src-tauri 中对应文案保持一致，修改时两边同步。
  */
 export const BACKEND_TEXT = {
-  uploadRunning: ["已有上传任务在进行中", "An upload is already in progress"],
-  downloadRunning: ["已有下载任务在进行中", "A download is already in progress"],
   remotePath: ["远端路径错误", "远端路径「", "Remote path error", 'Remote path "'],
   passwordMissing: ["请填写密码", "Please enter a password"],
   authFailed: ["认证失败", "服务器拒绝了提供的凭据", "Authentication failed", "The server rejected the credentials"],
   sftpError: ["SFTP 错误", "SFTP error"],
+  localIo: ["本地文件读取失败", "本地文件写入失败", "Failed to read local file", "Failed to write local file"],
+  sourceChanged: [
+    "本地文件在上传过程中被修改",
+    "远端文件已被修改",
+    "The local file was modified during the upload",
+    "The remote file was modified",
+  ],
 } as const;
 
 
@@ -23,6 +28,11 @@ export function matchesBackend(message: string, fragments: readonly string[]): b
 
 export function clarifyTransferError(message: string): string {
   if (matchesBackend(message, BACKEND_TEXT.remotePath)) {
+    return message;
+  }
+  // 源文件在传输途中变了：后端的说明已经写清原因和下一步，原样显示。放在前面是为了不让它
+  // 被后面的规则改写——比如远端文件被修改的错误若带上 SFTP 字样，会被说成「远端路径错误」。
+  if (matchesBackend(message, BACKEND_TEXT.sourceChanged)) {
     return message;
   }
   if (matchesBackend(message, BACKEND_TEXT.passwordMissing)) {
@@ -37,6 +47,10 @@ export function clarifyTransferError(message: string): string {
   }
   if (matchesBackend(message, BACKEND_TEXT.authFailed)) {
     return t("SSH 认证失败，密码或私钥可能不正确。\n{message}", { message });
+  }
+  // 本地读写错误里也会出现系统的 "No such file or directory"，不能被下面改写成「远端路径错误」。
+  if (matchesBackend(message, BACKEND_TEXT.localIo)) {
+    return message;
   }
   const remote = remotePathInput.value.trim();
   if (/no such file|sftp\(2\)/i.test(message) && remote) {

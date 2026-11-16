@@ -1,4 +1,8 @@
 // 前后端共享的数据结构（与 Rust 端 serde 结构对应）及界面内部类型。
+import type { ByteRange } from "../ui/blockMap";
+
+export type { ByteRange };
+
 export interface SshHostEntry {
   alias: string;
   hostname: string | null;
@@ -96,11 +100,16 @@ export interface UploadCheckpoint {
   auth_kind: "password" | "private_key";
   key_path: string | null;
   file_size: number;
+  /** 已上传的字节总数。并行传输时已完成的部分不一定连续，所以它是数量，不是续传偏移。 */
   uploaded_bytes: number;
   verified_bytes?: number;
   retry_count?: number;
   failure_reason?: string | null;
   status: "in_progress" | "failed" | "completed";
+  /** 已完成的字节区间；旧版断点为空，此时进度是开头连续的 verified_bytes 字节。 */
+  done_ranges?: ByteRange[];
+  /** 目标端现有的每一块是否都做过读回比对；为 false 时结束前必须整体校验。 */
+  all_chunks_verified?: boolean;
 }
 
 
@@ -123,12 +132,15 @@ export interface RemoteUploadProbe {
 
 
 export interface UploadProgressEvent {
+  /** 已传字节总数（已完成的区间 + 正在传的块里已传的部分）：用于百分比、速度和剩余时间，不是文件偏移。 */
   uploaded_bytes: number;
   total_bytes: number;
   status: string;
   message: string;
   retry_count: number;
   verify_summary?: string | null;
+  /** 已完成的字节区间，供分块地图画出不连续的进度；与进度无关的事件（取消、等待、完成等）不带。 */
+  done_ranges?: ByteRange[];
 }
 
 
@@ -148,11 +160,15 @@ export interface DownloadCheckpoint {
   auth_kind: "password" | "private_key";
   key_path: string | null;
   file_size: number;
+  /** 已下载的字节总数，含义与 UploadCheckpoint.uploaded_bytes 相同：是数量，不是偏移。 */
   downloaded_bytes: number;
   verified_bytes?: number;
   retry_count?: number;
   failure_reason?: string | null;
   status: "in_progress" | "failed" | "completed";
+  /** 已完成的字节区间；旧版断点为空，此时进度是开头连续的 verified_bytes 字节。 */
+  done_ranges?: ByteRange[];
+  all_chunks_verified?: boolean;
 }
 
 
@@ -176,12 +192,14 @@ export interface RemoteDownloadProbe {
 
 
 export interface DownloadProgressEvent {
+  /** 含义与 UploadProgressEvent.uploaded_bytes 相同。 */
   downloaded_bytes: number;
   total_bytes: number;
   status: string;
   message: string;
   retry_count: number;
   verify_summary?: string | null;
+  done_ranges?: ByteRange[];
 }
 
 
@@ -245,7 +263,7 @@ export interface ExpandedPaths {
 }
 
 
-export type QueueItemStatus = "pending" | "running" | "done" | "failed" | "skipped" | "cancelled";
+export type QueueItemStatus = "pending" | "running" | "done" | "failed" | "cancelled";
 
 
 /**
@@ -284,7 +302,9 @@ export interface ConnectionReadiness {
 
 
 /**
- * 预检、确认、启动一个上传。返回 false 表示用户在确认框里放弃了这个文件。
+ * 预检、确认、启动一个文件（startOneUpload / startOneDownload）的结果。
+ * started：后端已开始传输；identical：两端已完全一致，无需传输；
+ * declined：没有启动——单文件时是用户在确认框里放弃，批量时是用户在预检期间取消了整个批量。
  * 单文件与队列共用：队列只是对每个文件依次调用它，续传、校验等行为完全一致。
  */
 export type UploadStart = "started" | "declined" | "identical";

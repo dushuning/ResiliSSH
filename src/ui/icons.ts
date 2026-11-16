@@ -20,7 +20,6 @@ export const icons = {
   starFilled:
     '<svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9Z"/></svg>',
   chevronDown: svg('<path d="m6 9 6 6 6-6"/>', 14),
-  close: svg('<path d="M6 6l12 12M18 6 6 18"/>', 12),
   terminal: svg('<path d="m4 7 5 5-5 5"/><path d="M12 19h8"/>', 16),
   upload: svg('<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'),
   download: svg('<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>'),

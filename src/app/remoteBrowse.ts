@@ -9,7 +9,7 @@ import { describeError, formatBytes } from "./format";
 import { expandRemotePaths, reportExpansionWarnings, setSelectedDownloads, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
 import { setStatus } from "./progress";
-import { state } from "./state";
+import { isBusy, state } from "./state";
 import { isDownloadMode } from "./transfer";
 import { RemoteDirEntry, RemoteDirListing } from "./types";
 
@@ -36,7 +36,13 @@ export function openRemoteBrowseOverlay() {
 
 export function closeRemoteBrowseOverlay() {
   remoteBrowseOverlay.classList.remove("is-visible");
+  // 作废在途的列目录请求：对话框关了之后才返回的结果不能再写进列表。
+  // 被作废的请求不会自己恢复按钮（见 loadRemoteBrowseDir），所以在这里恢复。
+  const generation = ++state.remoteBrowseGeneration;
+  endRemoteBrowseLoading();
   window.setTimeout(() => {
+    // 关闭动画期间又被打开（代次已变）：不能把新打开的对话框藏掉、清空。
+    if (generation !== state.remoteBrowseGeneration) return;
     remoteBrowseOverlay.classList.add("hidden");
     remoteBrowseList.replaceChildren();
     remoteBrowseStatus.textContent = "";
@@ -250,6 +256,8 @@ export async function createRemoteBrowseDir() {
 
   remoteBrowseCreateDirBtn.disabled = true;
   setRemoteBrowseStatus(t("正在创建…"));
+  // 不递增代次：创建目录不作废别的请求，只是自己的结果在对话框已关闭或已切换目录后不再写回。
+  const generation = state.remoteBrowseGeneration;
 
   try {
     await prepareConnection();
@@ -260,10 +268,12 @@ export async function createRemoteBrowseDir() {
         dir_name: dirName,
       },
     });
+    if (generation !== state.remoteBrowseGeneration) return;
     hideRemoteBrowseNewDirForm();
     renderRemoteBrowseListing(listing);
     setRemoteBrowseStatus(t("已创建「{dirName}」", { dirName }));
   } catch (error) {
+    if (generation !== state.remoteBrowseGeneration) return;
     setRemoteBrowseStatus(describeError(error), "error");
   } finally {
     remoteBrowseCreateDirBtn.disabled = false;
@@ -271,9 +281,22 @@ export async function createRemoteBrowseDir() {
 }
 
 
+/** 列目录请求结束（或被作废）后恢复加载期间禁用的按钮。 */
+function endRemoteBrowseLoading() {
+  browseRemoteBtn.disabled = isBusy();
+  remoteBrowseGoBtn.disabled = false;
+  remoteBrowseUpBtn.disabled = !state.remoteBrowseCurrent?.parent;
+}
+
+
+/**
+ * 列出远端目录。每次请求占一个代次，只有最新的请求可以写回界面：
+ * 弱网下一次列目录要几秒，期间用户可能已关掉对话框或点进了别的目录，
+ * 迟到的旧结果如果照常渲染，列表就会跳回用户已经离开的目录。
+ */
 export async function loadRemoteBrowseDir(path?: string) {
-  if (state.remoteBrowseLoading) return;
-  state.remoteBrowseLoading = true;
+  const generation = ++state.remoteBrowseGeneration;
+  const isCurrent = () => generation === state.remoteBrowseGeneration;
   browseRemoteBtn.disabled = true;
   remoteBrowseGoBtn.disabled = true;
   remoteBrowseUpBtn.disabled = true;
@@ -287,17 +310,14 @@ export async function loadRemoteBrowseDir(path?: string) {
         path: path?.trim() || remoteBrowsePath.value.trim() || null,
       },
     });
+    if (!isCurrent()) return;
     renderRemoteBrowseListing(listing);
     updateRemoteBrowseCount(listing);
   } catch (error) {
-    setRemoteBrowseStatus(describeError(error), "error");
+    if (isCurrent()) setRemoteBrowseStatus(describeError(error), "error");
   } finally {
-    state.remoteBrowseLoading = false;
-    browseRemoteBtn.disabled = state.isTransferring;
-    remoteBrowseGoBtn.disabled = false;
-    if (state.remoteBrowseCurrent?.parent) {
-      remoteBrowseUpBtn.disabled = false;
-    }
+    // 已被更新的请求或关闭动作取代时，按钮状态归对方管。
+    if (isCurrent()) endRemoteBrowseLoading();
   }
 }
 
@@ -317,7 +337,7 @@ export function applyRemoteBrowseSelection(path: string, isDir: boolean) {
 
 
 export async function openRemoteBrowseDialog() {
-  if (state.isTransferring) return;
+  if (isBusy()) return;
 
   try {
     await ensureCredentialsLoaded();

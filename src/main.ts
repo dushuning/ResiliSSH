@@ -10,22 +10,23 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { clarifyTransferError } from "./app/backendText";
 import { appendConsoleLine, commandStorageKey, openCommandMenu, toggleSavedCommand, updateSaveCommandButton } from "./app/command";
 import { connectionPayload, forgetJumpSecrets, prepareConnection, rememberForSession, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./app/connection";
-import { PAGE_ORDER } from "./app/constants";
+import { COPY_FEEDBACK_MS, DEFAULT_SSH_PORT, PAGE_ORDER } from "./app/constants";
 import { closeConfirm, showConfirm } from "./app/dialogs";
 import { activityLog, appVersion, authTypeSelect, blockMap, bookmarkBtn, browseRemoteBtn, cancelBtn, changeFileBtn, clearCheckpointBtn, commandMenu, commandMenuBtn, confirmCancel, confirmOk, confirmOverlay, copyLogBtn, copyReceiptBtn, deleteProfileBtn, editServerBtn, forceOverwriteInput, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, languageHint, localPathInput, miniTransfer, newServerBtn, passwordInput, pathMenu, pathMenuBtn, pickFolderBtn, portInput, postCommandInput, profileNameInput, profileSelect, rememberSecretsInput, remoteBrowseCancelNewDirBtn, remoteBrowseCloseBtn, remoteBrowseCreateDirBtn, remoteBrowseGoBtn, remoteBrowseList, remoteBrowseNewDirBtn, remoteBrowseNewDirName, remoteBrowseOverlay, remoteBrowsePath, remoteBrowseSelectDirBtn, remoteBrowseUpBtn, remotePathInput, resultBackBtn, resultCard, saveCommandBtn, saveProfileBtn, saveReceiptBtn, statusText, testConnBtn, transferBtn, usernameInput, viewLogBtn } from "./app/dom";
-import { describeError, fileNameOf, formatBytes } from "./app/format";
-import { clearCheckpointFor, loadHistory, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
+import { describeError, fileNameOf, floorPercent, formatBytes } from "./app/format";
+import { clearCheckpointFor, loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint, resumePendingTransfer } from "./app/history";
 import { showPage } from "./app/nav";
 import { isQueueSelection, openPathMenu, pickLocalFolders, pickLocalPaths, setupDragDrop, toggleBookmark, updateDropZoneState, updateResolvedPathHint } from "./app/paths";
-import { clearProbeResult, invalidateProbeOnEdit, runBackgroundProbe, updateTransferStatePanel } from "./app/probe";
+import { clearLastProbe, clearProbeResult, invalidateProbeOnEdit, runBackgroundProbe, updateTransferStatePanel } from "./app/probe";
 import { refreshLiveVisuals, setBadge, setProgressState, setStatus, showReconnectingSpeedText, showTransferStatus, syncMapLegend, updateProgressDetail } from "./app/progress";
-import { startQueueFlow } from "./app/queue";
+import { offerSavedBatchOnLaunch, startQueueFlow } from "./app/queue";
+import { clearSavedBatch } from "./app/savedBatch";
 import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
 import { applyHostSelection, applyProfile, defaultProfileName, loadHosts, loadProfiles, setJumpSelection, startNewServer } from "./app/servers";
-import { applyThemePreference, initLanguagePreference, initThemePreference } from "./app/settings";
+import { applyParallelConnections, applyThemePreference, initLanguagePreference, initParallelConnections, initThemePreference } from "./app/settings";
 import { copyReceipt, saveReceipt } from "./app/receipt";
-import { state } from "./app/state";
-import { getTransferredBytes, handleProgressUpdate, isDownloadMode, setTransferring, showTransferView, startDownloadFlow, startUploadFlow, updateModeHint, updateTransferDirectionUI } from "./app/transfer";
+import { isBusy, state } from "./app/state";
+import { clearStartPhase, getTransferredBytes, handleProgressUpdate, isDownloadMode, setTransferring, showStartPhase, showTransferView, startDownloadFlow, startUploadFlow, syncBusyLock, updateModeHint, updateTransferButtonLabel, updateTransferDirectionUI } from "./app/transfer";
 import { ConnectionProfile, DownloadCheckpoint, DownloadProgressEvent, DownloadRetryEvent, PageId, ThemePreference, TransferDirection, UploadCheckpoint, UploadProgressEvent, UploadRetryEvent } from "./app/types";
 
 // 先告诉后端界面语言：之后后端生成的错误信息、活动日志都按这个语言输出。
@@ -81,9 +82,12 @@ saveProfileBtn.addEventListener("click", async () => {
   try {
     const saved = await invoke<ConnectionProfile>("save_connection_profile", {
       request: {
+        // 带上正在编辑的服务器 id：后端据此更新这一台（改名也保留收藏和常用命令）；
+        // 为 null 表示新建，重名时后端会报错而不是悄悄覆盖同名的另一台。
+        id: profileSelect.value || null,
         name,
         host: hostInput.value.trim(),
-        port: Number(portInput.value) || 22,
+        port: Number(portInput.value) || DEFAULT_SSH_PORT,
         username: usernameInput.value.trim(),
         auth_type: authTypeSelect.value,
         key_path: keyPathInput.value.trim() || null,
@@ -146,6 +150,8 @@ hostSelect.addEventListener("change", () => {
 [hostInput, usernameInput, portInput].forEach((input) => {
   input.addEventListener("input", () => {
     updateConnectionSummary();
+    // 预检结论和断点是否匹配都取决于服务器地址，改了就要重新判断。
+    clearLastProbe();
     if (!profileNameInput.value.trim()) {
       profileNameInput.placeholder = defaultProfileName() || t("保存名称，如 myserver 或 user@host");
     }
@@ -170,7 +176,9 @@ document.querySelectorAll('input[name="transferDirection"]').forEach((input) => 
     state.transferDirection = (selected?.value as TransferDirection) ?? "upload";
     updateTransferDirectionUI();
     clearProbeResult();
-    void restoreActiveCheckpoint();
+    // 只刷新断点状态，不回填表单：切方向时用断点里的服务器和路径覆盖用户正在填的内容，
+    // 是把「看一眼另一个方向」变成了「丢掉当前输入」。回填只在启动时和点「继续」时做。
+    void refreshCheckpointFromDisk().catch((error) => console.warn("failed to refresh checkpoint", error));
   });
 });
 
@@ -293,7 +301,7 @@ testConnBtn.addEventListener("click", async () => {
   } catch (error) {
     setConnectionStatus(clarifyTransferError(describeError(error)), "error");
   } finally {
-    if (!state.isTransferring) testConnBtn.disabled = false;
+    if (!isBusy()) testConnBtn.disabled = false;
   }
 });
 
@@ -302,6 +310,8 @@ document.querySelector("#pickKeyBtn")!.addEventListener("click", async () => {
   const selected = await open({ multiple: false });
   if (typeof selected === "string") {
     keyPathInput.value = selected;
+    // 直接赋值不会触发 input 事件，手动派发一次，让连接摘要和本次会话记住的凭据跟着更新。
+    keyPathInput.dispatchEvent(new Event("input"));
   }
 });
 
@@ -321,8 +331,9 @@ forceOverwriteInput.addEventListener("change", () => {
 document.querySelectorAll<HTMLInputElement>('input[name="languageMode"]').forEach((radio) => {
   radio.addEventListener("change", () => {
     if (!radio.checked) return;
-    // 切换语言会重新加载页面；传输虽在后端继续，但进行中视图会丢失本次的续传起点等信息。
-    if (state.isTransferring || state.commandRunning) {
+    // 切换语言会重新加载页面；传输虽在后端继续，但进行中视图会丢失本次的续传起点等信息，
+    // 批量还会丢掉尚未开始的文件。提示在忙碌结束时由 syncBusyLock 清除。
+    if (isBusy()) {
       initLanguagePreference();
       languageHint.textContent = t("传输进行中，完成后再切换语言");
       return;
@@ -340,6 +351,13 @@ document.querySelectorAll<HTMLInputElement>('input[name="themeMode"]').forEach((
 });
 
 
+document.querySelectorAll<HTMLInputElement>('input[name="parallelConnections"]').forEach((radio) => {
+  radio.addEventListener("change", () => {
+    if (radio.checked) applyParallelConnections(Number(radio.value));
+  });
+});
+
+
 localPathInput.addEventListener("input", () => {
   updateDropZoneState();
   updateResolvedPathHint();
@@ -347,9 +365,8 @@ localPathInput.addEventListener("input", () => {
 });
 
 
-localPathInput.addEventListener("blur", () => {
-  if (!state.isTransferring) void runBackgroundProbe();
-});
+// 是否该预检（忙碌、表单没变等）由 runBackgroundProbe 自己判断。
+localPathInput.addEventListener("blur", () => void runBackgroundProbe());
 
 
 bookmarkBtn.addEventListener("click", () => void toggleBookmark());
@@ -382,15 +399,17 @@ remotePathInput.addEventListener("input", () => {
 });
 
 
-remotePathInput.addEventListener("blur", () => {
-  if (!state.isTransferring) void runBackgroundProbe();
-});
+remotePathInput.addEventListener("blur", () => void runBackgroundProbe());
 
 
 transferBtn.addEventListener("click", async () => {
-  if (state.startInFlight || state.isTransferring) return;
+  if (isBusy()) return;
   state.startInFlight = true;
-  transferBtn.disabled = true;
+  syncBusyLock();
+  // 从这一刻到进入进行中视图之间要确认主机指纹、做一次完整的预检连接，弱网下可达数秒：
+  // 立刻换掉按钮文案并在页脚说明进行到哪一步，否则看起来像点了没反应。
+  transferBtn.textContent = t("准备中…");
+  showStartPhase(t("正在连接服务器…"));
   try {
     // 先判断是否多文件：上传和下载都可能是队列，不能先按方向分流。
     if (isQueueSelection()) {
@@ -407,8 +426,11 @@ transferBtn.addEventListener("click", async () => {
     setStatus(describeError(error), "error");
   } finally {
     state.startInFlight = false;
-    // 用户在确认框里取消时流程正常返回、没有进入传输态，需要把按钮还回去。
-    if (!state.isTransferring) transferBtn.disabled = false;
+    // 所有出口（成功进入传输、确认框里取消、出错）都走这里：撤掉阶段提示、还原按钮文案，
+    // 并按最终状态决定锁不锁——已进入传输态时保持锁定，否则把表单和按钮还回去。
+    clearStartPhase();
+    updateTransferButtonLabel();
+    syncBusyLock();
   }
 });
 
@@ -422,6 +444,10 @@ resultBackBtn.addEventListener("click", () => {
     updateDropZoneState();
     updateResolvedPathHint();
     clearProbeResult();
+  } else {
+    // 在没传完的结果页上选择「返回修改」而不是「重试 / 继续传输」：用户不打算接着传这个批量了，
+    // 下次启动不再提示。剩余文件仍留在选择里，再点开始会重新保存。
+    clearSavedBatch();
   }
   statusText.textContent = "";
   showTransferView("compose");
@@ -441,9 +467,16 @@ document.querySelectorAll<HTMLInputElement>('input[name="logFilter"]').forEach((
 
 
 copyLogBtn.addEventListener("click", async () => {
-  await copyText(activityLog.toText());
   const label = copyLogBtn.lastChild;
-  if (label) label.textContent = t("已复制");
+  let feedback = t("已复制");
+  try {
+    await copyText(activityLog.toText());
+  } catch (error) {
+    // 剪贴板写入可能被系统拒绝；日志页没有状态栏，就在按钮上如实说明没复制成功。
+    console.warn("copy log failed", error);
+    feedback = t("复制失败");
+  }
+  if (label) label.textContent = feedback;
   window.setTimeout(() => {
     if (label) label.textContent = t("复制");
   }, COPY_FEEDBACK_MS);
@@ -475,7 +508,7 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((item) => {
 });
 
 
-/** ⌘1–4 切页、⌘↩ 开始、⌘O 选文件：常用操作不必离开键盘。 */
+/** ⌘1–5 切页、⌘↩ 开始、⌘O 选文件：常用操作不必离开键盘。 */
 document.addEventListener("keydown", (event) => {
   if (!event.metaKey || event.altKey || event.ctrlKey) return;
   if (confirmOverlay.classList.contains("is-visible") || remoteBrowseOverlay.classList.contains("is-visible")) return;
@@ -485,12 +518,14 @@ document.addEventListener("keydown", (event) => {
     showPage(PAGE_ORDER[pageIndex]);
     return;
   }
-  if (event.key === "Enter" && state.currentPage === "transfer" && state.currentView !== "run") {
+  // 成功结果页上开始按钮只是被隐藏：不排除的话 ⌘↩ 会把刚完成的传输再跑一遍，连带重复执行传完后命令。
+  const startVisible = !transferBtn.classList.contains("hidden");
+  if (event.key === "Enter" && state.currentPage === "transfer" && state.currentView !== "run" && startVisible) {
     event.preventDefault();
     transferBtn.click();
     return;
   }
-  if (event.key.toLowerCase() === "o" && state.currentPage === "transfer" && state.currentView === "compose") {
+  if (event.key.toLowerCase() === "o" && state.currentPage === "transfer" && state.currentView === "compose" && !isBusy()) {
     event.preventDefault();
     document.querySelector<HTMLButtonElement>("#pickFileBtn")!.click();
   }
@@ -504,22 +539,29 @@ cancelBtn.addEventListener("click", () => {
     void invoke("cancel_remote_command").catch(() => {});
     return;
   }
-  if (state.cancelInFlight || !state.isTransferring) return;
+  if (state.cancelInFlight) return;
+  if (!state.isTransferring && !state.activeQueue) return;
 
-  state.cancelInFlight = true;
   cancelBtn.disabled = true;
   cancelBtn.textContent = t("取消中…");
-  cancelBtn.classList.add("is-cancelling");
   setBadge(t("取消中"), "retrying");
+  // 批量：无论当前文件能否被取消，都不再开始后面的文件。也覆盖「取消发出时当前文件刚好传完」的情况。
+  if (state.activeQueue) state.queueCancelRequested = true;
+  // 批量的文件间隙（上一个已结束、下一个还在预检）没有后端任务可取消，置好标记即可，
+  // 队列会在启动下一个文件前停下。
+  if (!state.isTransferring) return;
+
+  state.cancelInFlight = true;
   setStatus(t("正在取消…"));
 
   const cmd = state.runDirection === "download" ? "cancel_download" : "cancel_upload";
   void invoke(cmd).catch((error) => {
     state.cancelInFlight = false;
+    // 取消没发出去：当前文件仍在传，批量也照常继续，把按钮还给用户重试。
+    state.queueCancelRequested = false;
     if (state.isTransferring) {
       cancelBtn.disabled = false;
       cancelBtn.textContent = t("取消传输");
-      cancelBtn.classList.remove("is-cancelling");
     }
     setStatus(describeError(error), "error");
   });
@@ -531,11 +573,6 @@ clearCheckpointBtn.addEventListener("click", () => {
 });
 
 
-
-/** 「已复制」反馈停留时长。 */
-const COPY_FEEDBACK_MS = 1500;
-
-
 void listen("transfer-close-requested", async () => {
   const ok = await showConfirm(
     t("传输进行中"),
@@ -543,8 +580,15 @@ void listen("transfer-close-requested", async () => {
   );
   if (!ok) return;
 
-  await invoke("prepare_app_close");
-  await getCurrentWindow().close();
+  try {
+    await invoke("prepare_app_close");
+    await getCurrentWindow().close();
+  } catch (error) {
+    // 事件回调里的拒绝没有人接：不处理的话用户点了「确定」却什么都没发生，也不知道为什么。
+    // 传输中页脚状态行是隐藏的，用 showTransferStatus 让它重新可见。
+    console.warn("close after confirm failed", error);
+    showTransferStatus(describeError(error), "error");
+  }
 });
 
 
@@ -566,7 +610,9 @@ async function startupSequence() {
  * 用户往往不记得还有传了一半的文件，等他去历史页翻就晚了。
  */
 async function offerResumeOnLaunch() {
-  if (state.isTransferring) return;
+  if (isBusy()) return;
+  // 批量优先：它包含了那个传到一半的文件，问过批量就不必再为单个文件问一遍。
+  if (await offerSavedBatchOnLaunch()) return;
   const pending: [TransferDirection, UploadCheckpoint | DownloadCheckpoint][] = [];
   if (state.activeUploadCheckpoint) pending.push(["upload", state.activeUploadCheckpoint]);
   if (state.activeDownloadCheckpoint) pending.push(["download", state.activeDownloadCheckpoint]);
@@ -575,7 +621,7 @@ async function offerResumeOnLaunch() {
   const [direction, cp] = pending[0];
   const transferred = getTransferredBytes(cp);
   const name = fileNameOf(direction === "download" ? cp.remote_path : cp.local_path);
-  const percent = cp.file_size > 0 ? Math.floor((transferred / cp.file_size) * 100) : 0;
+  const percent = floorPercent(transferred, cp.file_size);
   const more = pending.length > 1 ? t("\n\n另有 1 个未完成的传输，可在「历史」页查看。") : "";
   const resume = await showConfirm(
     t("有未完成的传输"),
@@ -630,6 +676,7 @@ void listen<UploadProgressEvent>("upload-progress", (event) => {
     payload.retry_count,
     "upload",
     payload.verify_summary,
+    payload.done_ranges,
   );
 });
 
@@ -644,6 +691,7 @@ void listen<DownloadProgressEvent>("download-progress", (event) => {
     payload.retry_count,
     "download",
     payload.verify_summary,
+    payload.done_ranges,
   );
 });
 
@@ -687,6 +735,8 @@ setupDragDrop();
 initThemePreference();
 
 initLanguagePreference();
+
+initParallelConnections();
 
 showTransferView("compose");
 

@@ -4,14 +4,14 @@ import { icons } from "../ui/icons";
 import { invoke } from "@tauri-apps/api/core";
 import { connectionPayload, prepareConnection, updateAuthFields, updateConnectionSummary } from "./connection";
 import { showConfirm } from "./dialogs";
-import { authTypeSelect, historyList, hostInput, keyPathInput, localPathInput, navHistoryBadge, pendingList, pendingSection, portInput, profileSelect, remotePathInput, statusText, transferBtn, usernameInput } from "./dom";
-import { fileNameOf, formatBytes, formatTime } from "./format";
+import { authTypeSelect, historyList, historyStatus, hostInput, keyPathInput, localPathInput, navHistoryBadge, pendingList, pendingSection, portInput, profileSelect, remotePathInput, statusText, transferBtn, usernameInput } from "./dom";
+import { describeError, fileNameOf, formatBytes, formatTime } from "./format";
 import { showPage } from "./nav";
 import { selectLocalPathsExpanded, selectRemotePathsExpanded, updateDropZoneState, updateResolvedPathHint } from "./paths";
 import { clearProbeResult, scheduleBackgroundProbe, updateTransferStatePanel } from "./probe";
 import { setProgressState, setStatus } from "./progress";
 import { applyProfile, findProfileFor, restoreCredentialsFromProfile, setJumpSelection } from "./servers";
-import { state } from "./state";
+import { isBusy, state } from "./state";
 import { getTransferredBytes, isDownloadMode, setTransferDirection, showTransferView } from "./transfer";
 import { DownloadCheckpoint, TransferDirection, UploadCheckpoint, UploadHistoryEntry } from "./types";
 
@@ -162,7 +162,12 @@ function reuseUnavailableNote(): HTMLSpanElement {
 
 
 export async function reuseHistoryEntry(entry: UploadHistoryEntry) {
-  if (state.isTransferring) return;
+  reportHistoryFeedback("");
+  // 复用会改写服务器和路径；批量的文件间隙、命令执行期间这些仍在被使用。
+  if (isBusy()) {
+    reportHistoryFeedback(t("传输进行中，完成后再操作"), "error");
+    return;
+  }
   setTransferDirection(entry.direction === "download" ? "download" : "upload");
   const profile = findProfileFor(entry.host, entry.port, entry.username);
   if (profile) {
@@ -206,7 +211,11 @@ async function reuseBatch(entry: UploadHistoryEntry) {
 
 
 export async function resumePendingTransfer(direction: TransferDirection) {
-  if (state.isTransferring) return;
+  reportHistoryFeedback("");
+  if (isBusy()) {
+    reportHistoryFeedback(t("传输进行中，完成后再操作"), "error");
+    return;
+  }
   setTransferDirection(direction);
   showTransferView("compose");
   showPage("transfer");
@@ -217,8 +226,32 @@ export async function resumePendingTransfer(direction: TransferDirection) {
 }
 
 
+type FeedbackKind = "normal" | "error" | "retry";
+
+
+/**
+ * 历史与断点操作的反馈显示在用户所在的页面：从历史页触发时写到历史页标题栏，
+ * 否则写到传输页页脚。原先一律写页脚，在历史页点「清除」后看不到任何结果。
+ */
+function reportHistoryFeedback(message: string, kind: FeedbackKind = "normal") {
+  if (state.currentPage !== "history") {
+    setStatus(message, kind);
+    return;
+  }
+  historyStatus.textContent = message;
+  historyStatus.classList.toggle("error", kind === "error");
+  historyStatus.classList.toggle("retry", kind === "retry");
+}
+
+
 export async function clearCheckpointFor(direction: TransferDirection) {
   const download = direction === "download";
+  reportHistoryFeedback("");
+  // 忙碌时断点属于正在进行（或即将继续）的任务，清掉它会让续传从头开始；后端同样会拒绝。
+  if (isBusy()) {
+    reportHistoryFeedback(t("传输进行中，完成后再操作"), "error");
+    return;
+  }
   const confirmed = await showConfirm(
     t("清除断点"),
     download
@@ -227,30 +260,36 @@ export async function clearCheckpointFor(direction: TransferDirection) {
   );
   if (!confirmed) return;
 
-  if (download) {
-    await invoke("clear_saved_download_checkpoint");
-    state.activeDownloadCheckpoint = null;
-    updateTransferStatePanel();
-    setStatus(t("断点记录已清除"));
-    return;
-  }
-  // 删除服务器上的临时文件需要连接；连接不成（如没有密码）也照常清除断点，只是提示残留位置。
-  let connection = null;
   try {
-    await prepareConnection();
-    connection = connectionPayload();
+    if (download) {
+      await invoke("clear_saved_download_checkpoint");
+      state.activeDownloadCheckpoint = null;
+      updateTransferStatePanel();
+      reportHistoryFeedback(t("断点记录已清除"));
+      return;
+    }
+    // 删除服务器上的临时文件需要连接；连接不成（如没有密码）也照常清除断点，只是提示残留位置。
+    let connection = null;
+    try {
+      await prepareConnection();
+      connection = connectionPayload();
+    } catch (error) {
+      console.warn("clear checkpoint without connection", error);
+    }
+    const outcome = await invoke<{ leftover: string | null }>("clear_saved_checkpoint", { request: connection });
+    state.activeUploadCheckpoint = null;
+    updateTransferStatePanel();
+    reportHistoryFeedback(
+      outcome.leftover
+        ? t("断点记录已清除，但服务器上的临时文件 {path} 未能删除，可手动删除", { path: outcome.leftover })
+        : t("断点记录已清除"),
+      outcome.leftover ? "retry" : "normal",
+    );
   } catch (error) {
-    console.warn("clear checkpoint without connection", error);
+    // 后端拒绝（如该方向正有传输在跑）或写盘失败：断点仍在，界面状态不动，只把原因告诉用户。
+    console.warn("clear checkpoint failed", { direction, error });
+    reportHistoryFeedback(describeError(error), "error");
   }
-  const outcome = await invoke<{ leftover: string | null }>("clear_saved_checkpoint", { request: connection });
-  state.activeUploadCheckpoint = null;
-  updateTransferStatePanel();
-  setStatus(
-    outcome.leftover
-      ? t("断点记录已清除，但服务器上的临时文件 {path} 未能删除，可手动删除", { path: outcome.leftover })
-      : t("断点记录已清除"),
-    outcome.leftover ? "retry" : "normal",
-  );
 }
 
 
@@ -275,7 +314,7 @@ export async function refreshCheckpointFromDisk() {
 }
 
 
-export async function restoreUploadCheckpoint(options?: { keepStatus?: boolean }) {
+export async function restoreUploadCheckpoint() {
   state.activeUploadCheckpoint = await invoke<UploadCheckpoint | null>("get_saved_checkpoint");
   if (!state.activeUploadCheckpoint || state.activeUploadCheckpoint.status === "completed") {
     state.activeUploadCheckpoint = null;
@@ -305,7 +344,7 @@ export async function restoreUploadCheckpoint(options?: { keepStatus?: boolean }
   setProgressState("idle");
 
   // 断点状态由传输页顶部的状态面板统一呈现，页脚不再重复一遍。
-  if (!options?.keepStatus) statusText.textContent = "";
+  statusText.textContent = "";
   updateTransferStatePanel();
 }
 

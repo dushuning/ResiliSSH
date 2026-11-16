@@ -4,14 +4,12 @@ import { copyText } from "../ui/activityLog";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { connectionPayload } from "./connection";
+import { COPY_FEEDBACK_MS } from "./constants";
 import { copyReceiptBtn, resultReceipt, saveReceiptBtn } from "./dom";
 import { describeError, formatBytes, formatDuration } from "./format";
 import { setStatus } from "./progress";
 import { state } from "./state";
 import { ReceiptFile, RunReceipt, RunStats, TransferDirection } from "./types";
-
-/** 复制成功后按钮上的「已复制」提示停留多久。 */
-const COPIED_FEEDBACK_MS = 1500;
 
 interface FileDigest {
   size: number;
@@ -125,7 +123,7 @@ export async function copyReceipt() {
     copyReceiptBtn.textContent = t("已复制");
     window.setTimeout(() => {
       copyReceiptBtn.textContent = label;
-    }, COPIED_FEEDBACK_MS);
+    }, COPY_FEEDBACK_MS);
   } catch (error) {
     copyReceiptBtn.textContent = label;
     setStatus(describeError(error), "error");

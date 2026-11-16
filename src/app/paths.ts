@@ -7,14 +7,15 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { connectionPayload, prepareConnection } from "./connection";
 import { bookmarkBtn, dropZone, fileChip, fileChipName, fileChipPath, hostInput, localPathInput, pathMenu, portInput, remotePathInput, resolvedPathHint, usernameInput } from "./dom";
-import { asDir, describeError, fileNameOf, formatBytes, remoteDirOf } from "./format";
+import { DEFAULT_SSH_PORT } from "./constants";
+import { asDir, describeError, fileNameOf, formatBytes, pathCompatible, remoteDirOf } from "./format";
 import { showPage } from "./nav";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
 import { setStatus } from "./progress";
 import { RECENT_DIR_LIMIT, currentProfile, saveProfileExtras } from "./servers";
-import { state } from "./state";
+import { isBusy, state } from "./state";
 import { isDownloadMode, showTransferView } from "./transfer";
-import { ExpandedPaths, LocalEntry } from "./types";
+import { DownloadCheckpoint, ExpandedPaths, LocalEntry, UploadCheckpoint } from "./types";
 
 export function isQueueSelection(): boolean {
   // 文件夹里只有一个文件时也要走队列：它需要放进目标端的子目录。
@@ -125,7 +126,7 @@ export function updateBookmarkButton() {
   const profile = currentProfile();
   const dir = remoteDirOf(remotePathInput.value);
   const bookmarked = Boolean(profile && dir && profile.bookmarks.includes(dir));
-  bookmarkBtn.disabled = !profile || !dir || state.isTransferring;
+  bookmarkBtn.disabled = !profile || !dir || isBusy();
   bookmarkBtn.classList.toggle("is-active", bookmarked);
   bookmarkBtn.innerHTML = bookmarked ? icons.starFilled : icons.star;
   bookmarkBtn.title = !profile
@@ -157,7 +158,7 @@ export async function toggleBookmark() {
 /** 最近目录从传输历史推导，不额外存储：历史本来就记录了每次传到哪里。 */
 export function recentDirsForCurrentServer(exclude: string[]): string[] {
   const host = hostInput.value.trim();
-  const port = Number(portInput.value) || 22;
+  const port = Number(portInput.value) || DEFAULT_SSH_PORT;
   const user = usernameInput.value.trim();
   const dirs: string[] = [];
   for (const entry of state.historyEntries) {
@@ -220,7 +221,6 @@ export function updateDropZoneState() {
     state.uploadSizes = new Map();
   }
   const hasPath = path.length > 0;
-  dropZone.classList.toggle("has-file", hasPath);
   fileChip.classList.toggle("hidden", !hasPath);
   dropZone.classList.toggle("hidden", hasPath);
   if (!hasPath) return;
@@ -248,6 +248,25 @@ export function updateDropZoneState() {
 }
 
 
+/**
+ * 断点是否就是表单当前指向的这次传输。与后端决定「续传还是从头开始」的条件一致：
+ * 服务器（主机、端口、用户名）相同，且两端路径对得上。状态面板和路径预览都以此为准，
+ * 避免界面说「将从断点继续」而后端实际从头传。
+ */
+export function checkpointMatchesForm(cp: UploadCheckpoint | DownloadCheckpoint, download: boolean): boolean {
+  const sameServer =
+    cp.host === hostInput.value.trim() &&
+    cp.port === (Number(portInput.value) || DEFAULT_SSH_PORT) &&
+    cp.username === usernameInput.value.trim();
+  if (!sameServer) return false;
+  const local = localPathInput.value.trim();
+  const remote = remotePathInput.value.trim();
+  // 上传的本地文件必须是同一个；下载的本地一侧可以只填目录。
+  const localMatches = download ? pathCompatible(cp.local_path, local) : cp.local_path === local;
+  return localMatches && pathCompatible(cp.remote_path, remote);
+}
+
+
 export function previewResolvedPath(): string | null {
   const remote = remotePathInput.value.trim();
   const local = localPathInput.value.trim();
@@ -261,7 +280,7 @@ export function previewResolvedPath(): string | null {
       return `${base}/${remoteName}`;
     }
     const cp = state.activeDownloadCheckpoint;
-    if (cp && cp.local_path !== local && cp.remote_path === remote) {
+    if (cp && cp.local_path !== local && checkpointMatchesForm(cp, true)) {
       return cp.local_path;
     }
     return null;
@@ -274,12 +293,9 @@ export function previewResolvedPath(): string | null {
     return `${remote}${fileName}`;
   }
 
-  if (
-    state.activeUploadCheckpoint &&
-    state.activeUploadCheckpoint.remote_path !== remote &&
-    state.activeUploadCheckpoint.local_path === local
-  ) {
-    return state.activeUploadCheckpoint.remote_path;
+  const cp = state.activeUploadCheckpoint;
+  if (cp && cp.remote_path !== remote && checkpointMatchesForm(cp, false)) {
+    return cp.remote_path;
   }
 
   return null;
@@ -340,7 +356,8 @@ export function updateResolvedPathHint() {
 export function setupDragDrop() {
   void getCurrentWebview().onDragDropEvent((event) => {
     // 拖入文件是整个窗口范围的：在别的页面拖进来也直接带到传输页，但传输中不打断。
-    if (isDownloadMode() || state.isTransferring) return;
+    // 批量的文件间隙、传完后命令执行期间同样算「传输中」：此时换掉选择会让后续文件传错。
+    if (isDownloadMode() || isBusy()) return;
     if (event.payload.type === "over") {
       dropZone.classList.add("drag-over");
     } else if (event.payload.type === "leave") {
@@ -358,7 +375,6 @@ export function setupDragDrop() {
 }
 
 
-/** 上传可多选（排队依次传）；下载选择的是本地保存目录，只能单选。 */
 /** 上传可多选文件（排队依次传）；下载选择的是本地保存目录，只能单选。 */
 export async function pickLocalPaths() {
   const download = isDownloadMode();

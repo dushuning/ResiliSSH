@@ -452,13 +452,9 @@ input[type="radio"] {
 }
 
 .segmented input:checked + span {
-  background: var(--bg-window);
+  background: var(--segmented-active-bg);
   color: var(--text-primary);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
-}
-
-:root[data-theme="dark"] .segmented input:checked + span {
-  background: #55555a;
 }
 
 .segmented input:focus-visible + span {
@@ -916,9 +912,10 @@ input[type="radio"] {
   flex-direction: column;
   height: 150px;
   flex: none;
+  border: 1px solid var(--console-border);
   border-radius: var(--radius-l);
-  background: #1d1f23;
-  color: #d7dae0;
+  background: var(--console-bg);
+  color: var(--console-text);
   overflow: hidden;
 }
 
@@ -927,10 +924,10 @@ input[type="radio"] {
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--console-divider);
   font-family: var(--font-mono);
   font-size: 11.5px;
-  color: #9aa0aa;
+  color: var(--console-muted);
 }
 
 .command-console-cmd {
@@ -1057,11 +1054,6 @@ input[type="radio"] {
 .badge.stalled {
   background: var(--warn-soft);
   color: var(--warn-text);
-}
-
-.badge.error {
-  background: var(--danger-soft);
-  color: var(--danger-text);
 }
 
 .map-frame {
@@ -1254,7 +1246,6 @@ input[type="radio"] {
   background: var(--danger);
 }
 
-.result-files .skipped .file-mark,
 .result-files .cancelled .file-mark {
   background: var(--warn);
 }
@@ -1294,9 +1285,10 @@ input[type="radio"] {
   max-height: 120px;
   overflow: auto;
   padding: 8px 12px;
+  border: 1px solid var(--console-border);
   border-radius: var(--radius-m);
-  background: #1d1f23;
-  color: #d7dae0;
+  background: var(--console-bg);
+  color: var(--console-text);
 }
 
 .result-card.paused .result-icon {
@@ -1408,8 +1400,13 @@ input[type="radio"] {
   cursor: default;
 }
 
-.server-item:hover {
+.server-item:hover:not(:disabled) {
   background: var(--bg-hover);
+}
+
+/* 传输期间服务器列表被锁定：要看得出点不了，而不是点了没反应。选中项保留底色，仍能看出当前用的是哪台。 */
+.server-item:disabled {
+  opacity: 0.5;
 }
 
 .server-item.selected {
@@ -1734,6 +1731,16 @@ input[type="radio"] {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* 历史页标题栏右侧的操作反馈：占满剩余宽度并靠右，长消息在两行内截断而不是把标题挤走。 */
+#page-history .header-tools {
+  flex: 1;
+  min-width: 0;
+}
+
+#historyStatus {
+  text-align: right;
 }
 
 .nav-badge-error {

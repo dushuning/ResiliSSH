@@ -1,6 +1,7 @@
 // 当前连接参数的读取与校验：表单 → 后端连接参数、钥匙串密码的会话缓存、连接状态展示。
 import { t } from "../i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { DEFAULT_SSH_PORT } from "./constants";
 import { showConfirm } from "./dialogs";
 import { authHint, authTypeSelect, connectionStatus, connectionSummary, hostInput, jumpProfileSelect, keyFields, keyPassphraseInput, keyPathInput, passwordFields, passwordInput, portInput, profileSelect, rememberRow, rememberSecretsInput, usernameInput } from "./dom";
 import { updateBookmarkButton } from "./paths";
@@ -11,7 +12,7 @@ import { ConnectionProfile, ConnectionReadiness, HostKeyInfo, ProfileSecrets } f
 export function getConnectionReadiness(): ConnectionReadiness {
   const host = hostInput.value.trim();
   const user = usernameInput.value.trim();
-  const port = Number(portInput.value) || 22;
+  const port = Number(portInput.value) || DEFAULT_SSH_PORT;
   const profileSelected = profileSelect.value !== "";
   const profileLabel = profileSelected
     ? (profileSelect.options[profileSelect.selectedIndex]?.textContent ?? "").trim()
@@ -214,7 +215,7 @@ const MAX_JUMP_HOPS = 3;
 export function connectionPayload(): ConnectionPayload {
   return {
     host: hostInput.value.trim(),
-    port: Number(portInput.value) || 22,
+    port: Number(portInput.value) || DEFAULT_SSH_PORT,
     username: usernameInput.value.trim(),
     auth_type: authTypeSelect.value,
     password: passwordInput.value,

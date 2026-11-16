@@ -2,13 +2,13 @@
 import { t } from "../i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { restorePostCommand } from "./command";
+import { DEFAULT_SSH_PORT } from "./constants";
 import { loadProfileSecrets, sessionSecrets, setConnectionStatus, updateAuthFields, updateAuthHintVisibility, updateConnectionSummary } from "./connection";
 import { authTypeSelect, hostInput, hostSelect, jumpProfileSelect, keyPassphraseInput, keyPathInput, navServerCount, onboarding, onboardingActions, onboardingDetail, passwordInput, portInput, profileNameInput, profileSelect, rememberSecretsInput, saveProfileBtn, serverList, usernameInput } from "./dom";
 import { showPage } from "./nav";
-import { state } from "./state";
+import { clearLastProbe } from "./probe";
+import { isBusy, state } from "./state";
 import { ConnectionProfile, SshHostEntry } from "./types";
-
-const DEFAULT_SSH_PORT = 22;
 
 /** 最近使用的目录最多列几个：太多会把收藏挤出视野。 */
 export const RECENT_DIR_LIMIT = 6;
@@ -72,16 +72,16 @@ export async function applyProfile(profile: ConnectionProfile) {
   portInput.value = String(profile.port);
   usernameInput.value = profile.username;
   authTypeSelect.value = profile.auth_kind === "private_key" ? "key" : "password";
-  if (profile.key_path) {
-    keyPathInput.value = profile.key_path;
-  } else if (profile.auth_kind === "private_key") {
-    keyPathInput.value = "";
-  }
+  // 没有私钥路径的服务器（密码登录）也要清空：否则上一台的路径留在隐藏字段里，
+  // 之后把这台改成私钥登录并保存时会被一并带过去。
+  keyPathInput.value = profile.key_path ?? "";
 
   passwordInput.value = "";
   keyPassphraseInput.value = "";
   profileNameInput.value = profile.name;
   setJumpSelection(profile.jump_profile_id);
+  // 预检结论（「远端已是最新」等）是针对上一台服务器的，换了服务器就不再成立。
+  clearLastProbe();
   updateAuthFields();
   updateConnectionSummary();
 
@@ -163,7 +163,7 @@ export function renderJumpOptions() {
     ...candidates.map((p) => {
       const option = document.createElement("option");
       option.value = p.id;
-      option.textContent = `${p.name} (${p.username}@${p.host}${p.port === 22 ? "" : `:${p.port}`})`;
+      option.textContent = `${p.name} (${p.username}@${p.host}${p.port === DEFAULT_SSH_PORT ? "" : `:${p.port}`})`;
       return option;
     }),
   );
@@ -201,7 +201,7 @@ export function findProfileForJumpSpec(spec: string): ConnectionProfile | undefi
   if (!match) return undefined;
   const [, user, rawHost, rawPort] = match;
   const host = rawHost.replace(/^\[|\]$/g, "");
-  const port = rawPort ? Number(rawPort) : 22;
+  const port = rawPort ? Number(rawPort) : DEFAULT_SSH_PORT;
   return state.savedProfiles.find(
     (p) => p.host === host && p.port === port && (!user || p.username === user),
   );
@@ -233,10 +233,10 @@ export function renderServerList() {
       meta.className = "server-item-meta";
       const jump = profileById(profile.jump_profile_id);
       meta.textContent =
-        `${profile.username}@${profile.host}${profile.port === 22 ? "" : `:${profile.port}`}` +
+        `${profile.username}@${profile.host}${profile.port === DEFAULT_SSH_PORT ? "" : `:${profile.port}`}` +
         (jump ? t(" · 经 {name}", { name: jump.name }) : "");
       item.append(name, meta);
-      item.disabled = state.isTransferring;
+      item.disabled = isBusy();
       item.addEventListener("click", () => {
         profileSelect.value = profile.id;
         void applyProfile(profile);
@@ -282,6 +282,7 @@ function resetServerForm() {
   rememberSecretsInput.checked = true;
   setJumpSelection(null);
   setConnectionStatus("");
+  clearLastProbe();
   updateAuthFields();
   updateConnectionSummary();
 }

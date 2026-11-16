@@ -43,9 +43,16 @@
   --btn-secondary-bg: rgba(0, 0, 0, 0.06);
   --btn-secondary-hover: rgba(0, 0, 0, 0.1);
   --focus-ring: 0 0 0 3px rgba(10, 108, 222, 0.3);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.05);
   --shadow-modal: 0 18px 48px rgba(0, 0, 0, 0.22), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
   --modal-overlay: rgba(0, 0, 0, 0.28);
+  --segmented-active-bg: var(--bg-window);
+
+  /* 命令控制台：两种主题下都是深色终端。浅色下靠与页面的反差成块，不需要描边 */
+  --console-bg: #1d1f23;
+  --console-text: #d7dae0;
+  --console-muted: #9aa0aa;
+  --console-divider: rgba(255, 255, 255, 0.08);
+  --console-border: transparent;
 
   /* 分块地图：已续传与本次已传同色系不同明度，一眼能区分「之前」与「现在」 */
   --map-pending: #e6e6eb;
@@ -91,9 +98,16 @@
   --btn-secondary-bg: rgba(255, 255, 255, 0.09);
   --btn-secondary-hover: rgba(255, 255, 255, 0.14);
   --focus-ring: 0 0 0 3px rgba(47, 140, 255, 0.4);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-modal: 0 18px 48px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
   --modal-overlay: rgba(0, 0, 0, 0.45);
+  --segmented-active-bg: #55555a;
+
+  /* 深色下窗口本身就接近控制台的颜色：底色再压暗一档并加描边，才看得出边界 */
+  --console-bg: #141416;
+  --console-text: #d7dae0;
+  --console-muted: #9aa0aa;
+  --console-divider: rgba(255, 255, 255, 0.08);
+  --console-border: var(--border);
 
   --map-pending: #333337;
   --map-resumed: #2d5384;

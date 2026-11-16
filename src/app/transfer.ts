@@ -2,21 +2,23 @@
 import { t } from "../i18n";
 import { icons } from "../ui/icons";
 import { invoke } from "@tauri-apps/api/core";
-import { BACKEND_TEXT, clarifyTransferError, matchesBackend } from "./backendText";
-import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult } from "./command";
+import { clarifyTransferError } from "./backendText";
+import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult, updateSaveCommandButton } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
 import { TRANSFER_LOCK_SELECTORS, UI_STALL_WARN_MS } from "./constants";
-import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZone, forceOverwriteInput, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
-import { describeError, formatBytes, formatDuration, prefersReducedMotion } from "./format";
+import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, forceOverwriteInput, languageHint, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
+import { formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
-import { isQueueSelection, updateResolvedPathHint } from "./paths";
-import { clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
+import { isQueueSelection, updateBookmarkButton, updateResolvedPathHint } from "./paths";
+import { clearLastProbe, clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
 import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showProgressSpeed, showReconnectingSpeedText, showTransferStatus, showVerifySummary, showWaitingSpeedText, startProgressWatchdog, stopProgressWatchdog, updateProgress, updateProgressDetail } from "./progress";
 import { clearDockProgress } from "./dock";
 import { recordReceipt, syncReceiptVisibility } from "./receipt";
 import { updateRemoteBrowseModeUi } from "./remoteBrowse";
-import { state } from "./state";
-import { DownloadCheckpoint, ReceiptFile, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadStart } from "./types";
+import { clearSavedBatch } from "./savedBatch";
+import { readParallelConnections } from "./settings";
+import { isBusy, state } from "./state";
+import { ByteRange, DownloadCheckpoint, ReceiptFile, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadStart } from "./types";
 
 export function isDownloadMode(): boolean {
   return state.transferDirection === "download";
@@ -49,30 +51,74 @@ export function setTransferFormLocked(locked: boolean) {
 }
 
 
+/**
+ * 按 isBusy() 统一锁定或解锁「开始」「测试连接」和整张表单。所有会改变忙碌状态的地方
+ * （传输起止、队列起止、传完后命令起止、开始流程起止）改完状态后都调用它，
+ * 而不是各自去开关控件：批量的文件间隙里 isTransferring 会短暂为 false，
+ * 各管各的就会在那一瞬间把表单放开，下一个文件读到的可能已是被改过的服务器。
+ */
+export function syncBusyLock() {
+  const busy = isBusy();
+  transferBtn.disabled = busy;
+  testConnBtn.disabled = busy;
+  setTransferFormLocked(busy);
+  // setTransferFormLocked 会连方向单选一起放开，方向还要看当前视图。
+  syncDirectionLock();
+  if (busy) return;
+  // 解锁是「一律启用」，而这两个星标还取决于是否选了已保存的服务器、是否填了内容。
+  updateBookmarkButton();
+  updateSaveCommandButton();
+  // 「完成后再切换语言」的提示只在忙碌时成立。
+  languageHint.textContent = "";
+}
+
+
+/** 取消按钮恢复为可用的「取消传输」：一次取消（单个文件或整个批量）了结后调用。 */
+export function resetCancelButton() {
+  state.cancelInFlight = false;
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = t("取消传输");
+}
+
+
+/**
+ * 开始流程的阶段提示（连接服务器、检查远端文件）。点「开始」到进入进行中视图之间
+ * 要做主机指纹确认和一次完整的预检连接，弱网下可达数秒；只禁用按钮看起来就像卡死了。
+ */
+export function showStartPhase(message: string) {
+  state.startPhaseText = message;
+  showTransferStatus(message);
+}
+
+
+/** 只清掉自己写的阶段提示：期间如果已被错误信息等替换，就保留那条信息。 */
+export function clearStartPhase() {
+  if (state.startPhaseText && statusText.textContent === state.startPhaseText) {
+    statusText.textContent = "";
+  }
+  state.startPhaseText = "";
+}
+
+
 export function setTransferring(running: boolean) {
   state.isTransferring = running;
   // 批量中每个文件结束都会短暂置为 false，此时不清，免得 Dock 进度在文件之间闪烁；整批结束时由队列清除。
   if (!running && !state.activeQueue) clearDockProgress();
-  transferBtn.disabled = running;
-  testConnBtn.disabled = running;
-  setTransferFormLocked(running);
-  syncDirectionLock();
-  cancelBtn.textContent = t("取消传输");
-  cancelBtn.classList.remove("is-cancelling");
+  syncBusyLock();
   if (running) {
+    // 上一次如果以「停止命令」收尾，按钮文案还停在那里。
+    cancelBtn.textContent = t("取消传输");
     state.isConnecting = true;
     state.runDirection = state.transferDirection;
     clearProbeDebounce();
-    state.backgroundProbeGeneration++;
-    state.lastProbe = null;
+    clearLastProbe();
     hideVerifySummary();
     statusText.textContent = "";
     beginRunVisuals();
     showTransferView("run");
     startProgressWatchdog();
   } else {
-    state.cancelInFlight = false;
-    cancelBtn.disabled = false;
+    resetCancelButton();
     state.isReconnecting = false;
     state.isConnecting = false;
     state.isChunkVerifying = false;
@@ -92,6 +138,8 @@ export function setTransferring(running: boolean) {
 /** 传输页三种视图互斥：编辑 → 进行中 → 结果；页脚按钮随视图切换，主操作位置保持不变。 */
 export function showTransferView(view: TransferView) {
   state.currentView = view;
+  // 进入进行中视图后由视图自己说明状态，页脚的阶段提示不再需要。
+  if (view === "run") clearStartPhase();
   composeView.classList.toggle("hidden", view !== "compose");
   runView.classList.toggle("hidden", view !== "run");
   resultView.classList.toggle("hidden", view !== "result");
@@ -159,7 +207,6 @@ export function updateTransferDirectionUI() {
   dropHint.textContent = download
     ? t("点「选择…」指定保存目录")
     : t("也可以直接把文件拖到窗口里");
-  dropZone.classList.toggle("download-mode", download);
   pickFolderBtn.classList.toggle("hidden", download);
   forceOverwriteLabel.textContent = t("强制从头覆盖");
   forceOverwriteInput.parentElement!.title = download
@@ -188,53 +235,27 @@ export function updateModeHint() {
 }
 
 
-export function uploadPayload(forceOverwrite: boolean) {
+/** 上传与下载的启动参数结构相同，方向由调用的后端命令决定。 */
+export function transferPayload(forceOverwrite: boolean) {
   return {
     ...connectionPayload(),
     local_path: localPathInput.value.trim(),
     remote_path: remotePathInput.value.trim(),
     strict_chunk_verify: isReliableMode(),
     force_overwrite: forceOverwrite,
+    // 弱网下多开几条连接各传文件的不同部分；小文件后端无论如何只用一条。批量中的每个文件用同一个值。
+    connections: readParallelConnections(),
     // 批量中的文件由队列结束时整体记一条历史，避免一次批量挤掉全部历史。
     in_batch: Boolean(state.activeQueue),
   };
 }
 
 
-export function downloadPayload(forceOverwrite: boolean) {
-  return {
-    ...connectionPayload(),
-    local_path: localPathInput.value.trim(),
-    remote_path: remotePathInput.value.trim(),
-    strict_chunk_verify: isReliableMode(),
-    force_overwrite: forceOverwrite,
-    in_batch: Boolean(state.activeQueue),
-  };
-}
-
-
-export async function invokeStartDownload(forceOverwrite: boolean) {
-  try {
-    await invoke("start_download", {
-      request: downloadPayload(forceOverwrite),
-    });
-  } catch (error) {
-    const message = describeError(error);
-    if (!state.isTransferring && matchesBackend(message, BACKEND_TEXT.downloadRunning)) {
-      await invoke("reset_download_state");
-      await invoke("start_download", {
-        request: downloadPayload(forceOverwrite),
-      });
-      return;
-    }
-    throw error;
-  }
-}
-
-
 export async function startDownloadFlow() {
   await prepareConnection();
+  showStartPhase(t("正在检查远端文件…"));
   const outcome = await startOneDownload();
+  if (outcome !== "declined") clearSavedBatch();
   if (outcome === "identical") await finishIdenticalTransfer("download");
 }
 
@@ -242,6 +263,9 @@ export async function startDownloadFlow() {
 /** 预检、确认、启动一个下载；与 startOneUpload 对称，批量下载逐个调用它。 */
 export async function startOneDownload(): Promise<UploadStart> {
   const probe = await probeRemoteDownload();
+  clearStartPhase();
+  // 批量中用户在预检期间点了取消：这个文件不再启动，交回队列收尾。
+  if (state.queueCancelRequested) return "declined";
   // 本地磁盘不够时直接拦下，理由与上传相同。
   if (probe.action === "insufficient_space") {
     showDownloadProbeResult(probe);
@@ -271,33 +295,18 @@ export async function startOneDownload(): Promise<UploadStart> {
   applyActiveTransferBadge("download");
   showProgressSpeed(t("正在建立 SSH 连接…"));
 
-  await invokeStartDownload(forceOverwrite);
+  await invoke("start_download", { request: transferPayload(forceOverwrite) });
   return "started";
-}
-
-
-export async function invokeStartUpload(forceOverwrite: boolean) {
-  try {
-    await invoke("start_upload", {
-      request: uploadPayload(forceOverwrite),
-    });
-  } catch (error) {
-    const message = describeError(error);
-    if (!state.isTransferring && matchesBackend(message, BACKEND_TEXT.uploadRunning)) {
-      await invoke("reset_upload_state");
-      await invoke("start_upload", {
-        request: uploadPayload(forceOverwrite),
-      });
-      return;
-    }
-    throw error;
-  }
 }
 
 
 export async function startUploadFlow() {
   await prepareConnection();
+  showStartPhase(t("正在检查远端文件…"));
   const outcome = await startOneUpload();
+  // 用户转去传别的文件了：之前没传完的批量不再提示继续（其中传到一半的文件仍有自己的断点）。
+  // 在确认框里放弃则不算，那次传输并没有开始。
+  if (outcome !== "declined") clearSavedBatch();
   if (outcome === "identical") await finishIdenticalTransfer("upload");
 }
 
@@ -328,6 +337,9 @@ export async function finishIdenticalTransfer(direction: TransferDirection) {
 
 export async function startOneUpload(): Promise<UploadStart> {
   const probe = await probeRemoteUpload();
+  clearStartPhase();
+  // 批量中用户在预检期间点了取消：这个文件不再启动，交回队列收尾。
+  if (state.queueCancelRequested) return "declined";
   // 空间不足时直接拦下：传到 90% 才因磁盘满失败，比现在就报错糟糕得多。
   if (probe.action === "insufficient_space") {
     showProbeResult(probe);
@@ -358,7 +370,7 @@ export async function startOneUpload(): Promise<UploadStart> {
   applyActiveTransferBadge("upload");
   showProgressSpeed(t("正在建立 SSH 连接…"));
 
-  await invokeStartUpload(forceOverwrite);
+  await invoke("start_upload", { request: transferPayload(forceOverwrite) });
   return "started";
 }
 
@@ -475,6 +487,7 @@ export function handleProgressUpdate(
   retry_count: number,
   direction: TransferDirection,
   verify_summary?: string | null,
+  doneRanges?: ByteRange[],
 ) {
   state.retryCount = retry_count;
 
@@ -502,15 +515,23 @@ export function handleProgressUpdate(
     return;
   }
 
+  // 批量中的文件：历史与断点由队列在整批结束时统一刷新（见 finishQueue），
+  // 每个文件都重新读一遍历史和断点文件，几百个文件就是几百次无用的往返。
+  const inQueue = Boolean(state.resolveQueueStep);
+
   if (status === "completed") {
-    updateProgress(transferred, total);
+    updateProgress(transferred, total, doneRanges);
     const stats = collectRunStats();
+    // 单文件完成后还有一段完成动画才进结果页（或开始执行命令），这期间仍算忙碌；
+    // 必须在 setTransferring(false) 之前置位，否则表单会在动画期间被放开。
+    if (!inQueue) state.finishingRun = true;
     setTransferring(false);
     setProgressState("idle");
     resetSpeedTracker();
     setBadge(t("已完成"), "verifying");
     statusText.textContent = "";
-    cancelBtn.classList.add("hidden");
+    // 批量的文件之间保留取消按钮：此时点它是取消整个批量剩下的文件。
+    if (!inQueue) cancelBtn.classList.add("hidden");
     blockMap.setPhase("completed");
     showVerifySummary(
       verify_summary ??
@@ -521,16 +542,20 @@ export function handleProgressUpdate(
     if (uploading) state.activeUploadCheckpoint = null;
     else state.activeDownloadCheckpoint = null;
     updateTransferStatePanel();
-    void loadHistory();
     // 队列中的单个文件完成：交回调度器继续下一个，不展示单文件结果页。
     if (state.resolveQueueStep) {
       state.resolveQueueStep({ status: "completed", message, stats });
       return;
     }
+    void loadHistory();
     // 先让地图播完「全部变绿」的波纹再切结果页：这一刻是整个等待的回报，值得被看到。
     window.setTimeout(() => {
-      if (state.isTransferring) return;
-      void finishSuccessfulRun(uploading ? t("上传完成") : t("下载完成"), message, stats, [state.runRemotePath]);
+      state.finishingRun = false;
+      if (!state.isTransferring) {
+        // 有传完后命令时，这里会同步进入「命令执行中」，下面的解锁判断仍是忙碌。
+        void finishSuccessfulRun(uploading ? t("上传完成") : t("下载完成"), message, stats, [state.runRemotePath]);
+      }
+      syncBusyLock();
     }, prefersReducedMotion() ? 0 : COMPLETE_REVEAL_MS);
     return;
   }
@@ -543,12 +568,14 @@ export function handleProgressUpdate(
     hideVerifySummary();
     blockMap.setPhase("cancelled");
     statusText.textContent = "";
-    void restoreActiveCheckpoint();
-    void loadHistory();
     if (state.resolveQueueStep) {
+      // 批量中不回填表单：断点里存的是当前这一个文件的完整路径，回填会把用户填的目标目录
+      // 换成文件路径，之后「继续传输」剩余文件就全传进以文件名命名的目录里。
       state.resolveQueueStep({ status: "cancelled", message, stats });
       return;
     }
+    void restoreActiveCheckpoint();
+    void loadHistory();
     showResult(
       "paused",
       t("已暂停"),
@@ -561,7 +588,6 @@ export function handleProgressUpdate(
   if (status === "cancelling") {
     cancelBtn.disabled = true;
     cancelBtn.textContent = t("取消中…");
-    cancelBtn.classList.add("is-cancelling");
     setProgressState("retrying");
     setBadge(t("取消中"), "retrying");
     showTransferStatus(message, "retry");
@@ -576,12 +602,12 @@ export function handleProgressUpdate(
     hideVerifySummary();
     blockMap.setPhase("failed");
     statusText.textContent = "";
-    void refreshCheckpointFromDisk();
-    void loadHistory();
     if (state.resolveQueueStep) {
       state.resolveQueueStep({ status: "failed", message, stats });
       return;
     }
+    void refreshCheckpointFromDisk();
+    void loadHistory();
     showResult("error", uploading ? t("上传失败") : t("下载失败"), clarifyTransferError(message), stats);
     return;
   }
@@ -592,7 +618,7 @@ export function handleProgressUpdate(
     markProgressActivity();
     setProgressState("verifying");
     setBadge(t("校验中"), "verifying");
-    updateProgress(transferred, total);
+    updateProgress(transferred, total, doneRanges);
     updateProgressDetail(transferred, total, retry_count);
     showTransferStatus(t("正在校验文件完整性，请稍候…"));
     showProgressSpeed(t("校验中"));
@@ -605,7 +631,7 @@ export function handleProgressUpdate(
     state.isChunkVerifying = true;
     markProgressActivity();
     applyActiveTransferBadge(direction);
-    updateProgress(transferred, total);
+    updateProgress(transferred, total, doneRanges);
     updateProgressDetail(transferred, total, retry_count);
     hideTransferStatus();
     refreshLiveVisuals();
@@ -628,7 +654,7 @@ export function handleProgressUpdate(
 
   applyActiveTransferBadge(direction);
   recordSpeedSample(transferred);
-  updateProgress(transferred, total);
+  updateProgress(transferred, total, doneRanges);
   updateProgressDetail(transferred, total, retry_count);
   refreshSpeedDisplay();
   hideTransferStatus();

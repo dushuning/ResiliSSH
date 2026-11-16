@@ -66,12 +66,40 @@ export const state = {
   /** 队列执行中的状态；为 null 表示当前是普通单文件传输。 */
   activeQueue: null as ActiveQueue | null,
   resolveQueueStep: null as ((result: RunStepResult) => void) | null,
+  /** 批量进行中用户点了取消：文件之间没有可取消的后端任务，只能由队列在启动下一个文件前检查这个标记。 */
+  queueCancelRequested: false,
   probeDebounceTimer: null as number | null,
   backgroundProbeGeneration: 0,
+  /** 在途的预检请求：目标相同的第二次预检直接复用它，弱网下不必为同一个问题再开一条 SSH 连接。 */
+  inflightProbe: null as { key: string; promise: Promise<RemoteUploadProbe | RemoteDownloadProbe> } | null,
+  /** lastProbe 对应的预检目标；表单没变时失焦不必重新预检。lastProbe 清空时一并清空。 */
+  lastProbeKey: null as string | null,
   confirmResolver: null as ((value: boolean) => void) | null,
   confirmClosing: false,
+  /** 确认框关闭动画期间待完成的收尾；期间又弹出新确认框时要提前执行，不能让定时器作用到新框上。 */
+  confirmPendingClose: null as { timer: number; settle: () => void } | null,
   remoteBrowseCurrent: null as RemoteDirListing | null,
-  remoteBrowseLoading: false,
+  /** 远端浏览的请求代次：关闭对话框或发起新请求后，迟到的旧结果据此丢弃。 */
+  remoteBrowseGeneration: 0,
   /** 开始流程里有预检、确认框等多个 await，期间按钮仍可点；不加闸门的话双击会并发出第二个流程。 */
   startInFlight: false,
+  /** 开始流程当前显示在页脚的阶段提示（连接中、检查中）；只清除自己写的这一句，不误删之后出现的错误信息。 */
+  startPhaseText: "",
+  /** 单文件传完到结果页（或传完后命令）之间有一段完成动画，这期间同样不能改表单或另起传输。 */
+  finishingRun: false,
 };
+
+
+/**
+ * 「现在不能改输入、不能另起任务」的统一判断。只看 isTransferring 会漏掉批量的文件间隙、
+ * 传完后命令执行期间和开始流程的预检阶段——这些时候表单仍会被后续步骤读取。
+ */
+export function isBusy(): boolean {
+  return (
+    state.isTransferring ||
+    state.commandRunning ||
+    state.activeQueue !== null ||
+    state.startInFlight ||
+    state.finishingRun
+  );
+}

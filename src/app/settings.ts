@@ -1,8 +1,11 @@
-// 主题与界面语言偏好，保存在 localStorage。
+// 主题、界面语言与并行连接数等偏好，保存在 localStorage。
 import { languagePreference } from "../i18n";
+import { DEFAULT_PARALLEL_CONNECTIONS, PARALLEL_CONNECTION_CHOICES } from "./constants";
 import { ThemePreference } from "./types";
 
 export const THEME_STORAGE_KEY = "resiliss-theme";
+
+export const CONNECTIONS_STORAGE_KEY = "resiliss-connections";
 
 export const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -48,3 +51,24 @@ export function initLanguagePreference() {
   if (radio) radio.checked = true;
 }
 
+
+
+/** 没存过、或存的不是可选值之一（手改过、旧版本留下的）时用默认值，不把脏数据发给后端。 */
+export function readParallelConnections(): number {
+  const saved = Number(localStorage.getItem(CONNECTIONS_STORAGE_KEY));
+  return PARALLEL_CONNECTION_CHOICES.some((choice) => choice === saved) ? saved : DEFAULT_PARALLEL_CONNECTIONS;
+}
+
+
+/** 只存不通知：每次启动传输时现读（见 transferPayload），进行中的文件不受影响，下一个文件起生效。 */
+export function applyParallelConnections(count: number) {
+  localStorage.setItem(CONNECTIONS_STORAGE_KEY, String(count));
+}
+
+
+export function initParallelConnections() {
+  const radio = document.querySelector<HTMLInputElement>(
+    `input[name="parallelConnections"][value="${readParallelConnections()}"]`,
+  );
+  if (radio) radio.checked = true;
+}

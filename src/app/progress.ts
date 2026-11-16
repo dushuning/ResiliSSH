@@ -5,13 +5,15 @@ import { icons } from "../ui/icons";
 import { clarifyTransferError } from "./backendText";
 import { SPEED_REFRESH_MS, SPEED_SAMPLE_WINDOW_MS, SPEED_STALE_MS, UI_STALL_WARN_MS } from "./constants";
 import { blockMap, hostInput, legendDoneLabel, legendResumed, legendRetry, localPathInput, mapCaption, mapLegend, miniTransfer, miniTransferFill, miniTransferLabel, miniTransferPct, miniTransferSpeed, navTransferLive, progressBadge, progressDetail, progressPercent, progressSpeed, progressWrap, queueChip, remotePathInput, runSummary, statusText, verifySummary } from "./dom";
-import { fileNameOf, formatBytes, formatEtaSeconds, formatProgressPercent } from "./format";
+import { fileNameOf, floorPercent, formatBytes, formatEtaSeconds, formatProgressPercent } from "./format";
 import { renderQueueResultFiles } from "./queue";
 import { updateDockProgress } from "./dock";
 import { clearReceipt } from "./receipt";
 import { state } from "./state";
 import { isDownloadMode, isReliableMode } from "./transfer";
-import { TransferDirection } from "./types";
+import { ByteRange, TransferDirection } from "./types";
+
+const MS_PER_SECOND = 1000;
 
 /** 进入进行中视图前重置分块地图，并写好「谁 → 哪里」的摘要行。 */
 export function beginRunVisuals() {
@@ -50,7 +52,7 @@ export function beginRunVisuals() {
 
 export function setBadge(
   text: string,
-  kind: "idle" | "uploading" | "retrying" | "verifying" | "error" | "stalled" = "idle",
+  kind: "idle" | "uploading" | "retrying" | "verifying" | "stalled" = "idle",
 ) {
   progressBadge.textContent = text;
   progressBadge.className = "badge";
@@ -67,11 +69,9 @@ export function setStatus(message: string, kind: "normal" | "error" | "retry" = 
 }
 
 
+/** 样式上只有「重试中」需要区别对待（百分比变色），其余阶段外观相同，不必各挂一个类。 */
 export function setProgressState(state: "idle" | "uploading" | "retrying" | "verifying") {
-  progressWrap.classList.remove("uploading", "retrying", "verifying");
-  if (state === "uploading") progressWrap.classList.add("uploading");
-  if (state === "retrying") progressWrap.classList.add("retrying");
-  if (state === "verifying") progressWrap.classList.add("verifying");
+  progressWrap.classList.toggle("retrying", state === "retrying");
 }
 
 
@@ -133,9 +133,10 @@ export function refreshLiveVisuals() {
   miniTransferLabel.textContent =
     (phase === "connecting" ? t("连接中") : phase === "verifying" ? t("校验中") : waiting ? t("重连中") : t("{verb}中", { verb })) +
     queuePart;
-  const pct = state.progressTotalBytes > 0 ? (state.progressTransferredBytes / state.progressTotalBytes) * 100 : 0;
-  miniTransferPct.textContent = `${Math.floor(pct)}%`;
-  miniTransferFill.style.width = `${pct}%`;
+  // 文字用统一的向下取整；填充条用精确比例，移动才平滑。
+  miniTransferPct.textContent = `${floorPercent(state.progressTransferredBytes, state.progressTotalBytes)}%`;
+  const fill = state.progressTotalBytes > 0 ? (state.progressTransferredBytes / state.progressTotalBytes) * 100 : 0;
+  miniTransferFill.style.width = `${fill}%`;
   miniTransferSpeed.textContent = progressSpeed.textContent ?? "";
 }
 
@@ -238,7 +239,6 @@ export function updateProgressDetail(transferred: number, total: number, retries
   } else if (!state.isTransferring) {
     progressDetail.classList.add("hidden");
   }
-  syncProgressStatsRow();
 }
 
 
@@ -259,8 +259,12 @@ export function hideTransferStatus() {
 /**
  * 分块地图需要块内的细粒度进度（部分填充 + 当前块呼吸），所以每个进度事件都刷新；
  * 实际绘制由 BlockMap 按帧合并，事件再频繁也不会过度重绘。
+ * transferred 是已传字节总数，驱动百分比和 Dock 进度；哪些块已完成由 doneRanges 决定
+ * （并行传输时不连续），没有区间的事件由地图按「开头连续的一段」处理。
+ * 这里只更新进度数字与地图；字节明细和侧边栏等「活的」指示由调用方在处理完整个事件后
+ * 各刷新一次（见 handleProgressUpdate），否则一个事件会把同样的文字重写好几遍。
  */
-export function updateProgress(transferred: number, total: number) {
+export function updateProgress(transferred: number, total: number, doneRanges?: ByteRange[]) {
   // 只在传输进行中驱动地图：空闲时恢复断点也会调用这里，不能把断点进度当成本次起点。
   if (!state.isTransferring) return;
   state.progressTotalBytes = total;
@@ -268,19 +272,17 @@ export function updateProgress(transferred: number, total: number) {
   if (state.runStartBytes === null) state.runStartBytes = transferred;
   progressPercent.textContent = formatProgressPercent(transferred, total) || "0%";
   updateDockProgress(transferred, total);
-  blockMap.update(transferred, total);
+  blockMap.update(transferred, total, doneRanges);
   const perCell = blockMap.blocksPerCell;
   mapCaption.textContent =
     perCell > 1
       ? t("{p1} 块 · 每格 {perCell} MB", { p1: blockMap.blockCount.toLocaleString(), perCell })
       : t("{p1} 块 · 每块 1 MB", { p1: blockMap.blockCount.toLocaleString() });
   syncMapLegend();
-  updateProgressDetail(transferred, total);
-  refreshLiveVisuals();
 }
 
 
-/** 图例只列出地图上真实出现的状态：全新上传没有「之前已续传」，没断过线就不提「重连处」。 */
+/** 图例只列出地图上真实出现的状态：全新上传没有「此前已完成」，没断过线就不提「重连处」。 */
 export function syncMapLegend() {
   const perBlock = blockMap.verifiesPerBlock;
   mapLegend.classList.toggle("per-block", perBlock);
@@ -303,7 +305,6 @@ export function resetSpeedTracker() {
   hideProgressSpeed();
   progressWrap.classList.remove("stalled");
   progressDetail.classList.add("hidden");
-  syncProgressStatsRow();
 }
 
 
@@ -378,7 +379,6 @@ export function refreshSpeedDisplay() {
 
   if (speed <= 0) {
     showProgressSpeed("0 B/s");
-    refreshLiveVisuals();
     return;
   }
 
@@ -390,20 +390,25 @@ export function refreshSpeedDisplay() {
     const eta = formatEtaSeconds((total - transferred) / speed);
     if (eta) speedText += t(" · 约 {eta}", { eta });
   }
+  // 侧边栏的速度文字已由 showProgressSpeed 同步，不需要再整体刷新一遍活动指示。
   showProgressSpeed(speedText);
-  refreshLiveVisuals();
 }
 
 
 export function refreshStallUi() {
-  if (!state.isTransferring || state.lastProgressEventAt === 0) return;
+  if (!state.isTransferring) return;
 
+  // 连接阶段要先于下面的「尚无进度事件」判断：此时本来就没有进度事件，
+  // 但弱网下握手可能要十几秒，必须让用户看到等待时间在走，而不是一行静止的文字。
   if (state.isConnecting) {
     applyActiveTransferBadge(isDownloadMode() ? "download" : "upload");
-    showProgressSpeed(t("正在建立 SSH 连接…"));
+    const secs = Math.floor((Date.now() - state.runStartedAt) / MS_PER_SECOND);
+    showProgressSpeed(`${t("正在建立 SSH 连接…")} (${t("已等待 {secs}s", { secs })})`);
     refreshLiveVisuals();
     return;
   }
+
+  if (state.lastProgressEventAt === 0) return;
 
   if (state.isChunkVerifying) {
     return;

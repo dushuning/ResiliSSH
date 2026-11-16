@@ -276,6 +276,7 @@ export const pickFolderBtn = document.querySelector<HTMLButtonElement>("#pickFol
 export const languageHint = document.querySelector<HTMLParagraphElement>("#languageHint")!;
 
 
+export const historyStatus = document.querySelector<HTMLDivElement>("#historyStatus")!;
 export const copyLogBtn = document.querySelector<HTMLButtonElement>("#copyLogBtn")!;
 export const resultReceipt = document.querySelector<HTMLElement>("#resultReceipt")!;
 export const copyReceiptBtn = document.querySelector<HTMLButtonElement>("#copyReceiptBtn")!;

@@ -7,7 +7,8 @@ import { cancelBtn, commandConsole, commandConsoleCmd, commandMenu, commandOutpu
 import { describeError, fileNameOf, remoteDirOf } from "./format";
 import { setBadge, setStatus } from "./progress";
 import { currentProfile, saveProfileExtras } from "./servers";
-import { state } from "./state";
+import { isBusy, state } from "./state";
+import { syncBusyLock } from "./transfer";
 import { CommandContext, CommandOutcome } from "./types";
 
 /** 控制台只保留最近若干行，长时间输出的命令也不会让 DOM 无限增长。 */
@@ -34,7 +35,7 @@ export function updateSaveCommandButton() {
   const profile = currentProfile();
   const command = postCommandInput.value.trim();
   const saved = Boolean(profile && command && profile.post_commands.includes(command));
-  saveCommandBtn.disabled = !profile || !command || state.isTransferring;
+  saveCommandBtn.disabled = !profile || !command || isBusy();
   saveCommandBtn.classList.toggle("is-active", saved);
   saveCommandBtn.innerHTML = saved ? icons.starFilled : icons.star;
   saveCommandBtn.title = !profile
@@ -123,13 +124,15 @@ export async function runPostCommand(
   context: CommandContext,
 ): Promise<{ outcome: CommandOutcome | null; error?: string }> {
   state.commandRunning = true;
+  // 命令用的是当前表单里的连接参数，执行期间表单必须保持锁定，也不能另起一次传输。
+  syncBusyLock();
   commandOutput.textContent = "";
   commandConsoleCmd.textContent = template;
   commandConsole.classList.remove("hidden");
   setBadge(t("执行命令中"), "verifying");
   cancelBtn.textContent = t("停止命令");
   cancelBtn.disabled = false;
-  cancelBtn.classList.remove("hidden", "is-cancelling");
+  cancelBtn.classList.remove("hidden");
   navTransferLive.classList.remove("hidden");
   try {
     const outcome = await invoke<CommandOutcome>("run_remote_command", {
@@ -140,8 +143,11 @@ export async function runPostCommand(
     return { outcome: null, error: describeError(error) };
   } finally {
     state.commandRunning = false;
+    syncBusyLock();
     commandConsole.classList.add("hidden");
     cancelBtn.classList.add("hidden");
+    // 点过「停止命令」后按钮处于禁用状态；这里不复位的话，下一次传输的「取消传输」会一直点不了。
+    cancelBtn.disabled = false;
     navTransferLive.classList.add("hidden");
   }
 }

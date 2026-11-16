@@ -4,11 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { connectionPayload, validateConnectionBeforeTransfer } from "./connection";
 import { PROBE_DEBOUNCE_MS } from "./constants";
 import { showConfirm } from "./dialogs";
-import { clearCheckpointBtn, forceOverwriteInput, localPathInput, remotePathInput, statePanelDetail, statePanelHint, statePanelTitle, transferStatePanel } from "./dom";
-import { formatBytes } from "./format";
+import { clearCheckpointBtn, forceOverwriteInput, jumpProfileSelect, localPathInput, remotePathInput, statePanelDetail, statePanelHint, statePanelTitle, transferStatePanel } from "./dom";
+import { floorPercent, formatBytes } from "./format";
 import { renderPendingTransfers } from "./history";
-import { isQueueSelection } from "./paths";
-import { state } from "./state";
+import { checkpointMatchesForm, isQueueSelection } from "./paths";
+import { isBusy, state } from "./state";
 import { getActiveCheckpoint, getTransferredBytes, isDownloadMode } from "./transfer";
 import { DownloadCheckpoint, RemoteDownloadProbe, RemoteUploadProbe, TransferStateView, UploadCheckpoint } from "./types";
 
@@ -18,12 +18,13 @@ export function analyzeCheckpointState(
 ): TransferStateView {
   const transferred = getTransferredBytes(cp);
   const total = cp.file_size;
-  const pct = total > 0 ? Math.round((transferred / total) * 100) : 0;
+  const pct = floorPercent(transferred, total);
   const action = download ? t("开始下载") : t("开始上传");
   const verifyReadFailed = cp.failure_reason === "verify_read_failed";
   const needsRedo =
     cp.failure_reason === "hash_mismatch" ||
-    (cp.status === "failed" && transferred >= total && !verifyReadFailed);
+    // total 为 0 的空文件「已传 >= 总量」恒成立，不能据此断定校验失败。
+    (cp.status === "failed" && total > 0 && transferred >= total && !verifyReadFailed);
 
   if (verifyReadFailed && transferred >= total) {
     return {
@@ -181,8 +182,10 @@ export function updateTransferStatePanel() {
     return;
   }
 
+  // 断点只有与当前表单指向同一个文件、同一台服务器时后端才会续传；
+  // 表单已改成别的目标时还显示「可续传 40%」是在承诺一件不会发生的事。
   const cp = getActiveCheckpoint();
-  if (cp && cp.status !== "completed") {
+  if (cp && cp.status !== "completed" && checkpointMatchesForm(cp, isDownloadMode())) {
     renderTransferStatePanel(analyzeCheckpointState(cp, isDownloadMode()));
     return;
   }
@@ -196,14 +199,37 @@ export function updateTransferStatePanel() {
 }
 
 
+/**
+ * 一次预检的目标：方向 + 服务器 + 两端路径。用于判断「这个问题是否已经问过 / 正在问」，
+ * 不含密码等凭据——凭据不影响预检结论，失败的预检也不会被记住。
+ */
+function currentProbeKey(): string {
+  const { host, port, username } = connectionPayload();
+  return JSON.stringify([
+    state.transferDirection,
+    host,
+    port,
+    username,
+    jumpProfileSelect.value,
+    localPathInput.value.trim(),
+    remotePathInput.value.trim(),
+  ]);
+}
+
+
+/** 调用时表单必须仍是发起预检时的内容（开始流程中表单已锁定；后台预检由代次保证），这样记下的目标才与结果对应。 */
 export function setLastProbe(probe: RemoteUploadProbe | RemoteDownloadProbe | null) {
   state.lastProbe = probe;
+  state.lastProbeKey = probe ? currentProbeKey() : null;
   updateTransferStatePanel();
 }
 
 
 export function clearLastProbe() {
+  // 同时作废在途的后台预检：否则改了路径或切了方向之后，旧请求的结果还会被写回面板。
+  state.backgroundProbeGeneration++;
   state.lastProbe = null;
+  state.lastProbeKey = null;
   updateTransferStatePanel();
 }
 
@@ -223,11 +249,13 @@ export function clearProbeResult() {
 }
 
 
-/** 用户正在编辑路径时静默丢弃预检结果，不触发窗口自适应 */
+/**
+ * 用户正在编辑路径：丢弃预检结果，并作废在途的后台预检（即使当前没有结果在显示——
+ * 否则针对旧路径的请求稍后返回，会把过时的结论写回面板）。
+ * 面板要重新判断而不是直接隐藏：路径改回与断点一致时，断点状态应当重新出现。
+ */
 export function invalidateProbeOnEdit() {
-  if (!state.lastProbe) return;
-  state.lastProbe = null;
-  hideTransferStatePanel();
+  clearLastProbe();
 }
 
 
@@ -238,13 +266,7 @@ export async function probeRemoteDownload(): Promise<RemoteDownloadProbe> {
   if (!localPath) throw new Error(t("请填写本地保存路径"));
   if (!remotePath) throw new Error(t("请填写远端文件路径"));
 
-  return invoke<RemoteDownloadProbe>("probe_remote_download", {
-    request: {
-      ...connectionPayload(),
-      local_path: localPath,
-      remote_path: remotePath,
-    },
-  });
+  return sharedProbe<RemoteDownloadProbe>("probe_remote_download", localPath, remotePath);
 }
 
 
@@ -288,13 +310,39 @@ export async function probeRemoteUpload(): Promise<RemoteUploadProbe> {
   if (!localPath) throw new Error(t("请选择本地文件"));
   if (!remotePath) throw new Error(t("请填写远端路径"));
 
-  return invoke<RemoteUploadProbe>("probe_remote_upload", {
+  return sharedProbe<RemoteUploadProbe>("probe_remote_upload", localPath, remotePath);
+}
+
+
+/**
+ * 发出预检请求；目标相同的请求已在途时直接复用它。
+ * 典型场景：点「开始」时路径框失焦触发了后台预检，紧接着开始流程又要预检同一个目标——
+ * 每次预检都是一条完整的 SSH 连接，弱网下重复一次就是多等几秒。
+ * 目标里包含方向，所以复用到的结果类型一定与 T 一致。
+ */
+function sharedProbe<T extends RemoteUploadProbe | RemoteDownloadProbe>(
+  command: "probe_remote_upload" | "probe_remote_download",
+  localPath: string,
+  remotePath: string,
+): Promise<T> {
+  const key = currentProbeKey();
+  if (state.inflightProbe?.key === key) return state.inflightProbe.promise as Promise<T>;
+
+  const promise = invoke<T>(command, {
     request: {
       ...connectionPayload(),
       local_path: localPath,
       remote_path: remotePath,
     },
   });
+  const entry = { key, promise };
+  state.inflightProbe = entry;
+  // 成功失败都要让位；只清自己这一条，免得误清之后发出的另一个请求。
+  const release = () => {
+    if (state.inflightProbe === entry) state.inflightProbe = null;
+  };
+  promise.then(release, release);
+  return promise;
 }
 
 
@@ -341,7 +389,7 @@ export function clearProbeDebounce() {
 
 
 export function scheduleBackgroundProbe() {
-  if (state.isTransferring) return;
+  if (isBusy()) return;
   clearProbeDebounce();
   state.probeDebounceTimer = window.setTimeout(() => {
     state.probeDebounceTimer = null;
@@ -351,10 +399,13 @@ export function scheduleBackgroundProbe() {
 
 
 export async function runBackgroundProbe() {
-  if (state.isTransferring || isQueueSelection()) return;
+  // 开始流程自己会预检（见 startOneUpload / startOneDownload），此时后台再发一次只是多开一条连接。
+  if (isBusy() || isQueueSelection()) return;
   const localPath = localPathInput.value.trim();
   const remotePath = remotePathInput.value.trim();
   if (!localPath || !remotePath) return;
+  // 结论还显示着、表单也没变：只是焦点进出了一次输入框，不值得再连一次服务器。
+  if (state.lastProbe && state.lastProbeKey === currentProbeKey()) return;
 
   const gen = ++state.backgroundProbeGeneration;
 
@@ -363,7 +414,7 @@ export async function runBackgroundProbe() {
     const probe = isDownloadMode()
       ? await probeRemoteDownload()
       : await probeRemoteUpload();
-    if (gen !== state.backgroundProbeGeneration || state.isTransferring) return;
+    if (gen !== state.backgroundProbeGeneration || isBusy()) return;
     setLastProbe(probe);
   } catch {
     // 预检失败时不打扰用户，点开始时会再报

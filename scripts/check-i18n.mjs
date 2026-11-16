@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 const SRC = new URL("../src/", import.meta.url).pathname;
 /** 有意保留的中文：语言名需以本语言显示；与后端原文做匹配的关键字不能翻译。 */
-const ALLOWED = ["中文", "已有下载任务在进行中", "已有上传任务在进行中", "远端路径错误", "远端路径「", "请填写密码", "认证失败", "服务器拒绝了提供的凭据", "SFTP 错误"];
+const ALLOWED = ["中文", "远端路径错误", "远端路径「", "请填写密码", "认证失败", "服务器拒绝了提供的凭据", "SFTP 错误", "本地文件读取失败", "本地文件写入失败", "本地文件在上传过程中被修改", "远端文件已被修改"];
 
 function walk(dir) {
   return readdirSync(dir).flatMap((name) => {

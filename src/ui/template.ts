@@ -1,10 +1,11 @@
 import { t } from "../i18n";
+import { PARALLEL_CONNECTION_CHOICES } from "../app/constants";
 import { icons } from "./icons";
 
 /**
  * 应用骨架：侧边栏导航 + 多页面。每个页面固定在一屏内，不再靠折叠和滚动容纳功能——
  * 新功能加一个页面/侧边栏项即可，不会挤压传输主流程。
- * 元素 id 与 main.ts 中的逻辑一一对应，修改时需同步。
+ * 元素 id 由 app/dom.ts 统一查询并导出给各模块，增删或改名时需同步那里。
  */
 export function appTemplate(appName: string): string {
   return `
@@ -161,7 +162,7 @@ export function appTemplate(appName: string): string {
                 <canvas class="block-map" id="blockMap" aria-label="${t("分块传输进度")}"></canvas>
               </div>
               <div class="map-legend" id="mapLegend">
-                <span class="hidden" id="legendResumed"><i class="swatch swatch-resumed"></i>${t("之前已续传")}</span>
+                <span class="hidden" id="legendResumed"><i class="swatch swatch-resumed"></i>${t("此前已完成")}</span>
                 <span><i class="swatch swatch-done"></i><span id="legendDoneLabel">${t("本次已传")}</span></span>
                 <span><i class="swatch swatch-active"></i>${t("正在传输")}</span>
                 <span><i class="swatch swatch-pending"></i>${t("待传")}</span>
@@ -295,6 +296,9 @@ export function appTemplate(appName: string): string {
       <section class="page hidden" id="page-history" data-page="history">
         <header class="page-header" data-tauri-drag-region>
           <h1>${t("历史")}</h1>
+          <div class="header-tools">
+            <div class="status" id="historyStatus" role="status"></div>
+          </div>
         </header>
         <div class="page-body history-layout">
           <section class="history-section" id="pendingSection">
@@ -356,6 +360,16 @@ export function appTemplate(appName: string): string {
               </div>
             </div>
             <p class="hint" id="languageHint"></p>
+          </section>
+          <section class="settings-group">
+            <h2>${t("传输")}</h2>
+            <div class="settings-row">
+              <span>${t("并行连接数")}</span>
+              <div class="segmented segmented-small" role="radiogroup" aria-label="${t("并行连接数")}">
+                ${PARALLEL_CONNECTION_CHOICES.map((count) => `<label><input type="radio" name="parallelConnections" value="${count}" /><span>${count}</span></label>`).join("")}
+              </div>
+            </div>
+            <p class="hint">${t("弱网下多开几条连接能明显加快大文件；小文件始终只用一条。服务器限制了每个用户的连接数时请调小。")}</p>
           </section>
           <section class="settings-group">
             <h2>${t("数据与安全")}</h2>
