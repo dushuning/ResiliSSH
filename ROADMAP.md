@@ -31,6 +31,11 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
+### Unreleased
+- **Faster on bad links**: parallel connections, server-side verification, only changed blocks
+- **Unattended**: whole batches resume after a restart, immediate reconnect on network change
+- **Command line**: `resiliss put / get` on the same engine
+
 ## Project health (before wider release)
 
 | Item | Why |
@@ -39,7 +44,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Later / maybe
 
-bandwidth limit · keep running from the menu bar · Windows & Linux builds (Tauri supports them; needs testing and packaging).
+bandwidth limit · keep running from the menu bar · Linux build of the command-line tool · Windows & Linux desktop builds (Tauri supports them; needs testing and packaging) · rolling-checksum delta for files whose content shifts.
 
 ## Out of scope
 
@@ -50,4 +55,4 @@ These are deliberate non-goals — good tools already exist for them:
 - Deployment orchestration: multi-server fan-out, pipelines, watching folders for changes
 - Two-way sync
 
-Issues and pull requests that fit the positioning are very welcome. For anything on the "Next" list, comment on (or open) an issue so we don't duplicate work.
+Issues and pull requests that fit the positioning are very welcome. For anything on the "Later / maybe" list, comment on (or open) an issue so we don't duplicate work.

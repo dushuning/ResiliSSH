@@ -4,6 +4,51 @@
 
 ## [Unreleased]
 
+### Added
+- Parallel transfers: large files (32 MB and up) are split across several SSH connections, 4 by default and configurable from 1 to 8 in Settings. Each connection takes the next unfinished piece, so a slow or dropped connection only delays its own piece. Progress is now recorded as a set of completed ranges; checkpoints from earlier versions still resume.
+- Only changed blocks are transferred when an older version of the file already exists at the destination (uploads copy the old file on the server and compare block hashes; downloads do the same locally). Needs command execution on the server; otherwise the file is transferred in full as before.
+- Verification on the server: per-block checks in Reliable mode and the final whole-file SHA-256 are computed by the server (`sha256sum`, `shasum` or `openssl`) instead of reading the data back, roughly halving the traffic of a verified transfer. SFTP-only servers fall back to read-back automatically.
+- `resiliss` command-line tool (`put`, `get`, `servers`) built on the same engine, with its own per-task checkpoints so that re-running a command resumes it.
+- A network change (new Wi‑Fi, VPN reconnect) is noticed within a couple of seconds and the transfer reconnects immediately instead of waiting for a timeout.
+- A batch can be continued after quitting the app.
+
+### Changed
+- Much less waiting between "Test connection", pressing Start and seeing progress: the app now keeps the SSH connection it just used for up to 45 seconds and hands it to the next step (preflight, remote browser, the transfer itself, the next file of a batch, the post-transfer command) instead of doing a full handshake for each. A batch of many small files runs over one connection.
+- Pressing Start gives immediate feedback ("Connecting to the server…", "Checking the remote file…"); leaving a path field no longer triggers a duplicate preflight.
+- Inputs stay locked for a whole batch and while a post-transfer command runs, and a batch can be cancelled between files.
+- A transfer whose data is complete but was interrupted before verification or the final replace (cancel, quit, network) now only finishes those steps instead of starting over. Network errors during final verification are retried automatically.
+- A rejected password or key now stops the transfer instead of retrying forever (which could trigger fail2ban or an account lockout); timeouts during authentication are still retried.
+- Reliable mode skips the final whole-file hash only if every block was read back; a transfer that used Fast mode for part of the file is hashed in full.
+- Saving a server updates the one being edited (renaming keeps its bookmarks and commands); a name that is already taken is refused instead of silently overwriting the other server.
+- Zero-byte files can be downloaded (folders often contain `__init__.py`, `.gitkeep`).
+
+### Fixed
+- Transfers were reconnecting needlessly: with libssh2's keepalive enabled, any pause that happened to span a keepalive deadline was reported as a timeout. Keepalive is now only used where the connection is otherwise idle.
+- A file modified while it was being transferred (local file during upload, remote file during download or between resume attempts) is now detected and reported instead of producing a file stitched from two versions.
+- Servers whose `known_hosts` entry uses a different key type than the default (e.g. only ECDSA or RSA) were reported as "host key changed"; the known type is now negotiated first. A host on a non-default port is no longer compared against the port-22 entry of the same name.
+- Preflight could offer to resume when the same file was re-sent to a parent folder of the previous target.
+- Switching a server from password to key login left the old password in the Keychain.
+- Concurrent writes to the history or server list could lose an update or corrupt the file; an unreadable file is now moved aside instead of blocking every later operation.
+- Clearing a checkpoint while its transfer is running is refused; a transfer thread that crashes can no longer leave the app stuck in "a transfer is already in progress".
+- Remote browser: symlinks to folders can be entered, selected symlinks are downloaded, and a network error while checking for existing files is reported instead of being read as "nothing exists".
+- The checkpoint panel no longer claims "resumable" for a different file or server; switching direction no longer overwrites the form; reusing a retried batch keeps its folder structure; two confirmation dialogs in quick succession no longer mix up their answers.
+- Dark mode: the command console is distinguishable from the window background.
+- Uploading to an existing remote directory entered without a trailing `/` (e.g. `/opt/app`) reported success but left the file as a hidden `.app.resiliss-part` inside that directory. The target is now resolved after connecting, before the temporary file is created.
+- A post-transfer command that stayed silent for more than about 30 seconds was reported as "no output for 10 minutes". The 10-minute idle limit is now measured as documented.
+- Post-transfer command variables could be expanded twice when a file name itself contained a placeholder such as `{files}`, breaking the shell quoting. Command output containing multi-byte characters is no longer garbled at read boundaries.
+- Every successful transfer emitted two "completed" events, which could shift batch results by one file and run the post-transfer command twice.
+- Preflight could report "only verification will be retried" (and skip the overwrite confirmation) because of a failed checkpoint that belonged to a different file. Existing 0-byte remote files now also ask for confirmation.
+- Relative remote paths (e.g. `uploads/app.jar`) had their parent folders created under `/` instead of the SFTP start directory.
+- Remote paths containing words such as `auth` could turn a transient error into a permanent failure.
+- A hung SSH handshake (server accepts the TCP connection but never answers) now times out after 90 s and is retried instead of blocking forever.
+- Resume verification on very slow links no longer trips the stall watchdog in a loop.
+- The reconnect delay now backs off (1 s → 15 s) when the server accepts connections but no data gets through, instead of reconnecting every second.
+- A lost reply from the atomic-replace `mv` is no longer treated as success.
+- Private key paths typed as `~/.ssh/…` are expanded when connecting; `Match` blocks in `~/.ssh/config` no longer overwrite the preceding host's settings on import.
+- Closing the window during a transfer now actually closes it after confirmation (missing window permission).
+- Cancelling a batch no longer replaces the destination folder field with the current file's full path.
+- After stopping a post-transfer command, the Cancel button of the next transfer stayed disabled; ⌘↩ on a success page re-ran the transfer and its command; local file errors were shown as "remote path error"; speeds below 1 KB/s showed unrounded decimals.
+
 ## [1.2.0] - 2026-10-10
 
 ### Added

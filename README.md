@@ -34,7 +34,10 @@ ResiliSSH treats every transfer as something that **must finish correctly**:
 - Upload and download files one at a time or in **batches** — drag in several files or a **whole folder**, or multi-select remote files and folders to download (folder structure is kept both ways)
 - **Preflight**: refuses early if the destination disk (server or local) is out of space; skips files that are already identical (SHA-256) in either direction
 - **Safe replace**: both uploads and downloads are written to a hidden temporary file next to the target and swapped in only after verification — neither the server nor your Downloads folder ever shows a half-written file, a failed transfer leaves the old version in place, and replaced remote files keep their permissions
-- Block-level resume with integrity check at the resume boundary
+- **Parallel connections**: large files are split across up to 8 SSH connections (4 by default) — on lossy links a single TCP stream crawls, several add up
+- **Only what changed**: when an older version already exists at the destination, unchanged 1 MB blocks are detected by hash and not sent again
+- **Verification without the round trip**: when the server allows commands, it computes the SHA-256 itself, so verifying no longer means reading the data back over the network (falls back to read-back on SFTP-only servers)
+- Block-level resume with integrity check at the resume boundary; a whole batch can be continued after quitting the app
 - Two modes: *Reliable* (read back every block) and *Fast* (verify once at the end)
 - A live **block map** shows what was resumed, what's verified, where the connection dropped
 - **Then run** — optionally execute a command on the server after a verified upload (e.g. `sudo systemctl restart app`), with `{remote_dir}` `{file_name}` `{remote_path}` `{files}` variables safely shell-quoted
@@ -86,7 +89,9 @@ If you need those, great tools already exist. ResiliSSH does one job: getting fi
 | | ResiliSSH | scp | rsync -P | Typical SFTP client |
 |---|---|---|---|---|
 | Automatic reconnect & resume | ✅ unlimited | ❌ | manual re-run | varies |
-| Per-block read-back verification | ✅ | ❌ | ❌ | rare |
+| Per-block verification | ✅ | ❌ | ❌ | rare |
+| Parallel connections for one file | ✅ | ❌ | ❌ | some |
+| Skips unchanged blocks | ✅ same-offset blocks | ❌ | ✅ rolling checksum | rare |
 | Whole-file check after transfer | ✅ SHA-256 | ❌ | ✅ built-in checksum | rarely |
 | Host key confirmation UI | ✅ | terminal prompt | terminal prompt | ✅ |
 | Learning curve | fill a form | CLI | CLI | feature-heavy |
@@ -119,6 +124,20 @@ npm run app            # release build → src-tauri/target/release/bundle/
 5. Closed the app mid-transfer? Open **History** and press **Resume**.
 
 Keyboard: ⌘1–⌘5 switch pages, ⌘O picks a file, ⌘↩ starts.
+
+## Command line
+
+The same engine is available as `resiliss`, for scripts, CI and machines without a desktop:
+
+```bash
+cargo install --path src-tauri --bin resiliss     # or: cargo build --release --bin resiliss
+
+resiliss put app.jar deploy@prod.example.com:/opt/app/      # upload, verified, swapped in atomically
+resiliss put dist/*.js @prod:/srv/www/js/                   # "@prod" = a server saved in the desktop app
+resiliss get deploy@prod.example.com:/var/backups/db.dump ./backups/
+```
+
+Interrupted (Ctrl+C, power loss, dropped network)? Run the same command again — it resumes. `resiliss --help` lists the options (`-i` key, `-J` jump host, `-c` connections, `--fast`, `--accept-new`). Passwords come from `RESILISS_PASSWORD` or, for saved servers, the Keychain — never from the command line.
 
 ## Where your data lives
 
