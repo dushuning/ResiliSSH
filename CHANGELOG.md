@@ -11,6 +11,7 @@
 - `resiliss` command-line tool (`put`, `get`, `servers`) built on the same engine, with its own per-task checkpoints so that re-running a command resumes it.
 - A network change (new Wi‑Fi, VPN reconnect) is noticed within a couple of seconds and the transfer reconnects immediately instead of waiting for a timeout.
 - A batch can be continued after quitting the app.
+- `scripts/bench-weak-network.sh` and `scripts/netem-proxy.py`: a reproducible comparison against `scp` and `rsync` over a simulated slow, flaky link (no root needed); results are in the README.
 
 ### Changed
 - Interface refresh: the primary action and the selected server use the gradient of the app icon; the empty drop area is now the focal point of the Transfer page; confirmation dialogs name the action on the button ("Upload and replace", "Delete") with a red button for destructive ones, and the remote browser's primary button is "Choose this folder" instead of "Close".
@@ -26,6 +27,7 @@
 - Zero-byte files can be downloaded (folders often contain `__init__.py`, `.gitkeep`).
 
 ### Fixed
+- A connection dropped in the middle of authentication was reported with the same code as a rejected key and stopped the transfer; only an explicit rejection by the server is permanent now. The command-line tool also retries its initial connection instead of exiting on the first network error. (Both found by the weak-network benchmark.)
 - Transfers were reconnecting needlessly: with libssh2's keepalive enabled, any pause that happened to span a keepalive deadline was reported as a timeout. Keepalive is now only used where the connection is otherwise idle.
 - A file modified while it was being transferred (local file during upload, remote file during download or between resume attempts) is now detected and reported instead of producing a file stitched from two versions.
 - Servers whose `known_hosts` entry uses a different key type than the default (e.g. only ECDSA or RSA) were reported as "host key changed"; the known type is now negotiated first. A host on a non-default port is no longer compared against the port-22 entry of the same name.

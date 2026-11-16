@@ -323,26 +323,54 @@ fn resolve_target(spec: &str, options: &Options) -> Result<(ConnectionConfig, St
 
 /// 连接一次以确认凭据可用，并处理首次连接的指纹确认。成功后这条连接留在连接池里，传输直接接着用。
 fn connect_and_trust(config: &ConnectionConfig, options: &Options) -> Result<(), String> {
-    // 每一跳最多需要确认一次，链路再长也不会超过这个次数。
-    for _ in 0..=sftp::MAX_JUMP_HOPS + 1 {
+    let mut confirmations = 0;
+    let mut backoff = crate::retry::Backoff::new();
+    // 这一步连不上和传输中途断线是同一回事：网络问题一直重试，只有重连也不会好的错误才放弃。
+    // 否则脚本里的一次 `resiliss put` 会因为握手时的一下抖动直接失败，传输引擎的无限重试根本没机会上场。
+    let retry_later = |err: &ConnectError, backoff: &mut crate::retry::Backoff| {
+        let delay_ms = backoff.next_delay_ms(0);
+        announce_retry(&tr!(
+            format!("连接失败，{delay_ms}ms 后重试: {err}"),
+            format!("Connection failed, retrying in {delay_ms}ms: {err}")
+        ));
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    };
+    loop {
         let (unknown, fingerprint) = match sftp::test_connection(config) {
             Ok(_) => return Ok(()),
             Err(ConnectError::HostKeyUnknown(fingerprint)) => (config, fingerprint),
             Err(ConnectError::Jump { source, .. }) => match (*source, config.jump.as_deref()) {
                 (ConnectError::HostKeyUnknown(fingerprint), Some(jump)) => (jump, fingerprint),
-                (other, _) => return Err(other.to_string()),
+                (other, _) if other.is_permanent() => return Err(other.to_string()),
+                (other, _) => {
+                    retry_later(&other, &mut backoff);
+                    continue;
+                }
             },
-            Err(other) => return Err(other.to_string()),
+            Err(other) if other.is_permanent() => return Err(other.to_string()),
+            Err(other) => {
+                retry_later(&other, &mut backoff);
+                continue;
+            }
         };
+        // 每一跳最多需要确认一次，链路再长也不会超过这个次数；超过说明确认没有生效，不能无限问下去。
+        confirmations += 1;
+        if confirmations > sftp::MAX_JUMP_HOPS + 1 {
+            return Err(tr!("无法完成服务器指纹确认", "Could not complete host key confirmation").into());
+        }
         let endpoint = format!("{}:{}", unknown.host, unknown.port);
         if !options.accept_new && !confirm_fingerprint(&endpoint, &fingerprint)? {
             return Err(tr!("未信任该服务器，已取消", "Server not trusted; cancelled").into());
         }
-        let (session, _) = sftp::open_handshake(&unknown.host, unknown.port, unknown.jump.as_deref())
-            .map_err(|e| e.to_string())?;
-        sftp::trust_host_key(&session, &unknown.host, unknown.port, &fingerprint)?;
+        match sftp::open_handshake(&unknown.host, unknown.port, unknown.jump.as_deref()) {
+            Ok((session, _)) => sftp::trust_host_key(&session, &unknown.host, unknown.port, &fingerprint)?,
+            // 写入信任前又断了：回到开头重连，下一轮会再走到这里（用户已确认过，--accept-new 或再答一次）。
+            Err(err) => {
+                confirmations -= 1;
+                retry_later(&err, &mut backoff);
+            }
+        }
     }
-    Err(tr!("无法完成服务器指纹确认", "Could not complete host key confirmation").into())
 }
 
 fn confirm_fingerprint(endpoint: &str, fingerprint: &str) -> Result<bool, String> {
@@ -612,7 +640,9 @@ impl log::Log for StderrLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level().as_str().to_ascii_lowercase(), record.args());
+            // 带上从启动算起的秒数：排查「卡在哪一步、卡了多久」时，先后顺序和间隔比绝对时间有用。
+            let elapsed = LOG_START.get_or_init(Instant::now).elapsed().as_secs_f64();
+            eprintln!("[{elapsed:8.3}s {}] {}", record.level().as_str().to_ascii_lowercase(), record.args());
         }
     }
 
@@ -620,6 +650,7 @@ impl log::Log for StderrLogger {
 }
 
 static LOGGER: StderrLogger = StderrLogger;
+static LOG_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 fn list_servers() -> Result<(), String> {
     let profiles = list_profiles()?;

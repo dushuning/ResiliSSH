@@ -96,6 +96,26 @@ If you need those, great tools already exist. ResiliSSH does one job: getting fi
 | Host key confirmation UI | ✅ | terminal prompt | terminal prompt | ✅ |
 | Learning curve | fill a form | CLI | CLI | feature-heavy |
 
+## Does it actually help?
+
+Measured on one machine with [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh): a 48 MB file through a proxy that adds 100 ms round-trip latency and caps **each connection** at 8 Mbit/s — an approximation of a lossy link, where a single TCP stream is slow but several are each about as fast.
+
+| | Stable but slow link | Every connection dropped about every 20 s |
+|---|---|---|
+| `scp` | 55 s | 137 s (starts over each time) |
+| `rsync --partial --append`, re-run until done | 54 s | 58 s |
+| ResiliSSH, 4 connections (default), Reliable | **26 s** | **27 s** |
+| ResiliSSH, 8 connections, Reliable | 15 s | — |
+| ResiliSSH, 1 connection, Reliable | 69 s | 96 s |
+| ResiliSSH, 1 connection, Reliable, SFTP-only server | 120 s | — |
+
+What this shows, and what it doesn't:
+
+- With the default parallel connections it is about twice as fast as `scp`/`rsync` here, and frequent drops barely slow it down.
+- With a **single** connection it is slower than `scp`/`rsync` (it waits for each 1 MB block to be acknowledged and verified). If your link is fine and one stream already fills it, `rsync` is the better tool.
+- Letting the server compute hashes matters: on an SFTP-only server, verification has to read everything back and takes almost twice as long.
+- The proxy cannot reproduce real packet loss, so treat the numbers as a sanity check of the engine, not as a promise for your network. Run the script yourself — it needs no root and touches nothing outside `/tmp`.
+
 ## Install
 
 **Requirements:** macOS on Apple Silicon or Intel. Developed and tested on recent macOS releases; older versions are untested.

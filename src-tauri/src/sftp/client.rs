@@ -129,18 +129,17 @@ const TCP_CONNECT_TIMEOUT_SECS: u64 = 20;
 const SSH_OPERATION_TIMEOUT_MS: u64 = 30_000;
 /// 需要 keepalive 的场合（见 enable_keepalive）使用的间隔。
 const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 30;
-/// libssh2 的认证类错误码（libssh2.h）：私钥文件读不了或口令不对 / 服务器拒绝凭据 / 公钥不被接受。
+/// libssh2 的认证类错误码（libssh2.h）：私钥文件读不了或口令不对 / 服务器明确拒绝了凭据。
+/// 不包括 -19（PUBLICKEY_UNVERIFIED）：libssh2 在「等认证回复时连接断了」也报这个码
+/// （"Waiting for publickey USERAUTH response"），把它当成被拒绝会让一次断线变成永久失败。
 const LIBSSH2_ERROR_FILE: i32 = -16;
 const LIBSSH2_ERROR_AUTHENTICATION_FAILED: i32 = -18;
-const LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED: i32 = -19;
 
 /// 把认证阶段的 libssh2 错误分成「被拒绝」和「没走完」：前者重试无益，后者（超时、断线）必须继续重试。
 fn auth_error(err: ssh2::Error) -> ConnectError {
     let rejected = matches!(
         err.code(),
-        ssh2::ErrorCode::Session(
-            LIBSSH2_ERROR_FILE | LIBSSH2_ERROR_AUTHENTICATION_FAILED | LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED
-        )
+        ssh2::ErrorCode::Session(LIBSSH2_ERROR_FILE | LIBSSH2_ERROR_AUTHENTICATION_FAILED)
     );
     if rejected {
         ConnectError::AuthRejected(err.to_string())
