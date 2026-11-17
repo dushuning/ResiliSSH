@@ -31,7 +31,7 @@ Single-file SFTP upload/download, 1 MB block resume, automatic reconnect, SHA-25
 
 See [CHANGELOG.md](./CHANGELOG.md) for details.
 
-### Unreleased
+### v2.0.0 — 2026-11
 - **Faster on bad links**: parallel connections, server-side verification, only changed blocks
 - **Unattended**: whole batches resume after a restart, immediate reconnect on network change
 - **Command line**: `resiliss put / get` on the same engine

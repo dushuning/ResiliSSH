@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-17
+
 ### Added
 - Parallel transfers: large files (32 MB and up) are split across several SSH connections, 4 by default and configurable from 1 to 8 in Settings. Each connection takes the next unfinished piece, so a slow or dropped connection only delays its own piece. Progress is now recorded as a set of completed ranges; checkpoints from earlier versions still resume.
 - Only changed blocks are transferred when an older version of the file already exists at the destination (uploads copy the old file on the server and compare block hashes; downloads do the same locally). Needs command execution on the server; otherwise the file is transferred in full as before.
@@ -155,7 +157,8 @@
 - macOS（Apple Silicon / Intel）
 - 构建：`npm run app` → `ResiliSSH.app` / `.dmg`
 
-[Unreleased]: https://github.com/dushuning/ResiliSSH/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/dushuning/ResiliSSH/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/dushuning/ResiliSSH/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/dushuning/ResiliSSH/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dushuning/ResiliSSH/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dushuning/ResiliSSH/releases/tag/v1.0.0
