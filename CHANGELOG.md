@@ -27,6 +27,15 @@
 - Zero-byte files can be downloaded (folders often contain `__init__.py`, `.gitkeep`).
 
 ### Fixed
+- Downloads were three to four times slower than the link allowed: every megabyte the SFTP read-ahead already requested from the server was thrown away and requested again. Downloads now match `scp` on one connection.
+- Uploads on one connection write several blocks per round and verify them in one round trip, instead of pausing twice per megabyte; noticeably faster on fast, high-latency links.
+- A finished and verified transfer could take another minute or more to return, and every dropped connection cost far more than the reconnect itself: closing the file, the hash channel and the session of a broken connection each waited for a full timeout. Broken connections are now torn down immediately.
+- A connection that stops responding without closing is aborted after about 12 seconds when another connection is waiting for work, instead of holding its piece until the 30-second timeout. The handshake timeout is 30 seconds instead of 90.
+- Post-transfer command: output that never ends a line no longer grows without bound, and a command killed by a signal is no longer reported as successful.
+- Files whose name is close to the 255-byte limit could not be transferred because the temporary name was too long.
+- A symlink dropped or selected directly is followed instead of silently ignored; exactly 10,000 files no longer shows the "truncated" warning; failing to write the checkpoint is reported as a local error instead of being retried as a network error.
+- `~/.ssh/config` import follows OpenSSH rules: `Host a b` yields both hosts, `Host *` supplies defaults, the first value of a repeated option wins, `Key=Value` and quoted values are understood.
+- Jump hosts: the forwarding thread no longer leaks a session on exit or spins while the target side is busy.
 - A connection dropped in the middle of authentication was reported with the same code as a rejected key and stopped the transfer; only an explicit rejection by the server is permanent now. The command-line tool also retries its initial connection instead of exiting on the first network error. (Both found by the weak-network benchmark.)
 - Transfers were reconnecting needlessly: with libssh2's keepalive enabled, any pause that happened to span a keepalive deadline was reported as a timeout. Keepalive is now only used where the connection is otherwise idle.
 - A file modified while it was being transferred (local file during upload, remote file during download or between resume attempts) is now detected and reported instead of producing a file stitched from two versions.

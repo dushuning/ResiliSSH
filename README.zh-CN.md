@@ -98,22 +98,20 @@ ResiliSSH 刻意保持小而专注，它**不是**：
 
 ## 到底有没有用？
 
-用 [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh) 在同一台机器上实测：48 MB 的文件，经过一个代理，往返延迟 100 ms、**每条连接**限速 8 Mbit/s——这是对丢包链路的一种近似：单条 TCP 跑不快，但多开几条各自都能跑到差不多的速度。
+用 [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh) 在同一台机器上实测：48 MB 的文件，经过一个代理，往返延迟 100 ms、**每条连接**限速 8 Mbit/s——这是对丢包链路的一种近似：单条 TCP 跑不快，但多开几条各自都能跑到差不多的速度。故障场景每项跑 4 次，表里是耗时范围。
 
-| | 稳定但慢的链路 | 每条连接约每 20 秒断一次 |
-|---|---|---|
-| `scp` | 55 秒 | 137 秒（每次从头再来） |
-| `rsync --partial --append`，断了重跑直到完成 | 54 秒 | 58 秒 |
-| ResiliSSH，4 连接（默认），弱网可靠 | **26 秒** | **27 秒** |
-| ResiliSSH，8 连接，弱网可靠 | 15 秒 | — |
-| ResiliSSH，1 连接，弱网可靠 | 69 秒 | 96 秒 |
-| ResiliSSH，1 连接，弱网可靠，服务器只开放 SFTP | 120 秒 | — |
+| | `scp` / `rsync` | ResiliSSH 1 连接 | ResiliSSH 4 连接（默认） |
+|---|---|---|---|
+| 上传，稳定但慢的链路 | 54 秒 | 64 秒 | **25 秒** |
+| 下载，稳定但慢的链路 | 55 秒 | 55 秒 | **21 秒** |
+| 上传，每条连接约每 20 秒断一次 | `rsync --partial --append` 断了重跑：56–59 秒 · `scp`：传不完 | 79–87 秒 | **25–30 秒** |
+| 上传，每条连接约每 30 秒卡死一次（不通也不断） | `rsync` 加 ssh 保活探测：86–119 秒 | 96–258 秒 | **24–57 秒** |
 
 这些数字说明了什么、没说明什么：
 
-- 用默认的并行连接时，这里比 `scp` / `rsync` 快一倍左右，频繁断线几乎不拖慢它。
-- **只用一条连接**时它比 `scp` / `rsync` 慢（每传完 1 MB 要等确认并校验）。如果你的网络很好、一条连接就能跑满，`rsync` 是更合适的工具。
-- 让服务器自己算哈希很关键：只开放 SFTP 的服务器上校验只能把数据读回来，耗时接近翻倍。
+- 用默认的并行连接时，这里比 `scp` / `rsync` 快一倍以上，断线和卡死几乎不拖慢它。
+- **只用一条连接**时它没有速度优势：上传比 `scp` 慢约 15%（每一轮数据要等确认并校验后才传下一轮），下载持平，连接卡死要等 30 秒超时才能发现。如果你的网络很好、一条连接就能跑满，`rsync` 是更合适的工具。
+- 让服务器自己算哈希很关键：只开放 SFTP 的服务器上校验只能把数据读回来，上传耗时接近翻倍（118 秒对 64 秒）。
 - 代理模拟不了真实的丢包，所以这些数字只是对引擎的一次检验，不是对你的网络的承诺。脚本不需要管理员权限、只在 `/tmp` 下读写，可以自己跑一遍。
 
 ## 安装
@@ -150,7 +148,9 @@ npm run app            # Release 构建，产物在 src-tauri/target/release/bun
 同一套传输引擎也提供命令行版本 `resiliss`，用于脚本、CI 和没有桌面的机器：
 
 ```bash
-cargo install --path src-tauri --bin resiliss     # 或：cargo build --release --bin resiliss
+cargo install --path src-tauri --bin resiliss     # 从源码安装
+# 用 `npm run app:universal` 构建的安装包里也带着它：
+#   ln -s /Applications/ResiliSSH.app/Contents/MacOS/resiliss /usr/local/bin/resiliss
 
 resiliss put app.jar deploy@prod.example.com:/opt/app/      # 上传、校验、原子替换
 resiliss put dist/*.js @prod:/srv/www/js/                   # 「@prod」是图形界面里保存的服务器

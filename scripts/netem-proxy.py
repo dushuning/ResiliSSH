@@ -7,6 +7,7 @@
   --delay-ms   每个方向的固定延迟（往返延迟是它的两倍）
   --rate-kbps  每条连接、每个方向的带宽上限
   --kill-every 每条连接平均存活多少秒后被掐断（指数分布；0 表示不掐）
+  --stall-every 每条连接平均多少秒后变成「黑洞」：不再转发任何数据，但也不断开（0 表示不发生）
 
 模拟不了的：真实丢包下 TCP 拥塞控制的动态。「每条连接各自限速」是对丢包链路的一个近似——
 丢包时单条 TCP 的吞吐被压得很低、而多条连接各自都能拿到差不多的吞吐，这正是并行传输想利用的现象。
@@ -20,6 +21,8 @@ import random
 import time
 
 CHUNK_BYTES = 16 * 1024
+# 变成黑洞的连接保持多久才真正关闭：足够长，让客户端只能靠自己的超时或检测发现它。
+STALL_HOLD_SECS = 600
 # 排队中的数据块上限：到了就暂停读取，把拥堵反压回发送方，而不是无限占用内存。
 QUEUE_CHUNKS = 64
 
@@ -67,8 +70,17 @@ async def handle(client_reader, client_writer, args):
     ]
     if args.kill_every > 0:
         tasks.append(asyncio.create_task(asyncio.sleep(random.expovariate(1 / args.kill_every))))
+    stall = None
+    if args.stall_every > 0:
+        stall = asyncio.create_task(asyncio.sleep(random.expovariate(1 / args.stall_every)))
+        tasks.append(stall)
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if stall is not None and stall.done():
+            # 黑洞：两个方向都停止转发，连接本身留着不关。
+            for task in tasks[:2]:
+                task.cancel()
+            await asyncio.sleep(STALL_HOLD_SECS)
     finally:
         for task in tasks:
             task.cancel()
@@ -88,6 +100,7 @@ async def main():
     parser.add_argument("--delay-ms", type=float, default=0)
     parser.add_argument("--rate-kbps", type=float, default=0)
     parser.add_argument("--kill-every", type=float, default=0)
+    parser.add_argument("--stall-every", type=float, default=0)
     args = parser.parse_args()
     server = await asyncio.start_server(lambda r, w: handle(r, w, args), "127.0.0.1", args.listen)
     async with server:

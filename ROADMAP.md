@@ -44,7 +44,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## Later / maybe
 
-bandwidth limit · keep running from the menu bar · Linux build of the command-line tool · Windows & Linux desktop builds (Tauri supports them; needs testing and packaging) · rolling-checksum delta for files whose content shifts · per-connection stall detection (a connection that goes silent without closing currently holds its piece until the 30 s timeout) · pipelining blocks on a single connection (today one connection is slower than `scp`).
+bandwidth limit · keep running from the menu bar · Linux build of the command-line tool · Windows & Linux desktop builds (Tauri supports them; needs testing and packaging) · rolling-checksum delta for files whose content shifts · closing the remaining gap on a single upload connection (about 15% slower than `scp` at 100 ms round trip) · detecting a silent connection sooner when it is the only one (today it waits for the 30 s timeout).
 
 ## Out of scope
 

@@ -98,23 +98,21 @@ If you need those, great tools already exist. ResiliSSH does one job: getting fi
 
 ## Does it actually help?
 
-Measured on one machine with [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh): a 48 MB file through a proxy that adds 100 ms round-trip latency and caps **each connection** at 8 Mbit/s — an approximation of a lossy link, where a single TCP stream is slow but several are each about as fast.
+Measured on one machine with [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh): a 48 MB file through a proxy that adds 100 ms round-trip latency and caps **each connection** at 8 Mbit/s — an approximation of a lossy link, where a single TCP stream is slow but several are each about as fast. Fault scenarios were run four times each; the range is shown.
 
-| | Stable but slow link | Every connection dropped about every 20 s |
-|---|---|---|
-| `scp` | 55 s | 137 s (starts over each time) |
-| `rsync --partial --append`, re-run until done | 54 s | 58 s |
-| ResiliSSH, 4 connections (default), Reliable | **26 s** | **27 s** |
-| ResiliSSH, 8 connections, Reliable | 15 s | — |
-| ResiliSSH, 1 connection, Reliable | 69 s | 96 s |
-| ResiliSSH, 1 connection, Reliable, SFTP-only server | 120 s | — |
+| | `scp` / `rsync` | ResiliSSH, 1 connection | ResiliSSH, 4 connections (default) |
+|---|---|---|---|
+| Upload, stable but slow link | 54 s | 64 s | **25 s** |
+| Download, stable but slow link | 55 s | 55 s | **21 s** |
+| Upload, every connection dropped about every 20 s | `rsync --partial --append` re-run until done: 56–59 s · `scp`: never finishes | 79–87 s | **25–30 s** |
+| Upload, every connection goes silent about every 30 s (neither working nor closed) | `rsync` with ssh keep-alive probes: 86–119 s | 96–258 s | **24–57 s** |
 
 What this shows, and what it doesn't:
 
-- With the default parallel connections it is about twice as fast as `scp`/`rsync` here, and frequent drops barely slow it down.
-- With a **single** connection it is slower than `scp`/`rsync` (it waits for each 1 MB block to be acknowledged and verified). If your link is fine and one stream already fills it, `rsync` is the better tool.
-- Letting the server compute hashes matters: on an SFTP-only server, verification has to read everything back and takes almost twice as long.
-- The proxy cannot reproduce real packet loss, so treat the numbers as a sanity check of the engine, not as a promise for your network. Run the script yourself — it needs no root and touches nothing outside `/tmp`.
+- With the default parallel connections it is more than twice as fast as `scp`/`rsync` here, and drops or stalls barely slow it down.
+- With a **single** connection it has no speed advantage: uploads are about 15% slower than `scp` (each round of blocks is acknowledged and verified before the next), downloads are on par, and a silent connection is only noticed after a 30-second timeout. If your link is fine and one stream already fills it, `rsync` is the better tool.
+- Letting the server compute hashes matters: on an SFTP-only server, verification has to read everything back and an upload takes almost twice as long (118 s instead of 64 s).
+- The proxy cannot reproduce real packet loss, so treat the numbers as a check of the engine, not as a promise for your network. Run the script yourself — it needs no root and touches nothing outside `/tmp`.
 
 ## Install
 
@@ -150,7 +148,9 @@ Keyboard: ⌘1–⌘5 switch pages, ⌘O picks a file, ⌘↩ starts.
 The same engine is available as `resiliss`, for scripts, CI and machines without a desktop:
 
 ```bash
-cargo install --path src-tauri --bin resiliss     # or: cargo build --release --bin resiliss
+cargo install --path src-tauri --bin resiliss     # from source
+# builds made with `npm run app:universal` also ship it inside the app:
+#   ln -s /Applications/ResiliSSH.app/Contents/MacOS/resiliss /usr/local/bin/resiliss
 
 resiliss put app.jar deploy@prod.example.com:/opt/app/      # upload, verified, swapped in atomically
 resiliss put dist/*.js @prod:/srv/www/js/                   # "@prod" = a server saved in the desktop app

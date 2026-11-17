@@ -11,6 +11,7 @@
     "icon": "tauri icon assets/brand/icon.svg -o src-tauri/icons && rm -rf src-tauri/icons/android src-tauri/icons/ios src-tauri/icons/Square*Logo.png src-tauri/icons/StoreLogo.png && cp src-tauri/icons/128x128@2x.png public/app-logo.png",
     "app:debug": "tauri build --debug",
     "app": "tauri build",
+    "app:universal": "scripts/build-universal.sh",
     "check:i18n": "node scripts/check-i18n.mjs"
   },
   "dependencies": {
