@@ -6,11 +6,12 @@ use super::transfer_common::{
     HASH_READ_BUFFER_SIZE, hex_encode,
 };
 use super::client::{
-    connect_session, is_sftp_not_found, hurry_failed_session, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
+    connect_session, is_sftp_not_found, hurry_failed_session, is_responsive, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
     ConnectionConfig,
 };
 use super::plan::{
-    effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES, PIECE_BYTES,
+    effective_connections, watch_for_stalls, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES,
+    PIECE_BYTES,
 };
 use super::remote_hash::{remote_block_hashes, remote_copy, remote_file_sha256, BlockHasher};
 use super::browse::join_remote_path;
@@ -18,7 +19,7 @@ use super::pool;
 use super::preflight::shell_quote;
 pub use super::transfer_common::{is_staging_file, staging_path};
 use crate::checkpoint::{save_checkpoint, CheckpointStatus, UploadCheckpoint};
-use crate::retry::Backoff;
+use crate::retry::{whole_seconds, Backoff};
 use sha2::{Digest, Sha256};
 use ssh2::{File as RemoteFile, FileStat, OpenFlags, OpenType, Session, Sftp};
 use std::fs::File;
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 /// 所以按实测速度自适应：让每个分片大约 TARGET_SLICE_SECS 秒写完。
 /// 上限是一整段任务：快而延迟高的链路上（跨境专线等）若仍以 1 MB 为上限，每传 1 MB 就要
 /// 空等一个往返写确认、再等一个往返校验，实际速度会被压到带宽的几分之一。
-const MIN_WRITE_SLICE: usize = 64 * 1024;
+const MIN_WRITE_SLICE: usize = 16 * 1024;
 const MAX_WRITE_SLICE: usize = PIECE_BYTES as usize;
 /// 分片每轮最多增长到上一轮写入量的几倍。
 const SLICE_GROWTH_LIMIT: usize = 2;
@@ -52,6 +53,16 @@ fn run_length(write_slice: usize, remaining: u64) -> u64 {
 /// 第一块还没有测速数据，取中间值。
 const INITIAL_WRITE_SLICE: usize = 256 * 1024;
 const TARGET_SLICE_SECS: f64 = 2.0;
+/// 每一轮写完都要空等约两个往返（等写确认、等校验结果）。往返延迟高时把一轮拉长到延迟的这么多倍，
+/// 让空等只占百分之几；延迟低时仍是 TARGET_SLICE_SECS。
+const ROUND_RTT_MULTIPLE: f64 = 40.0;
+/// 一轮最长多少秒：再长的话进度刷新太稀，断线时白传的也多。
+const MAX_ROUND_SECS: f64 = 4.0;
+
+/// 按实测往返延迟决定一轮写入大约持续多久。
+fn round_secs_for(rtt: Duration) -> f64 {
+    (rtt.as_secs_f64() * ROUND_RTT_MULTIPLE).clamp(TARGET_SLICE_SECS, MAX_ROUND_SECS)
+}
 
 pub struct UploadCallbacks {
     pub on_progress: Box<dyn Fn(u64, u64, &str, u32) + Send + Sync>,
@@ -443,6 +454,8 @@ fn replace_with_mv(session: &Session, part: &str, final_path: &str) -> bool {
 
 /// 没有任务可领、但别的连接还在传时，多久再看一眼队列。
 const PLAN_POLL: Duration = Duration::from_millis(100);
+/// 连接空等超过这么久，再用它之前要先探活。
+const IDLE_PROBE_AFTER: Duration = Duration::from_secs(5);
 
 /// 一次上传中各连接共享的状态。
 struct UploadShared<'a> {
@@ -454,6 +467,8 @@ struct UploadShared<'a> {
     callbacks: &'a UploadCallbacks,
     aborts: &'a AbortHandles,
     plan: TransferPlan<UploadError>,
+    /// 一轮写入的目标时长（毫秒），由准备阶段按实测往返延迟设定，各连接共用。
+    round_millis: std::sync::atomic::AtomicU64,
     /// 准备阶段确定的（最终目标, 实际写入的文件）；主连接重连后不必重新确定。
     target: Mutex<Option<(String, String)>>,
 }
@@ -557,6 +572,7 @@ pub fn upload_with_resume(
         callbacks: &callbacks,
         aborts: &aborts,
         plan: TransferPlan::new(),
+        round_millis: std::sync::atomic::AtomicU64::new((TARGET_SLICE_SECS * 1000.0) as u64),
         target: Mutex::new(None),
     };
     let helpers = effective_connections(connections, local_size) - 1;
@@ -572,8 +588,15 @@ pub fn upload_with_resume(
                 log::warn!("cannot start parallel upload connection {index}: {e}");
             }
         }
+        // 后台盯着卡死的连接；发送端在本作用域结束时被丢弃，它随即退出。
+        let (stop_watch, watch_stopped) = std::sync::mpsc::channel::<()>();
+        {
+            let shared = &shared;
+            scope.spawn(move || watch_for_stalls(&shared.plan, shared.aborts, watch_stopped));
+        }
         let result =
             lead_loop(&config, &shared, &resolved_remote_path, staged, started_fingerprint, &force_overwrite);
+        drop(stop_watch);
         shared.plan.finish();
         // 无论成败都打断还登记着的连接（成功时主连接已交还连接池、不在其中，剩下的只有辅助连接）：
         // 辅助连接若正卡在一条已经死掉的连接上做收尾，会让一个早已传完并校验通过的任务迟迟不结束。
@@ -626,19 +649,20 @@ fn lead_loop(
                     let retry_count = increment_retry_count(checkpoint)?;
                     let uploaded_bytes = shared.transferred();
                     let backoff_ms = backoff.next_delay_ms(uploaded_bytes);
+                    let wait = whole_seconds(backoff_ms);
                     let message = if uploaded_bytes > 0 {
                         crate::tr!(
                             format!(
-                                "连接失败（已传 {uploaded_bytes} 字节），{backoff_ms}ms 后重连续传: {err}"
+                                "连接失败（已传 {uploaded_bytes} 字节），{wait} 秒后重连续传: {err}"
                             ),
                             format!(
-                                "Connection failed ({uploaded_bytes} bytes sent), reconnecting to resume in {backoff_ms}ms: {err}"
+                                "Connection failed ({uploaded_bytes} bytes sent), reconnecting to resume in {wait} s: {err}"
                             )
                         )
                     } else {
                         crate::tr!(
-                            format!("连接失败，{backoff_ms}ms 后重试: {err}"),
-                            format!("Connection failed, retrying in {backoff_ms}ms: {err}")
+                            format!("连接失败，{wait} 秒后重试: {err}"),
+                            format!("Connection failed, retrying in {wait} s: {err}")
                         )
                     };
                     log::warn!("upload retry #{retry_count}: {message}");
@@ -721,9 +745,10 @@ fn lead_loop(
                 }
                 write_slice = (write_slice / SLICE_SHRINK_ON_ERROR).max(MIN_WRITE_SLICE);
                 let backoff_ms = backoff.next_delay_ms(shared.transferred());
+                let wait = whole_seconds(backoff_ms);
                 let message = crate::tr!(
-                    format!("传输中断（{err}），{backoff_ms}ms 后重连续传"),
-                    format!("Transfer interrupted ({err}), reconnecting to resume in {backoff_ms}ms")
+                    format!("传输中断（{err}），{wait} 秒后重连续传"),
+                    format!("Transfer interrupted ({err}), reconnecting to resume in {wait} s")
                 );
                 log::warn!("upload retry #{retry_count}: {message}");
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
@@ -800,7 +825,12 @@ fn prepare_upload(
 
     // 只有「不存在」才视为没有数据；其他 stat 失败交给重试循环重连，
     // 否则一次超时就会把断点归零、把已传的数据清掉。
-    let remote_size = match sftp.stat(Path::new(&write_path)) {
+    // 顺便给这次 stat 计时，当作链路的往返延迟（它只有一问一答）。
+    let asked = Instant::now();
+    let stat_result = sftp.stat(Path::new(&write_path));
+    let round_secs = round_secs_for(asked.elapsed());
+    shared.round_millis.store((round_secs * 1000.0) as u64, Ordering::Relaxed);
+    let remote_size = match stat_result {
         Ok(stat) => Some(stat.size.unwrap_or(0)),
         Err(e) if is_sftp_not_found(&e) => None,
         Err(e) => {
@@ -1062,6 +1092,7 @@ fn pump_pieces(
     let mut hasher_started = false;
     // 在文件句柄和哈希通道之后声明，出错时先于它们执行（见 AbortUnlessDone）。
     let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
+    let mut idle_since: Option<Instant> = None;
     // 一轮最多写一整段任务，缓冲区按这个上限分配一次。
     let mut run_buffer = vec![0_u8; PIECE_BYTES as usize];
 
@@ -1069,15 +1100,22 @@ fn pump_pieces(
         if shared.cancel.load(Ordering::Relaxed) {
             return Err(UploadError::Cancelled);
         }
+        // 空等了一阵之后、要接新任务或收尾之前，先确认这条连接还通（原因见 is_responsive）。
+        // 不探的话，最后一段任务会被一条条早已卡死的空闲连接轮流抢走，每条各白等一次操作超时。
+        if idle_since.is_some_and(|since| since.elapsed() >= IDLE_PROBE_AFTER)
+            && shared.plan.status() != PlanStatus::Wait
+        {
+            if !is_responsive(session) {
+                return Err(UploadError::Sftp(
+                    crate::tr!("连接在空闲期间已经失效", "The connection was lost while it was idle").into(),
+                ));
+            }
+            idle_since = None;
+        }
         let mut piece = match shared.plan.claim(connection) {
             Claim::Piece(piece) => piece,
             Claim::Wait => {
-                // 自己没活干、在等别的连接：顺便看看有没有哪条已经卡死，有就打断它，
-                // 它手里的那段会退回队列由我接手，不必等它自己超时。
-                for stalled in shared.plan.take_stalled() {
-                    log::warn!("connection {stalled} made no progress for too long while others wait; aborting it");
-                    shared.aborts.abort(stalled);
-                }
+                idle_since.get_or_insert_with(Instant::now);
                 keepalive_while_idle(session);
                 thread::sleep(PLAN_POLL);
                 continue;
@@ -1107,7 +1145,9 @@ fn pump_pieces(
             })?;
             // 每轮最多比上一轮翻一倍：一次测速偏高（刚连上、缓冲区还空）就直接跳到上限的话，
             // 下一轮可能一口气写出好几秒的数据，取消要等它写完才生效，断线时白传的也多。
-            *write_slice = next_write_slice(run_len, write_started.elapsed()).min(run_len * SLICE_GROWTH_LIMIT);
+            let round_secs = shared.round_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+            *write_slice =
+                next_write_slice(run_len, write_started.elapsed(), round_secs).min(run_len * SLICE_GROWTH_LIMIT);
 
             let read_back = shared.strict.load(Ordering::Relaxed);
             if read_back {
@@ -1362,12 +1402,12 @@ fn open_remote_for_upload(sftp: &Sftp, remote_path: &str) -> Result<RemoteFile, 
 /// 根据上一轮的实测写入速度决定下一个分片的大小（取 2 的幂，避免尺寸频繁抖动）。
 /// 向上取整：实测速度里含有「等确认」的空转时间，总是略低于链路的真实速度；向下取整的话，
 /// 分片会卡在比目标小一档的地方上不去（例如 1 MB/s 的链路永远停在 1 MB，每块都要空等一次）。
-fn next_write_slice(bytes: usize, elapsed: std::time::Duration) -> usize {
+fn next_write_slice(bytes: usize, elapsed: std::time::Duration, round_secs: f64) -> usize {
     let secs = elapsed.as_secs_f64();
     if secs <= 0.0 {
         return MAX_WRITE_SLICE;
     }
-    let target = (bytes as f64 / secs * TARGET_SLICE_SECS) as usize;
+    let target = (bytes as f64 / secs * round_secs) as usize;
     target.next_power_of_two().clamp(MIN_WRITE_SLICE, MAX_WRITE_SLICE)
 }
 
@@ -1411,12 +1451,22 @@ mod tests {
     fn write_slice_adapts_to_measured_speed() {
         use std::time::Duration;
         // 快速链路：1 MB 只用 0.1 s → 用满上限，尽量多的数据在途。
-        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(100)), MAX_WRITE_SLICE);
+        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(100), TARGET_SLICE_SECS), MAX_WRITE_SLICE);
         // 约 300 KB/s：2 秒约 600 KB → 向上取 2 的幂，1 MB。
-        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(3400)), 1 << 20);
-        // 弱网 20 KB/s：退到下限，保证进度仍然频繁刷新。
-        assert_eq!(next_write_slice(1 << 20, Duration::from_secs(50)), MIN_WRITE_SLICE);
-        assert_eq!(next_write_slice(1 << 20, Duration::ZERO), MAX_WRITE_SLICE);
+        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(3400), TARGET_SLICE_SECS), 1 << 20);
+        // 弱网 20 KB/s：2 秒约 40 KB → 64 KB，进度仍然几秒刷新一次。
+        assert_eq!(next_write_slice(1 << 20, Duration::from_secs(50), TARGET_SLICE_SECS), 64 * 1024);
+        // 每秒只有 1 KB 左右：退到下限，一个分片也只要十几秒，不会被当成卡死。
+        assert_eq!(next_write_slice(64 * 1024, Duration::from_secs(60), TARGET_SLICE_SECS), MIN_WRITE_SLICE);
+        assert_eq!(next_write_slice(1 << 20, Duration::ZERO, TARGET_SLICE_SECS), MAX_WRITE_SLICE);
+    }
+
+    #[test]
+    fn rounds_stretch_with_latency_within_limits() {
+        use std::time::Duration;
+        assert_eq!(round_secs_for(Duration::from_millis(2)), TARGET_SLICE_SECS);
+        assert_eq!(round_secs_for(Duration::from_millis(75)), 3.0);
+        assert_eq!(round_secs_for(Duration::from_millis(600)), MAX_ROUND_SECS);
     }
 
     #[test]

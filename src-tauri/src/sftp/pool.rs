@@ -8,9 +8,7 @@
 //! 这里只留一个空闲会话（应用同一时间只面向一台服务器），按连接配置的摘要匹配：
 //! 主机、用户、凭据或跳板机链任何一项不同都不会复用。空闲超过 IDLE_TTL 自动断开。
 
-use super::client::{
-    connect_session, hurry_failed_session, set_operation_timeout, ConnectError, ConnectionConfig, DEFAULT_OPERATION_TIMEOUT_MS,
-};
+use super::client::{connect_session, hurry_failed_session, is_responsive, ConnectError, ConnectionConfig};
 use sha2::{Digest, Sha256};
 use ssh2::Session;
 use std::net::TcpStream;
@@ -21,10 +19,6 @@ use std::time::{Duration, Instant};
 /// 空闲会话最多保留多久。要覆盖「看完预检结果、点确认」的间隔，又不能让一条没人用的连接
 /// 长时间挂在服务器上；也必须远小于跳板机转发线程的空闲上限，否则会被它先掐断。
 const IDLE_TTL: Duration = Duration::from_secs(45);
-/// 复用前探活的超时。链路已经悄悄断掉（NAT 超时、切换网络）时不能按常规的 30 秒去等，
-/// 那比重新连接还慢；探活失败就当它不存在，照常新建连接。
-const LIVENESS_TIMEOUT_MS: u64 = 3_000;
-
 struct Idle {
     key: [u8; 32],
     session: Session,
@@ -61,14 +55,6 @@ fn config_key(config: &ConnectionConfig) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// 会话是否还通：开一个通道再关掉，约两个往返。
-fn is_alive(session: &Session) -> bool {
-    set_operation_timeout(session, LIVENESS_TIMEOUT_MS);
-    let alive = session.channel_session().is_ok();
-    set_operation_timeout(session, DEFAULT_OPERATION_TIMEOUT_MS);
-    alive
-}
-
 /// 取出与该配置匹配、未过期且探活通过的空闲会话。
 fn take(config: &ConnectionConfig) -> Option<(Session, TcpStream)> {
     let key = config_key(config);
@@ -80,7 +66,7 @@ fn take(config: &ConnectionConfig) -> Option<(Session, TcpStream)> {
         }
     }?;
     // 探活要走网络，必须在释放锁之后做。
-    if idle.stored_at.elapsed() > IDLE_TTL || !is_alive(&idle.session) {
+    if idle.stored_at.elapsed() > IDLE_TTL || !is_responsive(&idle.session) {
         log::debug!("pooled session for {} is stale, reconnecting", config.endpoint());
         return None;
     }

@@ -8,16 +8,17 @@ use super::transfer_common::{
     HASH_READ_BUFFER_SIZE,
 };
 use super::client::{
-    connect_session, is_sftp_not_found, hurry_failed_session, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
+    connect_session, is_sftp_not_found, hurry_failed_session, is_responsive, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
     ConnectionConfig,
 };
 use super::plan::{
-    effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES, MAX_CONNECTIONS,
+    effective_connections, watch_for_stalls, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES,
+    MAX_CONNECTIONS,
 };
 use super::remote_hash::{remote_block_hashes, remote_file_sha256, BlockHasher};
 use crate::checkpoint::CheckpointStatus;
 use crate::download_checkpoint::{save_download_checkpoint, DownloadCheckpoint};
-use crate::retry::Backoff;
+use crate::retry::{whole_seconds, Backoff};
 use sha2::{Digest, Sha256};
 use ssh2::{File as RemoteFile, OpenFlags, OpenType, Session, Sftp};
 use std::fs::{self, File, OpenOptions};
@@ -26,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct DownloadCallbacks {
     pub on_progress: Box<dyn Fn(u64, u64, &str, u32) + Send + Sync>,
@@ -185,6 +186,8 @@ pub fn remote_file_name(remote_path: &str) -> Result<String, DownloadError> {
 
 /// 没有任务可领、但别的连接还在传时，多久再看一眼队列。
 const PLAN_POLL: Duration = Duration::from_millis(100);
+/// 连接空等超过这么久，再用它之前要先探活。
+const IDLE_PROBE_AFTER: Duration = Duration::from_secs(5);
 
 /// 准备阶段确定的路径与大小。
 #[derive(Clone)]
@@ -308,7 +311,14 @@ pub fn download_with_resume(
                 log::warn!("cannot start parallel download connection {index}: {e}");
             }
         }
+        // 后台盯着卡死的连接；发送端在本作用域结束时被丢弃，它随即退出。
+        let (stop_watch, watch_stopped) = std::sync::mpsc::channel::<()>();
+        {
+            let shared = &shared;
+            scope.spawn(move || watch_for_stalls(&shared.plan, shared.aborts, watch_stopped));
+        }
         let result = lead_loop(&config, &shared, remote_path, local_path, &force_overwrite);
+        drop(stop_watch);
         shared.plan.finish();
         // 无论成败都打断还登记着的连接（成功时主连接已交还连接池、不在其中，剩下的只有辅助连接），
         // 理由同上传侧：别让卡在死连接上的收尾拖住一个已经完成的任务。
@@ -352,9 +362,10 @@ fn lead_loop(
                     }
                     let retry_count = increment_retry_count(checkpoint)?;
                     let backoff_ms = backoff.next_delay_ms(shared.transferred());
+                    let wait = whole_seconds(backoff_ms);
                     let message = crate::tr!(
-                        format!("连接失败，{backoff_ms}ms 后重试: {err}"),
-                        format!("Connection failed, retrying in {backoff_ms}ms: {err}")
+                        format!("连接失败，{wait} 秒后重试: {err}"),
+                        format!("Connection failed, retrying in {wait} s: {err}")
                     );
                     log::warn!("download retry #{retry_count}: {message}");
                     (callbacks.on_retry)(retry_count, backoff_ms, &message);
@@ -425,9 +436,10 @@ fn lead_loop(
                     shared.aborts.remove(abort_id);
                 }
                 let backoff_ms = backoff.next_delay_ms(shared.transferred());
+                let wait = whole_seconds(backoff_ms);
                 let message = crate::tr!(
-                    format!("传输中断（{err}），{backoff_ms}ms 后重连续传"),
-                    format!("Transfer interrupted ({err}), reconnecting to resume in {backoff_ms}ms")
+                    format!("传输中断（{err}），{wait} 秒后重连续传"),
+                    format!("Transfer interrupted ({err}), reconnecting to resume in {wait} s")
                 );
                 log::warn!("download retry #{retry_count}: {message}");
                 (callbacks.on_retry)(retry_count, backoff_ms, &message);
@@ -746,20 +758,28 @@ fn pump_pieces(
     let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
     // 在文件句柄之后声明，出错时先于它们执行（见 AbortUnlessDone）。
     let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
+    let mut idle_since: Option<Instant> = None;
 
     loop {
         if shared.cancel.load(Ordering::Relaxed) {
             return Err(DownloadError::Cancelled);
         }
+        // 空等了一阵之后、要接新任务或收尾之前，先确认这条连接还通（原因见 is_responsive）。
+        // 不探的话，最后一段任务会被一条条早已卡死的空闲连接轮流抢走，每条各白等一次操作超时。
+        if idle_since.is_some_and(|since| since.elapsed() >= IDLE_PROBE_AFTER)
+            && shared.plan.status() != PlanStatus::Wait
+        {
+            if !is_responsive(session) {
+                return Err(DownloadError::Sftp(
+                    crate::tr!("连接在空闲期间已经失效", "The connection was lost while it was idle").into(),
+                ));
+            }
+            idle_since = None;
+        }
         let mut piece = match shared.plan.claim(connection) {
             Claim::Piece(piece) => piece,
             Claim::Wait => {
-                // 自己没活干、在等别的连接：顺便看看有没有哪条已经卡死，有就打断它，
-                // 它手里的那段会退回队列由我接手，不必等它自己超时。
-                for stalled in shared.plan.take_stalled() {
-                    log::warn!("connection {stalled} made no progress for too long while others wait; aborting it");
-                    shared.aborts.abort(stalled);
-                }
+                idle_since.get_or_insert_with(Instant::now);
                 keepalive_while_idle(session);
                 thread::sleep(PLAN_POLL);
                 continue;

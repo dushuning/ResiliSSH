@@ -1873,7 +1873,7 @@ fn start_upload(
                         }
                         let retry_message = crate::tr!(
                             format!("{message}（第 {retry_count} 次重试）"),
-                            format!("{message} (retry #{retry_count})")
+                            format!("{message} (attempt {retry_count})")
                         );
                         activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(
@@ -2397,7 +2397,7 @@ fn start_download(
                         }
                         let retry_message = crate::tr!(
                             format!("{message}（第 {retry_count} 次重试）"),
-                            format!("{message} (retry #{retry_count})")
+                            format!("{message} (attempt {retry_count})")
                         );
                         activity::warn(activity::classify_failure(message), retry_message.clone());
                         let _ = app.emit(

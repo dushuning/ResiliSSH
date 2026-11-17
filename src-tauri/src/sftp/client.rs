@@ -162,6 +162,19 @@ pub(super) fn disable_keepalive(session: &Session) {
     session.set_keepalive(false, 0);
 }
 
+/// 探活的超时。链路已经悄悄断掉（NAT 超时、切换网络、中间设备丢弃）时不能按常规的操作超时去等，
+/// 那比重新连接还慢；探不通就当它不存在。
+const LIVENESS_TIMEOUT_MS: u64 = 3_000;
+
+/// 会话是否还通：开一个通道再关掉，约两个往返。用在「这条连接闲置了一阵、马上又要用」的时候——
+/// 闲置期间没有任何收发，连接就算已经变成黑洞也没人知道，直接拿去干活会白等一次操作超时。
+pub(super) fn is_responsive(session: &Session) -> bool {
+    session.set_timeout(LIVENESS_TIMEOUT_MS as u32);
+    let alive = session.channel_session().is_ok();
+    session.set_timeout(SSH_OPERATION_TIMEOUT_MS as u32);
+    alive
+}
+
 /// 会话暂时没活干、但稍后还要用时（并行传输中主连接等其他连接传完）定期调用：按间隔发一个 keepalive，
 /// 免得 NAT / 防火墙 / 跳板机转发线程把这条安静的连接当成死连接掐掉。调用期间不在 libssh2 的
 /// 阻塞等待里，所以不受「keepalive 让等待提前超时」的影响；发完立刻恢复关闭状态。
@@ -173,12 +186,6 @@ pub(super) fn keepalive_while_idle(session: &Session) {
     disable_keepalive(session);
 }
 
-/// 把会话的单次操作超时恢复为默认值（探活等场合会临时改短）。
-pub(super) fn set_operation_timeout(session: &Session, timeout_ms: u64) {
-    session.set_timeout(timeout_ms as u32);
-}
-
-pub(super) const DEFAULT_OPERATION_TIMEOUT_MS: u64 = SSH_OPERATION_TIMEOUT_MS;
 
 /// 域名可能解析出多个地址（IPv4/IPv6），逐个尝试，全部失败时报告最后一个错误。
 fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream, ConnectError> {

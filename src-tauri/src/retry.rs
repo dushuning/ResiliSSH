@@ -8,6 +8,11 @@ pub fn next_backoff_ms(current_ms: u64) -> u64 {
     current_ms.saturating_mul(2).min(MAX_BACKOFF_MS)
 }
 
+/// 等待时长写进给用户看的提示时用秒：「8000ms 后重连」对用户没有意义。
+pub fn whole_seconds(delay_ms: u64) -> u64 {
+    delay_ms.div_ceil(1000)
+}
+
 /// 一次传输的退避状态。只有「比上次失败时多传出了数据」才回到初始等待：
 /// 以连接成功为准重置的话，能连上却传不动的服务器（如磁盘满，SFTP 只报笼统的 Failure，
 /// 按设计无限重试）会被每秒完整握手、认证一次。

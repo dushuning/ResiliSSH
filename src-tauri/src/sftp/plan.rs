@@ -24,12 +24,16 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// 小于这个大小的文件不做「与目标端旧版本逐块比对」：比对本身的开销已经接近直接传一遍。
 pub const DELTA_MIN_BYTES: u64 = 8 * CHUNK_SIZE;
 
-/// 有连接在等任务时，另一条连接多久没有任何进展就认定它卡死并主动断开。
-/// 链路不通却也不断开（「黑洞」）时，TCP 自己要等到操作超时（约 30 秒）才报错；如果剩下的最后
-/// 一段正好在它手里，其他连接只能干等。分片大小是按「约 2 秒写完」自适应的，正常连接不会这么久没动静。
+/// 一条正在传输的连接多久没有任何进展就认定它卡死并主动断开。
+/// 链路不通却也不断开（「黑洞」）时，TCP 自己要等到操作超时（约 30 秒）才报错，这段时间这条连接
+/// 和它手里的任务都白白搁着。分片大小是按「几秒写完」自适应的，正常连接不会这么久没动静。
 const STALL_ABORT_AFTER: Duration = Duration::from_secs(12);
+/// 多久检查一次有没有卡死的连接。
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// 每主动断开一次就把阈值翻倍、直到这个上限：极慢的链路上一个分片可能真的要传这么久，
 /// 误断过一两次之后就不再打扰它，否则它每次都被打断、永远传不完一块。
+/// 只要有连接正常传完一轮，阈值就回到初始值（见 Piece::advance）——不回落的话，
+/// 断过两三次之后阈值就超过了操作超时，这项检测形同虚设。
 const STALL_ABORT_MAX: Duration = Duration::from_secs(120);
 
 /// 实际使用的连接数：小文件不并行，请求值限制在合理范围内。
@@ -237,9 +241,8 @@ impl<E> TransferPlan<E> {
         }
     }
 
-    /// 由「正在等任务」的连接调用：返回太久没有进展、应当被打断的连接编号。
-    /// 只有别人在等的时候才值得打断——没人等的话，卡住的连接并不耽误任何人，让它自己超时即可。
-    pub fn take_stalled(&self) -> Vec<u64> {
+    /// 返回太久没有进展、应当被打断的连接编号。
+    fn take_stalled(&self) -> Vec<u64> {
         let mut state = self.lock();
         let threshold = state.stall_threshold;
         let stalled = Self::stalled_older_than(&mut state, threshold);
@@ -292,6 +295,23 @@ impl<E> TransferPlan<E> {
     }
 }
 
+/// 传输期间在后台盯着各条连接：谁太久没有进展就打断谁的 socket，让它立刻出错、重连，
+/// 手里的任务段退回队列。只有一条连接时同样有效——没有它，单连接遇到黑洞只能干等操作超时。
+/// `stopped` 的发送端被丢弃（传输结束）时立即返回，不会让传输多等一个检查间隔。
+pub fn watch_for_stalls<E>(
+    plan: &TransferPlan<E>,
+    aborts: &super::client::AbortHandles,
+    stopped: std::sync::mpsc::Receiver<()>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(STALL_CHECK_INTERVAL) {
+        for connection in plan.take_stalled() {
+            log::warn!("connection {connection} made no progress for too long; aborting it so it reconnects");
+            aborts.abort(connection);
+        }
+    }
+}
+
 /// 领到的一段任务。无论以何种方式结束（传完、出错、取消），析构时都会把没传完的部分退回队列，
 /// 所以调用方不必在每个出错分支里手动归还。
 pub struct Piece<'a, E> {
@@ -327,7 +347,12 @@ impl<E> Piece<'_, E> {
     pub fn advance(&mut self, len: u64) {
         self.set_partial(0);
         self.next += len;
-        self.plan.touch(self.id);
+        let mut state = self.plan.lock();
+        if let Some(holder) = state.holders.get_mut(&self.id) {
+            holder.last_progress = Instant::now();
+        }
+        // 有连接正常传完了一轮：链路是通的，卡死检测回到最灵敏的档位。
+        state.stall_threshold = STALL_ABORT_AFTER;
     }
 }
 

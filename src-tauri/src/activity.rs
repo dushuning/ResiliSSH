@@ -198,7 +198,7 @@ mod tests {
             ("服务器拒绝了提供的凭据", "The server rejected the credentials"),
             ("未信任的服务器（指纹 SHA256:x），请确认后再连接", "Untrusted server (host key fingerprint SHA256:x), please confirm before connecting"),
             ("服务器指纹已变化（SHA256:x）", "Server host key fingerprint changed (SHA256:x)"),
-            ("连接失败，1000ms 后重试: x", "Connection failed, retrying in 1000ms: x"),
+            ("连接失败，1 秒后重试: x", "Connection failed, retrying in 1 s: x"),
             ("传输超过 60 秒无响应", "Transfer had no response for 60 seconds"),
             ("SHA-256 校验未通过", "SHA-256 verification failed"),
         ];

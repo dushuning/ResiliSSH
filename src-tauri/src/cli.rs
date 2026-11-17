@@ -43,8 +43,8 @@ const CLI_CHECKPOINT_DIR: &str = "cli";
 fn usage() -> String {
     tr!(
         "用法:
-  resiliss put <本地文件>... <目标>     上传（多个文件时目标必须是目录，以 / 结尾）
-  resiliss get <目标> [本地路径]        下载（本地路径默认为当前目录）
+  resiliss put <本地文件或文件夹>... <目标>  上传（多个文件或文件夹时目标是目录；文件夹保留目录结构）
+  resiliss get <目标> [本地路径]        下载文件或整个文件夹（本地路径默认为当前目录）
   resiliss servers                      列出图形界面里保存的服务器
 
 目标的写法:
@@ -55,8 +55,9 @@ fn usage() -> String {
   -i, --identity <私钥>      私钥文件（默认依次尝试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa，并先试 ssh-agent）
   -J, --jump <[用户@]主机[:端口]>  经跳板机连接（与目标使用同一种认证方式）
   -c, --connections <N>      并行连接数，1-8（默认 4；小文件始终只用 1 条）
+      --then <命令>          全部上传成功后在服务器上执行；可用 {remote_dir} {file_name} {remote_path} {files}
       --fast                 快速模式：不逐块校验，只在最后做整文件 SHA-256
-      --force                忽略已有断点，从头传
+      --force                忽略已有断点、不跳过已相同的文件，从头传
       --accept-new           首次连接的服务器自动信任其指纹（不询问）
   -v, --verbose              输出连接、重连等详细过程（-vv 连同逐块的调试信息）
   -h, --help                 显示本说明
@@ -67,8 +68,8 @@ fn usage() -> String {
 
 中断（Ctrl+C、断电、网络断开）后重新执行同一条命令即可从断点继续。",
         "Usage:
-  resiliss put <local-file>... <target>   upload (with several files the target must be a directory ending in /)
-  resiliss get <target> [local-path]      download (local path defaults to the current directory)
+  resiliss put <local-file-or-folder>... <target>  upload (several files or a folder go into the target directory; folders keep their structure)
+  resiliss get <target> [local-path]      download a file or a whole folder (local path defaults to the current directory)
   resiliss servers                        list the servers saved in the desktop app
 
 Target:
@@ -79,8 +80,9 @@ Options:
   -i, --identity <key>       private key file (default: ~/.ssh/id_ed25519, id_ecdsa, id_rsa in turn; ssh-agent is tried first)
   -J, --jump <[user@]host[:port]>  connect through a jump host (same authentication as the target)
   -c, --connections <N>      parallel connections, 1-8 (default 4; small files always use 1)
+      --then <command>       run on the server after all uploads succeed; {remote_dir} {file_name} {remote_path} {files} are available
       --fast                 fast mode: no per-block verification, only a whole-file SHA-256 at the end
-      --force                ignore an existing checkpoint and start over
+      --force                ignore existing checkpoints, do not skip identical files, start over
       --accept-new           trust the host key of a server seen for the first time without asking
   -v, --verbose              print connection and reconnect details (-vv adds per-block debug output)
   -h, --help                 show this help
@@ -102,6 +104,8 @@ struct Options {
     fast: bool,
     force: bool,
     accept_new: bool,
+    /// 全部上传成功后在服务器上执行的命令（与图形界面的「传完后执行」相同，变量会做 shell 转义）。
+    then: Option<String>,
     /// 0 = 安静；1（-v）= 连接、重连等过程；2 及以上（-vv）= 连同逐块的调试信息。
     verbose: u8,
 }
@@ -135,6 +139,7 @@ fn parse_args(args: &[String]) -> Result<(Command, Options), String> {
                     tr!(format!("并行连接数必须是数字: {value}"), format!("Connections must be a number: {value}"))
                 })?);
             }
+            "--then" => options.then = Some(value_of(arg, &mut iter)?),
             "--fast" => options.fast = true,
             "--force" => options.force = true,
             "--accept-new" => options.accept_new = true,
@@ -331,9 +336,10 @@ fn connect_and_trust(config: &ConnectionConfig, options: &Options) -> Result<(),
     // 否则脚本里的一次 `resiliss put` 会因为握手时的一下抖动直接失败，传输引擎的无限重试根本没机会上场。
     let retry_later = |err: &ConnectError, backoff: &mut crate::retry::Backoff| {
         let delay_ms = backoff.next_delay_ms(0);
+        let wait = crate::retry::whole_seconds(delay_ms);
         announce_retry(&tr!(
-            format!("连接失败，{delay_ms}ms 后重试: {err}"),
-            format!("Connection failed, retrying in {delay_ms}ms: {err}")
+            format!("连接失败，{wait} 秒后重试: {err}"),
+            format!("Connection failed, retrying in {wait} s: {err}")
         ));
         std::thread::sleep(Duration::from_millis(delay_ms));
     };
@@ -672,33 +678,233 @@ fn execute(command: Command, options: &Options) -> Result<(), String> {
             Ok(())
         }
         Command::Servers => list_servers(),
-        Command::Put { locals, target } => {
-            let (config, remote) = resolve_target(&target, options)?;
-            if locals.len() > 1 && !remote.ends_with('/') {
-                return Err(tr!(
-                    "上传多个文件时目标必须是目录（以 / 结尾），否则它们会互相覆盖",
-                    "With several files the target must be a directory (ending in /), otherwise they would overwrite each other"
-                )
-                .into());
-            }
-            connect_and_trust(&config, options)?;
-            // 长时间传输期间不让机器因空闲而睡眠。
-            let _awake = crate::power::SleepGuard::acquire("cli upload");
-            for local in &locals {
-                let remote_path = put_file(&config, local, &remote, options)?;
-                println!("{}", tr!(format!("已上传并校验: {local} → {remote_path}"), format!("Uploaded and verified: {local} → {remote_path}")));
-            }
-            Ok(())
+        Command::Put { locals, target } => put_all(&locals, &target, options),
+        Command::Get { target, local } => get_all(&target, &local, options),
+    }
+}
+
+/// 一个待上传的文件：本地路径，以及它要放进的远端目录（或完整远端路径）。
+struct UploadJob {
+    local: String,
+    remote: String,
+}
+
+/// 把命令行给的文件和文件夹展开成逐个文件的上传任务。文件夹的规则与图形界面、`scp -r` 一致：
+/// `put dist host:/srv/` 得到 `/srv/dist/...`，目录结构原样保留。
+fn plan_uploads(locals: &[String], remote: &str) -> Result<Vec<UploadJob>, String> {
+    let has_folder = locals.iter().any(|local| Path::new(local).is_dir());
+    if locals.len() > 1 && !has_folder && !remote.ends_with('/') {
+        return Err(tr!(
+            "上传多个文件时目标必须是目录（以 / 结尾），否则它们会互相覆盖",
+            "With several files the target must be a directory (ending in /), otherwise they would overwrite each other"
+        )
+        .into());
+    }
+    // 有文件夹时目标只能是目录，替用户补上结尾的斜杠。
+    let base = if has_folder && !remote.ends_with('/') { format!("{remote}/") } else { remote.to_string() };
+    let mut jobs = Vec::new();
+    for local in locals {
+        let path = std::path::absolute(local).map_err(|e| e.to_string())?;
+        if !path.is_dir() {
+            jobs.push(UploadJob { local: local.clone(), remote: base.clone() });
+            continue;
         }
-        Command::Get { target, local } => {
-            let (config, remote) = resolve_target(&target, options)?;
-            connect_and_trust(&config, options)?;
-            let _awake = crate::power::SleepGuard::acquire("cli download");
-            let local_path = get_file(&config, &remote, &local, options)?;
-            println!("{}", tr!(format!("已下载并校验: {remote} → {local_path}"), format!("Downloaded and verified: {remote} → {local_path}")));
-            Ok(())
+        let expanded = crate::local_files::expand_local_paths(&[path.to_string_lossy().to_string()]);
+        if expanded.truncated {
+            return Err(tr!(
+                format!("{local} 里的文件太多，请分批上传"),
+                format!("{local} contains too many files; upload it in parts")
+            ));
+        }
+        if let Some(dir) = expanded.unreadable_dirs.first() {
+            // 读不了的子目录不能悄悄跳过：用户会以为整个文件夹都传完了。
+            return Err(tr!(format!("无法读取目录 {dir}"), format!("Cannot read directory {dir}")));
+        }
+        for entry in expanded.entries {
+            jobs.push(UploadJob { local: entry.path, remote: format!("{base}{}/", entry.rel_dir) });
         }
     }
+    if jobs.is_empty() {
+        return Err(tr!("没有可上传的文件", "Nothing to upload").into());
+    }
+    Ok(jobs)
+}
+
+/// 远端已经是同一个文件（大小相同且 SHA-256 一致）。服务器算不了哈希时按「不同」处理，照常传。
+fn remote_is_identical(config: &ConnectionConfig, local: &Path, remote_file: &str) -> bool {
+    let Ok(size) = std::fs::metadata(local).map(|meta| meta.len()) else { return false };
+    sftp::with_session(config, |session| {
+        let sftp = session.sftp().map_err(|e| e.to_string())?;
+        // 文件不存在是最常见的情况，不算出错（出错的会话不会留给下一步复用）。
+        let same_size = sftp.stat(Path::new(remote_file)).is_ok_and(|stat| stat.size == Some(size));
+        // 两边都是空文件就不必算哈希了。
+        Ok(same_size
+            && (size == 0
+                || sftp::remote_sha256(session, remote_file)
+                    .is_some_and(|remote| sftp::local_sha256(local).as_deref() == Some(remote.as_str()))))
+    })
+    .unwrap_or(false)
+}
+
+fn put_all(locals: &[String], target: &str, options: &Options) -> Result<(), String> {
+    let (config, remote) = resolve_target(target, options)?;
+    let jobs = plan_uploads(locals, &remote)?;
+    connect_and_trust(&config, options)?;
+    // 长时间传输期间不让机器因空闲而睡眠。
+    let _awake = crate::power::SleepGuard::acquire("cli upload");
+
+    let mut remote_paths = Vec::new();
+    let mut skipped = 0;
+    for job in &jobs {
+        let local_path = Path::new(&job.local);
+        let remote_file = sftp::resolve_remote_path(&job.remote, local_path).map_err(|e| e.to_string())?;
+        // 已经一样的文件不再传一遍（重复部署同一个目录时大部分文件都没变）；--force 时照传。
+        if !options.force && remote_is_identical(&config, local_path, &remote_file) {
+            println!("{}", tr!(format!("已相同，跳过: {remote_file}"), format!("Identical, skipped: {remote_file}")));
+            skipped += 1;
+            remote_paths.push(remote_file);
+            continue;
+        }
+        let remote_path = put_file(&config, &job.local, &job.remote, options)?;
+        println!(
+            "{}",
+            tr!(
+                format!("已上传并校验: {} → {remote_path}", job.local),
+                format!("Uploaded and verified: {} → {remote_path}", job.local)
+            )
+        );
+        remote_paths.push(remote_path);
+    }
+    if jobs.len() > 1 {
+        let (total, sent) = (jobs.len(), jobs.len() - skipped);
+        println!(
+            "{}",
+            tr!(
+                format!("共 {total} 个文件：上传 {sent} 个，已相同跳过 {skipped} 个"),
+                format!("{total} files: {sent} uploaded, {skipped} identical and skipped")
+            )
+        );
+    }
+    // 传了多个文件或文件夹时，{remote_dir} 指用户给的目标目录，而不是最后一个文件碰巧所在的子目录。
+    let target_dir = (jobs.len() > 1).then(|| remote_base(&remote));
+    match &options.then {
+        Some(template) => run_then(&config, template, &remote_paths, target_dir),
+        None => Ok(()),
+    }
+}
+
+/// 用户给的远端目标按目录理解时的写法（保证以 / 结尾）。
+fn remote_base(remote: &str) -> String {
+    if remote.ends_with('/') { remote.to_string() } else { format!("{remote}/") }
+}
+
+/// 全部上传成功后在服务器上执行命令。命令失败时整个命令行以失败退出，方便脚本判断。
+fn run_then(
+    config: &ConnectionConfig,
+    template: &str,
+    remote_paths: &[String],
+    target_dir: Option<String>,
+) -> Result<(), String> {
+    let last = remote_paths.last().cloned().unwrap_or_default();
+    let (last_dir, file_name) = match last.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+        None => (String::new(), last.clone()),
+    };
+    let remote_dir = target_dir.unwrap_or(last_dir);
+    let context = sftp::CommandContext {
+        remote_dir,
+        file_name,
+        remote_path: last,
+        files: remote_paths.iter().map(|path| path.rsplit('/').next().unwrap_or(path).to_string()).collect(),
+    };
+    let outcome = sftp::run_remote_command(
+        config,
+        template,
+        &context,
+        &AtomicBool::new(false),
+        &Arc::new(Mutex::new(None)),
+        |line| println!("{line}"),
+    )?;
+    if outcome.succeeded() {
+        return Ok(());
+    }
+    Err(match outcome.exit_code {
+        Some(code) => tr!(format!("命令执行失败（退出码 {code}）"), format!("Command failed (exit code {code})")),
+        None => tr!("命令没有正常结束", "The command did not finish normally").to_string(),
+    })
+}
+
+fn get_all(target: &str, local: &str, options: &Options) -> Result<(), String> {
+    let (config, remote) = resolve_target(target, options)?;
+    connect_and_trust(&config, options)?;
+    let _awake = crate::power::SleepGuard::acquire("cli download");
+
+    // 远端路径可以是文件，也可以是文件夹：统一展开成文件列表，文件夹里的每个文件带着它的相对目录。
+    let expanded = sftp::expand_remote_paths(&config, std::slice::from_ref(&remote))?;
+    if expanded.truncated {
+        return Err(tr!(
+            format!("{remote} 里的文件太多，请分批下载"),
+            format!("{remote} contains too many files; download it in parts")
+        ));
+    }
+    if let Some(dir) = expanded.unreadable_dirs.first() {
+        return Err(tr!(format!("无法读取远端路径 {dir}"), format!("Cannot read remote path {dir}")));
+    }
+    if expanded.entries.is_empty() {
+        return Err(tr!("没有可下载的文件", "Nothing to download").into());
+    }
+    let is_folder = expanded.entries.len() > 1 || expanded.entries.iter().any(|entry| !entry.rel_dir.is_empty());
+    // 下载文件夹时本地路径只能是目录。
+    let base = if is_folder && !local.ends_with('/') { format!("{local}/") } else { local.to_string() };
+
+    let mut skipped = 0;
+    let total = expanded.entries.len();
+    for entry in expanded.entries {
+        let local_target = if entry.rel_dir.is_empty() { base.clone() } else { format!("{base}{}/", entry.rel_dir) };
+        if !options.force && local_is_identical(&config, &entry.path, &local_target, entry.size) {
+            println!("{}", tr!(format!("已相同，跳过: {}", entry.path), format!("Identical, skipped: {}", entry.path)));
+            skipped += 1;
+            continue;
+        }
+        let local_path = get_file(&config, &entry.path, &local_target, options)?;
+        println!(
+            "{}",
+            tr!(
+                format!("已下载并校验: {} → {local_path}", entry.path),
+                format!("Downloaded and verified: {} → {local_path}", entry.path)
+            )
+        );
+    }
+    if total > 1 {
+        let fetched = total - skipped;
+        println!(
+            "{}",
+            tr!(
+                format!("共 {total} 个文件：下载 {fetched} 个，已相同跳过 {skipped} 个"),
+                format!("{total} files: {fetched} downloaded, {skipped} identical and skipped")
+            )
+        );
+    }
+    Ok(())
+}
+
+/// 本地已经有同一个文件（大小相同且 SHA-256 一致）。`local_target` 是目录时文件名取远端的。
+fn local_is_identical(config: &ConnectionConfig, remote_file: &str, local_target: &str, remote_size: u64) -> bool {
+    let name = remote_file.rsplit('/').next().unwrap_or(remote_file);
+    let local_path = if local_target.ends_with('/') || Path::new(local_target).is_dir() {
+        Path::new(local_target).join(name)
+    } else {
+        PathBuf::from(local_target)
+    };
+    let same_size = std::fs::metadata(&local_path).is_ok_and(|meta| meta.is_file() && meta.len() == remote_size);
+    if !same_size {
+        return false;
+    }
+    if remote_size == 0 {
+        return true;
+    }
+    let Some(local_hash) = sftp::local_sha256(&local_path) else { return false };
+    sftp::with_session(config, |session| Ok(sftp::remote_sha256(session, remote_file))).ok().flatten() == Some(local_hash)
 }
 
 /// 命令行主函数，返回进程退出码。
@@ -743,6 +949,31 @@ mod tests {
         );
         assert!(options.fast);
         assert_eq!(options.connections, Some(2));
+    }
+
+    #[test]
+    fn folders_expand_into_the_target_directory_keeping_structure() {
+        let root = std::env::temp_dir().join(format!("resiliss-cli-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dist/js")).unwrap();
+        std::fs::write(root.join("dist/index.html"), b"x").unwrap();
+        std::fs::write(root.join("dist/js/app.js"), b"y").unwrap();
+        let dist = root.join("dist").to_string_lossy().to_string();
+
+        // 目标没写结尾斜杠也按目录处理，与 scp -r 一样得到 /srv/www/dist/...
+        let jobs = plan_uploads(std::slice::from_ref(&dist), "/srv/www").unwrap();
+        let mut targets: Vec<(String, String)> = jobs
+            .iter()
+            .map(|job| (job.local.rsplit('/').next().unwrap().to_string(), job.remote.clone()))
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![("app.js".into(), "/srv/www/dist/js/".into()), ("index.html".into(), "/srv/www/dist/".into())]
+        );
+        // 多个普通文件必须明确给出目录。
+        assert!(plan_uploads(&["a.jar".into(), "b.jar".into()], "/opt/app.jar").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
