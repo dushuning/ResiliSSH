@@ -98,20 +98,20 @@ If you need those, great tools already exist. ResiliSSH does one job: getting fi
 
 ## Does it actually help?
 
-Measured on one machine with [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh): a 48 MB file through a proxy that adds 100 ms round-trip latency and caps **each connection** at 8 Mbit/s — an approximation of a lossy link, where a single TCP stream is slow but several are each about as fast. Fault scenarios were run four times each; the range is shown.
+Measured on one machine with [`scripts/bench-weak-network.sh`](./scripts/bench-weak-network.sh): a 48 MB file through a proxy that adds 100 ms round-trip latency and caps **each connection** at 8 Mbit/s — an approximation of a lossy link, where a single TCP stream is slow but several are each about as fast. Fault scenarios were run 4–10 times each; the range is shown.
 
 | | `scp` / `rsync` | ResiliSSH, 1 connection | ResiliSSH, 4 connections (default) |
 |---|---|---|---|
-| Upload, stable but slow link | 54 s | 64 s | **25 s** |
-| Download, stable but slow link | 55 s | 55 s | **21 s** |
-| Upload, every connection dropped about every 20 s | `rsync --partial --append` re-run until done: 56–59 s · `scp`: never finishes | 79–87 s | **25–30 s** |
-| Upload, every connection goes silent about every 30 s (neither working nor closed) | `rsync` with ssh keep-alive probes: 86–119 s | 96–258 s | **24–57 s** |
+| Upload, stable but slow link | 55 s | 63 s | **26 s** |
+| Download, stable but slow link | 55 s | 56 s | **22 s** |
+| Upload, every connection dropped about every 20 s | `rsync --partial --append` re-run until done: 57–65 s · `scp`: never finishes | 70–94 s | **25–33 s** |
+| Upload, every connection goes silent about every 30 s (neither working nor closed) | `rsync` with ssh keep-alive probes: 55–151 s | 62–195 s | **29–73 s** |
 
 What this shows, and what it doesn't:
 
 - With the default parallel connections it is more than twice as fast as `scp`/`rsync` here, and drops or stalls barely slow it down.
-- With a **single** connection it has no speed advantage: uploads are about 15% slower than `scp` (each round of blocks is acknowledged and verified before the next), downloads are on par, and a silent connection is only noticed after a 30-second timeout. If your link is fine and one stream already fills it, `rsync` is the better tool.
-- Letting the server compute hashes matters: on an SFTP-only server, verification has to read everything back and an upload takes almost twice as long (118 s instead of 64 s).
+- With a **single** connection it has no speed advantage: uploads are about 15% slower than `scp` (each round of blocks is acknowledged and verified before the next) and downloads are on par. A connection that goes silent is cut after about 12 seconds without progress, but with only one connection there is nothing to cover for it while it reconnects. If your link is fine and one stream already fills it, `rsync` is the better tool.
+- Letting the server compute hashes matters: on an SFTP-only server, verification has to read everything back and an upload takes almost twice as long (120 s instead of 63 s).
 - The proxy cannot reproduce real packet loss, so treat the numbers as a check of the engine, not as a promise for your network. Run the script yourself — it needs no root and touches nothing outside `/tmp`.
 
 ## Install
@@ -153,11 +153,11 @@ cargo install --path src-tauri --bin resiliss     # from source
 #   ln -s /Applications/ResiliSSH.app/Contents/MacOS/resiliss /usr/local/bin/resiliss
 
 resiliss put app.jar deploy@prod.example.com:/opt/app/      # upload, verified, swapped in atomically
-resiliss put dist/*.js @prod:/srv/www/js/                   # "@prod" = a server saved in the desktop app
+resiliss put dist @prod:/srv/www/ --then 'sudo systemctl reload nginx'   # a whole folder, to a server saved in the app
 resiliss get deploy@prod.example.com:/var/backups/db.dump ./backups/
 ```
 
-Interrupted (Ctrl+C, power loss, dropped network)? Run the same command again — it resumes. `resiliss --help` lists the options (`-i` key, `-J` jump host, `-c` connections, `--fast`, `--accept-new`). Passwords come from `RESILISS_PASSWORD` or, for saved servers, the Keychain — never from the command line.
+Folders keep their structure, files that are already identical are skipped, and `--then` runs a command on the server once everything has arrived (a failing command makes `resiliss` exit non-zero). Interrupted (Ctrl+C, power loss, dropped network)? Run the same command again — it resumes. `resiliss --help` lists the options (`-i` key, `-J` jump host, `-c` connections, `--fast`, `--accept-new`). Passwords come from `RESILISS_PASSWORD` or, for saved servers, the Keychain — never from the command line.
 
 ## Where your data lives
 

@@ -11,9 +11,12 @@
 - `resiliss` command-line tool (`put`, `get`, `servers`) built on the same engine, with its own per-task checkpoints so that re-running a command resumes it.
 - A network change (new Wi‑Fi, VPN reconnect) is noticed within a couple of seconds and the transfer reconnects immediately instead of waiting for a timeout.
 - A batch can be continued after quitting the app.
+- Command line: upload and download whole folders (structure kept), skip files that are already identical, and `--then <command>` to run something on the server after all uploads succeed.
 - `scripts/bench-weak-network.sh` and `scripts/netem-proxy.py`: a reproducible comparison against `scp` and `rsync` over a simulated slow, flaky link (no root needed); results are in the README.
 
 ### Changed
+- The run view makes a dropped connection unmistakable and reassuring: "Reconnecting", what is already saved, when the next attempt happens and how many attempts so far — instead of showing the last speed for several seconds and then two contradictory labels. Reconnect delays are shown in seconds, not milliseconds.
+- Activity page: warnings and errors stand out, long messages wrap cleanly, and an empty or fully filtered list says so. English wording was unified (Saved, Activity, Reconnecting, Resume) and nothing overflows at the minimum window size.
 - Interface refresh: the primary action and the selected server use the gradient of the app icon; the empty drop area is now the focal point of the Transfer page; confirmation dialogs name the action on the button ("Upload and replace", "Delete") with a red button for destructive ones, and the remote browser's primary button is "Choose this folder" instead of "Close".
 - Fewer steps: the last used server is selected on launch; downloads default to the Downloads folder; the Servers page has a "Use for transfer" shortcut; the result page says which file went where; the preflight summary sits below the form instead of pushing it around.
 - "Then run" is only offered for uploads. Dismissing the "continue the batch?" prompt with Esc keeps the batch for next time; only "Discard" drops it.
@@ -30,7 +33,7 @@
 - Downloads were three to four times slower than the link allowed: every megabyte the SFTP read-ahead already requested from the server was thrown away and requested again. Downloads now match `scp` on one connection.
 - Uploads on one connection write several blocks per round and verify them in one round trip, instead of pausing twice per megabyte; noticeably faster on fast, high-latency links.
 - A finished and verified transfer could take another minute or more to return, and every dropped connection cost far more than the reconnect itself: closing the file, the hash channel and the session of a broken connection each waited for a full timeout. Broken connections are now torn down immediately.
-- A connection that stops responding without closing is aborted after about 12 seconds when another connection is waiting for work, instead of holding its piece until the 30-second timeout. The handshake timeout is 30 seconds instead of 90.
+- A connection that stops responding without closing is aborted after about 12 seconds without progress (also when it is the only connection), instead of holding its piece until the 30-second timeout. A connection that sat idle is checked before it takes more work, so the last piece of a transfer is no longer handed from one silently dead connection to the next. The handshake timeout is 30 seconds instead of 90.
 - Post-transfer command: output that never ends a line no longer grows without bound, and a command killed by a signal is no longer reported as successful.
 - Files whose name is close to the 255-byte limit could not be transferred because the temporary name was too long.
 - A symlink dropped or selected directly is followed instead of silently ignored; exactly 10,000 files no longer shows the "truncated" warning; failing to write the checkpoint is reported as a local error instead of being retried as a network error.
