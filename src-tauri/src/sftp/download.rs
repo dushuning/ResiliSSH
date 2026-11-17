@@ -2,13 +2,14 @@ use super::errors::is_permanent_sftp_error;
 use super::pool;
 use super::transfer_common::{
     staging_path,
-    align_down, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
+    align_down, bounded_read_len, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
     increment_retry_count, sha256_bytes, sha256_local_file, sha256_remote_file,
     should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
     HASH_READ_BUFFER_SIZE,
 };
 use super::client::{
-    connect_session, is_sftp_not_found, keepalive_while_idle, AbortHandles, ConnectError, ConnectionConfig,
+    connect_session, is_sftp_not_found, hurry_failed_session, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
+    ConnectionConfig,
 };
 use super::plan::{
     effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES, MAX_CONNECTIONS,
@@ -226,12 +227,20 @@ impl DownloadShared<'_> {
         cp.downloaded_bytes = total;
         cp.verified_bytes = total;
         cp.all_chunks_verified &= read_back;
-        save_download_checkpoint(&cp).map_err(DownloadError::Sftp)
+        save_download_checkpoint(&cp).map_err(checkpoint_error)
     }
 
     fn transferred(&self) -> u64 {
         self.checkpoint.lock().map(|cp| cp.downloaded_bytes).unwrap_or(0)
     }
+}
+
+/// 断点写不进本地磁盘：本机的问题，重连解决不了，按本地错误停下来（理由同上传侧）。
+fn checkpoint_error(detail: String) -> DownloadError {
+    DownloadError::LocalIo(crate::tr!(
+        format!("无法保存断点文件（{detail}）"),
+        format!("cannot save the checkpoint file ({detail})")
+    ))
 }
 
 /// 重连也不会好的错误：停止重试，把断点留给用户处理。
@@ -301,10 +310,9 @@ pub fn download_with_resume(
         }
         let result = lead_loop(&config, &shared, remote_path, local_path, &force_overwrite);
         shared.plan.finish();
-        if result.is_err() {
-            // 失败或取消：别让辅助连接在阻塞的网络 IO 里再等上几十秒才发现该退出了。
-            aborts.abort_all();
-        }
+        // 无论成败都打断还登记着的连接（成功时主连接已交还连接池、不在其中，剩下的只有辅助连接），
+        // 理由同上传侧：别让卡在死连接上的收尾拖住一个已经完成的任务。
+        aborts.abort_all();
         result
     })
 }
@@ -356,10 +364,10 @@ fn lead_loop(
             }
         }
 
-        let (active_session, _) = session.as_ref().unwrap();
+        let (active_session, connection) = session.as_ref().unwrap();
         // 传输、校验、换成正式文件放在同一个结果里：校验阶段的网络错误与传输中的一样走下面的
         // 重试分支，重连后再校验，而不是让一个已经下完的文件以失败告终。
-        let transfer_result = lead_transfer(active_session, shared, remote_path, local_path, force_overwrite)
+        let transfer_result = lead_transfer(active_session, shared, remote_path, local_path, force_overwrite, *connection)
             .and_then(|target| {
                 if !should_skip_full_file_hash(shared.strict, checkpoint, target.size)? {
                     (callbacks.on_progress)(target.size, target.size, "verifying", current_retry_count(checkpoint));
@@ -409,7 +417,11 @@ fn lead_loop(
                     return Err(err);
                 }
                 let retry_count = increment_retry_count(checkpoint)?;
-                if let Some((_, abort_id)) = session.take() {
+                if let Some((failed_session, abort_id)) = session.take() {
+                    // 先打断再丢弃：会话析构时还要向服务器道别，在一条死连接上会空等一次超时。
+                    shared.aborts.abort(abort_id);
+                    hurry_failed_session(&failed_session);
+                    drop(failed_session);
                     shared.aborts.remove(abort_id);
                 }
                 let backoff_ms = backoff.next_delay_ms(shared.transferred());
@@ -460,8 +472,11 @@ fn lead_transfer(
     remote_path: &str,
     local_path: &str,
     force_overwrite: &AtomicBool,
+    connection: u64,
 ) -> Result<DownloadTarget, DownloadError> {
     let sftp = session.sftp().map_err(|e| DownloadError::Sftp(e.to_string()))?;
+    // 在 sftp 之后声明：出错时先打断连接，sftp 的析构才不会在一条死连接上空等。
+    let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
     let lock_target = || shared.target.lock().map_err(|e| DownloadError::Sftp(e.to_string()));
     let existing = lock_target()?.clone();
     let target = match existing {
@@ -473,7 +488,7 @@ fn lead_transfer(
         }
     };
 
-    pump_pieces(session, &sftp, &target, shared)?;
+    pump_pieces(session, &sftp, &target, shared, connection)?;
     if let Some(fatal) = shared.plan.take_fatal() {
         return Err(fatal);
     }
@@ -491,6 +506,9 @@ fn lead_transfer(
         log::error!("remote file changed during download: {}", target.remote_path);
         return Err(DownloadError::RemoteFileChanged);
     }
+    // cp 借用着 checkpoint 的锁，先放掉它再结束。
+    drop(cp);
+    teardown.done();
     Ok(target)
 }
 
@@ -540,7 +558,7 @@ fn prepare_download(
         cp.remote_path = actual_remote_path.clone();
         cp.local_path = resolved_local_path.clone();
         cp.remote_mtime = remote_stat.mtime;
-        save_download_checkpoint(&cp).map_err(DownloadError::Sftp)?;
+        save_download_checkpoint(&cp).map_err(checkpoint_error)?;
         (done, cp.staged)
     };
 
@@ -589,7 +607,7 @@ fn prepare_download(
             cp.all_chunks_verified = true;
         }
         cp.done_ranges = done.clone();
-        save_download_checkpoint(&cp).map_err(DownloadError::Sftp)?;
+        save_download_checkpoint(&cp).map_err(checkpoint_error)?;
     }
 
     super::upload::log_resume_point(done.total(), remote_size);
@@ -698,7 +716,9 @@ fn verify_resume_boundaries(
                     hasher = None;
                 }
                 // 每读到一段就刷新心跳：慢速链路上读 1 MB 可能超过无响应阈值。
-                read_remote_chunk(&mut remote_file, start, &mut buffer[..len as usize], |_| on_activity())?;
+                read_remote_chunk(&mut remote_file, &mut None, start, &mut buffer[..len as usize], end, |_| {
+                    on_activity()
+                })?;
                 sha256_bytes(&buffer[..len as usize])
             }
         };
@@ -716,24 +736,38 @@ fn pump_pieces(
     sftp: &Sftp,
     target: &DownloadTarget,
     shared: &DownloadShared<'_>,
+    connection: u64,
 ) -> Result<(), DownloadError> {
     let write_path = Path::new(&target.write_path);
     let mut remote_file: Option<RemoteFile> = None;
     let mut local_file: Option<File> = None;
+    // 远端句柄当前读到的位置：同一段任务里各块是连续的，据此避免无谓的重新定位。
+    let mut remote_position: Option<u64> = None;
     let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
+    // 在文件句柄之后声明，出错时先于它们执行（见 AbortUnlessDone）。
+    let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
 
     loop {
         if shared.cancel.load(Ordering::Relaxed) {
             return Err(DownloadError::Cancelled);
         }
-        let mut piece = match shared.plan.claim() {
+        let mut piece = match shared.plan.claim(connection) {
             Claim::Piece(piece) => piece,
             Claim::Wait => {
+                // 自己没活干、在等别的连接：顺便看看有没有哪条已经卡死，有就打断它，
+                // 它手里的那段会退回队列由我接手，不必等它自己超时。
+                for stalled in shared.plan.take_stalled() {
+                    log::warn!("connection {stalled} made no progress for too long while others wait; aborting it");
+                    shared.aborts.abort(stalled);
+                }
                 keepalive_while_idle(session);
                 thread::sleep(PLAN_POLL);
                 continue;
             }
-            Claim::Done => return Ok(()),
+            Claim::Done => {
+                teardown.done();
+                return Ok(());
+            }
         };
         if remote_file.is_none() {
             remote_file = Some(open_remote_for_download(sftp, &target.remote_path)?);
@@ -754,7 +788,7 @@ fn pump_pieces(
             let chunk_len = CHUNK_SIZE.min(piece.end - offset) as usize;
             let chunk = &mut chunk_buffer[..chunk_len];
 
-            read_remote_chunk(remote, offset, chunk, |absolute| {
+            read_remote_chunk(remote, &mut remote_position, offset, chunk, piece.end, |absolute| {
                 piece.set_partial(absolute - offset);
                 shared.report("downloading");
             })?;
@@ -798,7 +832,7 @@ fn helper_loop(config: &ConnectionConfig, shared: &DownloadShared<'_>, index: us
             let result = session
                 .sftp()
                 .map_err(|e| DownloadError::Sftp(e.to_string()))
-                .and_then(|sftp| pump_pieces(&session, &sftp, &target, shared));
+                .and_then(|sftp| pump_pieces(&session, &sftp, &target, shared, abort_id));
             shared.aborts.remove(abort_id);
             result
         });
@@ -864,20 +898,32 @@ fn open_remote_for_download(sftp: &Sftp, remote_path: &str) -> Result<RemoteFile
         .map_err(|e| DownloadError::Sftp(e.to_string()))
 }
 
+/// 读取远端 `[offset, offset + buffer.len())`。
+/// `position` 是这个句柄当前所在的位置（None 表示未知）：顺序读时不重新定位，因为 libssh2 的 seek
+/// 会把已经发出的预读请求全部作废。`boundary` 是这条连接当前任务段的终点，读取大小据此收紧，
+/// 让预读不越过它（见 bounded_read_len）。
 fn read_remote_chunk<F: FnMut(u64)>(
     remote_file: &mut RemoteFile,
+    position: &mut Option<u64>,
     offset: u64,
     buffer: &mut [u8],
+    boundary: u64,
     mut on_partial_progress: F,
 ) -> Result<(), DownloadError> {
-    remote_file
-        .seek(SeekFrom::Start(offset))
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+    if *position != Some(offset) {
+        remote_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+    }
+    // 出错提前返回时位置不再可信，下次必须重新定位。
+    *position = None;
 
     let mut read_total = 0usize;
     while read_total < buffer.len() {
+        let at = offset + read_total as u64;
+        let want = bounded_read_len(buffer.len() - read_total, boundary.saturating_sub(at));
         let read_bytes = remote_file
-            .read(&mut buffer[read_total..])
+            .read(&mut buffer[read_total..read_total + want])
             .map_err(|e| DownloadError::Sftp(e.to_string()))?;
         if read_bytes == 0 {
             return Err(DownloadError::Sftp(
@@ -887,6 +933,7 @@ fn read_remote_chunk<F: FnMut(u64)>(
         read_total += read_bytes;
         on_partial_progress(offset + read_total as u64);
     }
+    *position = Some(offset + buffer.len() as u64);
     Ok(())
 }
 

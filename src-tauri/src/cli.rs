@@ -58,7 +58,7 @@ fn usage() -> String {
       --fast                 快速模式：不逐块校验，只在最后做整文件 SHA-256
       --force                忽略已有断点，从头传
       --accept-new           首次连接的服务器自动信任其指纹（不询问）
-  -v, --verbose              输出连接、重连等详细过程
+  -v, --verbose              输出连接、重连等详细过程（-vv 连同逐块的调试信息）
   -h, --help                 显示本说明
 
 环境变量:
@@ -82,7 +82,7 @@ Options:
       --fast                 fast mode: no per-block verification, only a whole-file SHA-256 at the end
       --force                ignore an existing checkpoint and start over
       --accept-new           trust the host key of a server seen for the first time without asking
-  -v, --verbose              print connection and reconnect details
+  -v, --verbose              print connection and reconnect details (-vv adds per-block debug output)
   -h, --help                 show this help
 
 Environment:
@@ -102,7 +102,8 @@ struct Options {
     fast: bool,
     force: bool,
     accept_new: bool,
-    verbose: bool,
+    /// 0 = 安静；1（-v）= 连接、重连等过程；2 及以上（-vv）= 连同逐块的调试信息。
+    verbose: u8,
 }
 
 #[derive(Debug, PartialEq)]
@@ -137,7 +138,8 @@ fn parse_args(args: &[String]) -> Result<(Command, Options), String> {
             "--fast" => options.fast = true,
             "--force" => options.force = true,
             "--accept-new" => options.accept_new = true,
-            "-v" | "--verbose" => options.verbose = true,
+            "-v" | "--verbose" => options.verbose += 1,
+            "-vv" => options.verbose += 2,
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(tr!(format!("未知选项: {other}"), format!("Unknown option: {other}")));
             }
@@ -712,8 +714,8 @@ pub fn run(args: Vec<String>) -> i32 {
             return EXIT_USAGE;
         }
     };
-    if options.verbose && log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+    if options.verbose > 0 && log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(if options.verbose > 1 { log::LevelFilter::Debug } else { log::LevelFilter::Info });
     }
     match execute(command, &options) {
         Ok(()) => EXIT_OK,

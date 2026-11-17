@@ -39,9 +39,16 @@ pub fn expand_local_paths(paths: &[String]) -> ExpandedPaths {
     let mut truncated = false;
     let mut unreadable_dirs = Vec::new();
     for raw in paths {
+        // 在处理下一个之前判断：恰好装满、后面也没有更多内容时不算被截断。
+        if entries.len() >= MAX_EXPANDED_FILES {
+            truncated = true;
+            break;
+        }
         let path = PathBuf::from(raw);
-        // symlink_metadata：不跟随符号链接，避免链接成环或把树外的内容带进来。
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        // 用户亲手选中的条目跟随符号链接：拖进来一个指向文件或目录的链接，意图就是传它指向的内容，
+        // 不跟随的话它既不是文件也不是目录，会被一声不响地丢掉。递归进入目录后不再跟随（见 walk），
+        // 避免链接成环或把树外的内容带进来。
+        let Ok(meta) = fs::metadata(&path) else { continue };
         if meta.is_file() {
             push_file(&mut entries, &path, String::new(), meta.len());
         } else if meta.is_dir() {
@@ -50,10 +57,6 @@ pub fn expand_local_paths(paths: &[String]) -> ExpandedPaths {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             walk(&path, &root_name, &mut entries, &mut truncated, &mut unreadable_dirs);
-        }
-        if entries.len() >= MAX_EXPANDED_FILES {
-            truncated = true;
-            break;
         }
     }
     entries.truncate(MAX_EXPANDED_FILES);

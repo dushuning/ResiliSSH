@@ -21,6 +21,8 @@ const POLL_TIMEOUT_MS: i32 = 1_000;
 /// 空闲时发 keepalive 或只在连接池里短暂停留（远短于此值），正常连接不可能这么久没有流量；
 /// 超过即认定链路已死，结束线程释放跳板机连接，避免弱网下线程和 socket 永久挂起。
 const IDLE_LIMIT: Duration = Duration::from_secs(180);
+/// 线程退出时关闭通道、断开跳板机最多等多久：对端多半已经不在了，不值得久等。
+const TEARDOWN_TIMEOUT_MS: u32 = 2_000;
 /// libssh2 未给出下次 keepalive 时间时的重试间隔。
 const KEEPALIVE_RETRY: Duration = Duration::from_secs(1);
 
@@ -140,7 +142,12 @@ fn pump(hop: Session, mut channel: Channel, mut local: UnixStream, hop_fd: Owned
 
     log::debug!("jump tunnel to {target} closed: {reason}");
     let _ = local.shutdown(std::net::Shutdown::Both);
-    // channel 与 hop 在此处析构，关闭跳板机上的通道与连接。
+    // 收尾前切回阻塞模式并给一个很短的超时：非阻塞下关闭通道、释放会话都可能返回「稍后再试」，
+    // 而析构不会重试，结果是每次经跳板机的连接结束都泄漏一个 libssh2 会话的内存（描述符会关，内存不会还）。
+    hop.set_blocking(true);
+    hop.set_timeout(TEARDOWN_TIMEOUT_MS);
+    drop(channel);
+    // hop 在此处析构，断开与跳板机的连接。
 }
 
 fn is_transient(err: &std::io::Error) -> bool {
@@ -156,9 +163,14 @@ fn wait_for_events(
     want_local_write: bool,
 ) -> bool {
     // libssh2 告诉我们它卡在哪个方向：发送窗口满时要等可写，否则等新数据（含窗口调整包）。
+    // 目标会话一侧暂时写不进去（want_local_write）、又没有要发往跳板机的数据（want_local_read）时，
+    // 跳板机来的新数据我们反正不会去读：此时若还等它可读，poll 会因为那些未读数据立刻返回，
+    // 循环空转直到本地一侧腾出空间。这种情况下只等本地可写（以及 libssh2 自己要发的数据）。
+    let hop_read_useless = want_local_write && want_local_read;
     let hop_events = match hop.block_directions() {
         BlockDirections::Outbound => libc::POLLOUT,
         BlockDirections::Both => libc::POLLIN | libc::POLLOUT,
+        BlockDirections::Inbound | BlockDirections::None if hop_read_useless => 0,
         BlockDirections::Inbound | BlockDirections::None => libc::POLLIN,
     };
     let mut local_events = 0;

@@ -22,6 +22,8 @@ const OUTPUT_TAIL_LINES: usize = 40;
 /// 写进活动日志的行数上限，防止 `tail -f` 之类的命令把日志刷爆。
 const MAX_LOGGED_LINES: usize = 300;
 const READ_BUFFER_BYTES: usize = 4096;
+/// 一行最多攒多少字节。进度条之类只用回车刷新、从不换行的输出会一直攒下去，到这个长度就先当作一行输出。
+const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// 变量的取值来自本次传输；多文件时 `file_name`/`remote_path` 指最后一个文件，`files` 为全部文件名。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,6 +155,10 @@ pub fn run_remote_command(
                     let line: Vec<u8> = pending.drain(..=pos).collect();
                     emit(String::from_utf8_lossy(&line[..pos]).as_ref(), &mut tail, &mut logged);
                 }
+                if pending.len() > MAX_LINE_BYTES {
+                    emit(String::from_utf8_lossy(&pending).as_ref(), &mut tail, &mut logged);
+                    pending.clear();
+                }
             }
             Err(e) => {
                 if cancel.load(Ordering::Relaxed) {
@@ -193,7 +199,18 @@ pub fn run_remote_command(
         None
     } else {
         let _ = channel.wait_close();
-        channel.exit_status().ok()
+        // 被信号结束的进程没有退出码，libssh2 此时给出的是默认值 0：不单独判断的话，
+        // 一个被 kill 掉或崩溃的命令会被记成「执行成功」。
+        match channel.exit_signal().ok().and_then(|signal| signal.exit_signal) {
+            Some(signal) => {
+                activity::error(
+                    Category::Command,
+                    crate::tr!(format!("命令被信号 {signal} 终止"), format!("Command was terminated by signal {signal}")),
+                );
+                None
+            }
+            None => channel.exit_status().ok(),
+        }
     };
 
     let outcome = CommandOutcome {

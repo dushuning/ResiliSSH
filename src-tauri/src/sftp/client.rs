@@ -121,8 +121,10 @@ pub fn is_sftp_not_found(err: &ssh2::Error) -> bool {
     matches!(err.code(), ssh2::ErrorCode::SFTP(SFTP_FX_NO_SUCH_FILE))
 }
 
-/// 握手 + 认证整体的上限（见 new_session）。比单次操作超时宽：极差的链路上密钥交换本身就要好几个往返。
-const SSH_HANDSHAKE_TIMEOUT_SECS: u64 = 90;
+/// 握手 + 认证整体的上限（见 new_session）。整个过程只有十来个往返，往返延迟两秒以内的链路都够用；
+/// 取得更长的话，连接一建立就卡死（不通也不断）时每次都要白等这么久才重试——实测 90 秒时，
+/// 一次这样的卡死就让一个 50 秒能传完的任务拖到三分钟。
+const SSH_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// 单次 TCP 建连上限。系统默认可能等 75s 以上，期间无法取消；
 /// 超时后交给外层重试循环，所以这里不会让弱网任务失败，只是让每次尝试可控、可取消。
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 20;
@@ -399,6 +401,49 @@ pub fn abort_socket(socket: &TcpStream) {
     let _ = socket.shutdown(Shutdown::Both);
 }
 
+/// 作用域以失败告终时，先打断这条连接，再让上面的对象（远端文件句柄、哈希通道、SFTP 通道）析构。
+/// 这些对象析构时都要和服务器再说一句话；连接若已经断了或卡死，每一个都会各等满一次操作超时
+/// （约 30 秒），一次断线就白等一两分钟。socket 一旦被打断，这些收尾都会立刻返回。
+/// 必须在那些对象之后声明——局部变量按声明的相反顺序析构，这样它才会最先执行。
+pub(super) struct AbortUnlessDone<'a> {
+    aborts: &'a AbortHandles,
+    session: &'a Session,
+    connection: u64,
+    done: bool,
+}
+
+/// 已经出错的会话在收尾时每一步最多等多久。
+const FAILED_SESSION_TIMEOUT_MS: u32 = 200;
+
+/// 让一个已经出错、即将丢弃的会话的后续操作尽快返回。只打断 socket 不够：一次发送在半途失败后，
+/// libssh2 的会话里留着一个没发完的包，之后每个操作都返回「稍后再试」却不指明在等读还是等写，
+/// 它的等待逻辑此时不看 socket，只是干等到操作超时——关闭文件、关闭通道、释放会话各等一次，
+/// 一条已经没用的连接要占住线程一分多钟。把超时调短，这些收尾就都立刻结束。
+pub(super) fn hurry_failed_session(session: &Session) {
+    session.set_timeout(FAILED_SESSION_TIMEOUT_MS);
+}
+
+impl<'a> AbortUnlessDone<'a> {
+    pub(super) fn new(aborts: &'a AbortHandles, session: &'a Session, connection: u64) -> Self {
+        Self { aborts, session, connection, done: false }
+    }
+
+    /// 正常走完：连接完好，照常收尾。
+    pub(super) fn done(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for AbortUnlessDone<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            log::debug!("connection {}: failed, aborting its socket before teardown", self.connection);
+            self.aborts.abort(self.connection);
+            hurry_failed_session(self.session);
+        }
+    }
+}
+
 /// 一次传输用到的所有连接的「可打断」副本。并行传输时不止一条连接：取消、无响应看门狗、
 /// 网络切换都要能把它们一起打断，让各自阻塞中的网络 IO 立刻返回。
 #[derive(Default)]
@@ -425,6 +470,13 @@ impl AbortHandles {
         let mut sockets = self.lock();
         let index = sockets.iter().position(|(socket_id, _)| *socket_id == id)?;
         Some(sockets.swap_remove(index).1)
+    }
+
+    /// 只打断其中一条连接（并行传输中某条连接卡死时用）。
+    pub fn abort(&self, id: u64) {
+        if let Some((_, socket)) = self.lock().iter().find(|(socket_id, _)| *socket_id == id) {
+            abort_socket(socket);
+        }
     }
 
     pub fn abort_all(&self) {

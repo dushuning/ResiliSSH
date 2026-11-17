@@ -7,9 +7,10 @@
 
 use super::transfer_common::CHUNK_SIZE;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// 每次领取的分段大小。太大则快慢连接之间分配不均、断线时退回的也多；太小则频繁加锁领取。
 pub const PIECE_BYTES: u64 = 8 * CHUNK_SIZE;
@@ -22,6 +23,14 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 
 /// 小于这个大小的文件不做「与目标端旧版本逐块比对」：比对本身的开销已经接近直接传一遍。
 pub const DELTA_MIN_BYTES: u64 = 8 * CHUNK_SIZE;
+
+/// 有连接在等任务时，另一条连接多久没有任何进展就认定它卡死并主动断开。
+/// 链路不通却也不断开（「黑洞」）时，TCP 自己要等到操作超时（约 30 秒）才报错；如果剩下的最后
+/// 一段正好在它手里，其他连接只能干等。分片大小是按「约 2 秒写完」自适应的，正常连接不会这么久没动静。
+const STALL_ABORT_AFTER: Duration = Duration::from_secs(12);
+/// 每主动断开一次就把阈值翻倍、直到这个上限：极慢的链路上一个分片可能真的要传这么久，
+/// 误断过一两次之后就不再打扰它，否则它每次都被打断、永远传不完一块。
+const STALL_ABORT_MAX: Duration = Duration::from_secs(120);
 
 /// 实际使用的连接数：小文件不并行，请求值限制在合理范围内。
 pub fn effective_connections(requested: usize, file_size: u64) -> usize {
@@ -130,6 +139,16 @@ struct PlanState<E> {
     exclusive: bool,
     /// 辅助连接遇到的「重连也不会好」的错误，交给主连接上报。
     fatal: Option<E>,
+    /// 正在传输的各段：由哪条连接持有、上次有进展是什么时候（见 take_stalled）。
+    holders: HashMap<u64, Holder>,
+    next_piece_id: u64,
+    stall_threshold: Duration,
+}
+
+struct Holder {
+    /// 该连接在 AbortHandles 里的编号，用来单独打断它。
+    connection: u64,
+    last_progress: Instant,
 }
 
 /// 各连接共享的传输计划。
@@ -149,6 +168,9 @@ impl<E> TransferPlan<E> {
                 finished: false,
                 exclusive: false,
                 fatal: None,
+                holders: HashMap::new(),
+                next_piece_id: 0,
+                stall_threshold: STALL_ABORT_AFTER,
             }),
             partial: AtomicU64::new(0),
         }
@@ -181,7 +203,8 @@ impl<E> TransferPlan<E> {
         self.lock().exclusive = true;
     }
 
-    pub fn claim(&self) -> Claim<'_, E> {
+    /// 领取一段任务。`connection` 是调用方那条连接在 AbortHandles 里的编号。
+    pub fn claim(&self, connection: u64) -> Claim<'_, E> {
         let mut state = self.lock();
         if state.finished || state.fatal.is_some() {
             return Claim::Done;
@@ -189,7 +212,10 @@ impl<E> TransferPlan<E> {
         match state.pending.pop_front() {
             Some((start, end)) => {
                 state.in_flight += 1;
-                Claim::Piece(Piece { plan: self, next: start, end, partial: 0 })
+                let id = state.next_piece_id;
+                state.next_piece_id += 1;
+                state.holders.insert(id, Holder { connection, last_progress: Instant::now() });
+                Claim::Piece(Piece { plan: self, id, next: start, end, partial: 0 })
             }
             None if state.in_flight > 0 || !state.ready => Claim::Wait,
             None => Claim::Done,
@@ -208,6 +234,38 @@ impl<E> TransferPlan<E> {
             PlanStatus::Wait
         } else {
             PlanStatus::Done
+        }
+    }
+
+    /// 由「正在等任务」的连接调用：返回太久没有进展、应当被打断的连接编号。
+    /// 只有别人在等的时候才值得打断——没人等的话，卡住的连接并不耽误任何人，让它自己超时即可。
+    pub fn take_stalled(&self) -> Vec<u64> {
+        let mut state = self.lock();
+        let threshold = state.stall_threshold;
+        let stalled = Self::stalled_older_than(&mut state, threshold);
+        if !stalled.is_empty() {
+            state.stall_threshold = (threshold * 2).min(STALL_ABORT_MAX);
+        }
+        stalled
+    }
+
+    fn stalled_older_than(state: &mut PlanState<E>, threshold: Duration) -> Vec<u64> {
+        let now = Instant::now();
+        state
+            .holders
+            .values_mut()
+            .filter(|holder| now.duration_since(holder.last_progress) >= threshold)
+            .map(|holder| {
+                // 重新计时：打断之后它要重连，不能在下一次检查时又被算作卡住。
+                holder.last_progress = now;
+                holder.connection
+            })
+            .collect()
+    }
+
+    fn touch(&self, piece_id: u64) {
+        if let Some(holder) = self.lock().holders.get_mut(&piece_id) {
+            holder.last_progress = Instant::now();
         }
     }
 
@@ -238,6 +296,7 @@ impl<E> TransferPlan<E> {
 /// 所以调用方不必在每个出错分支里手动归还。
 pub struct Piece<'a, E> {
     plan: &'a TransferPlan<E>,
+    id: u64,
     /// 下一个要传的块的起点。
     pub next: u64,
     pub end: u64,
@@ -253,12 +312,22 @@ impl<E> Piece<'_, E> {
             self.plan.partial.fetch_sub(self.partial - bytes, Ordering::Relaxed);
         }
         self.partial = bytes;
+        if bytes > 0 {
+            self.plan.touch(self.id);
+        }
+    }
+
+    /// 连接还活着、只是这一步不产生字节进度（如逐块读回校验）：刷新「上次有进展」的时间，
+    /// 免得被等任务的其他连接当成卡死而打断。
+    pub fn touch(&self) {
+        self.plan.touch(self.id);
     }
 
     /// 一块传完并已记入断点：前进到下一块。
     pub fn advance(&mut self, len: u64) {
         self.set_partial(0);
         self.next += len;
+        self.plan.touch(self.id);
     }
 }
 
@@ -266,6 +335,7 @@ impl<E> Drop for Piece<'_, E> {
     fn drop(&mut self) {
         self.set_partial(0);
         let mut state = self.plan.lock();
+        state.holders.remove(&self.id);
         state.in_flight -= 1;
         if self.next < self.end {
             // 放回队首：让文件尽量按顺序完成，已完成区间也更容易合并。
@@ -312,15 +382,15 @@ mod tests {
     #[test]
     fn unfinished_part_of_a_piece_returns_to_the_queue() {
         let plan: TransferPlan<()> = TransferPlan::new();
-        assert!(matches!(plan.claim(), Claim::Wait), "nothing to claim before the plan is ready");
+        assert!(matches!(plan.claim(0), Claim::Wait), "nothing to claim before the plan is ready");
         plan.start(&[(0, PIECE_BYTES + MB)]);
-        let Claim::Piece(mut first) = plan.claim() else { panic!("expected a piece") };
+        let Claim::Piece(mut first) = plan.claim(0) else { panic!("expected a piece") };
         assert_eq!((first.next, first.end), (0, PIECE_BYTES));
         first.advance(MB);
-        let Claim::Piece(second) = plan.claim() else { panic!("expected a piece") };
-        assert!(matches!(plan.claim(), Claim::Wait), "others still hold pieces");
+        let Claim::Piece(second) = plan.claim(0) else { panic!("expected a piece") };
+        assert!(matches!(plan.claim(0), Claim::Wait), "others still hold pieces");
         drop(first);
-        let Claim::Piece(retry) = plan.claim() else { panic!("the rest of the dropped piece must come back") };
+        let Claim::Piece(retry) = plan.claim(0) else { panic!("the rest of the dropped piece must come back") };
         assert_eq!((retry.next, retry.end), (MB, PIECE_BYTES));
         let mut retry = retry;
         retry.next = retry.end;
@@ -328,7 +398,25 @@ mod tests {
         let mut second = second;
         second.next = second.end;
         drop(second);
-        assert!(matches!(plan.claim(), Claim::Done));
+        assert!(matches!(plan.claim(0), Claim::Done));
+    }
+
+    #[test]
+    fn only_connections_without_progress_are_reported_as_stalled() {
+        let plan: TransferPlan<()> = TransferPlan::new();
+        plan.start(&[(0, 2 * PIECE_BYTES)]);
+        let Claim::Piece(mut busy) = plan.claim(7) else { panic!("expected a piece") };
+        let Claim::Piece(stuck) = plan.claim(9) else { panic!("expected a piece") };
+        std::thread::sleep(Duration::from_millis(30));
+        busy.set_partial(MB);
+        let threshold = Duration::from_millis(20);
+        let stalled = TransferPlan::stalled_older_than(&mut plan.lock(), threshold);
+        assert_eq!(stalled, vec![9], "only the connection that made no progress");
+        // 报告过一次后重新计时，不会立刻再报。
+        assert!(TransferPlan::stalled_older_than(&mut plan.lock(), threshold).is_empty());
+        drop(stuck);
+        drop(busy);
+        assert!(plan.lock().holders.is_empty(), "finished pieces are no longer tracked");
     }
 
     #[test]

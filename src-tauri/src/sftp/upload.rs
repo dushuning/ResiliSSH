@@ -1,14 +1,17 @@
 use super::errors::is_permanent_sftp_error;
 use super::transfer_common::{
-    align_down, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
+    align_down, bounded_read_len, current_retry_count, effective_verified_bytes, ensure_not_cancelled,
     increment_retry_count, sha256_bytes, sha256_local_file, sha256_remote_file,
     should_skip_full_file_hash, sleep_backoff, TransferCheckpoint, TransferError, CHUNK_SIZE,
     HASH_READ_BUFFER_SIZE, hex_encode,
 };
 use super::client::{
-    connect_session, is_sftp_not_found, keepalive_while_idle, AbortHandles, ConnectError, ConnectionConfig,
+    connect_session, is_sftp_not_found, hurry_failed_session, keepalive_while_idle, AbortHandles, AbortUnlessDone, ConnectError,
+    ConnectionConfig,
 };
-use super::plan::{effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES};
+use super::plan::{
+    effective_connections, Claim, PlanStatus, RangeSet, TransferPlan, DELTA_MIN_BYTES, PIECE_BYTES,
+};
 use super::remote_hash::{remote_block_hashes, remote_copy, remote_file_sha256, BlockHasher};
 use super::browse::join_remote_path;
 use super::pool;
@@ -26,12 +29,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 写入分片大小的上下限。libssh2 会把单次写入的数据流水线发送，分片越大，每个往返在途的数据越多：
+/// 写入分片大小的上下限。libssh2 会把单次写入的数据流水线发送，但每次写入都要等这一批全部被确认
+/// 才返回，也就是每个分片之间连接会空转一个往返；分片越大，空转占的比例越小：
 /// 实测 100 ms 往返延迟下 5 MB 上传，64 KB 分片 12.5 s、256 KB 6.0 s、1 MB 4.2 s。
 /// 但进度只在每个分片写完时刷新，慢速链路上大分片会让进度条长时间不动、被误判为无响应，
 /// 所以按实测速度自适应：让每个分片大约 TARGET_SLICE_SECS 秒写完。
+/// 上限是一整段任务：快而延迟高的链路上（跨境专线等）若仍以 1 MB 为上限，每传 1 MB 就要
+/// 空等一个往返写确认、再等一个往返校验，实际速度会被压到带宽的几分之一。
 const MIN_WRITE_SLICE: usize = 64 * 1024;
-const MAX_WRITE_SLICE: usize = CHUNK_SIZE as usize;
+const MAX_WRITE_SLICE: usize = PIECE_BYTES as usize;
+/// 分片每轮最多增长到上一轮写入量的几倍。
+const SLICE_GROWTH_LIMIT: usize = 2;
+/// 出错重连后把分片缩小到原来的几分之一：链路可能刚变差，沿用之前的大分片第一片就可能超时。
+const SLICE_SHRINK_ON_ERROR: usize = 4;
+
+/// 一轮连续写入多少字节：大约一个分片的量，凑成整块（断点按块记录），至少一块，不超过这一段剩下的。
+/// 一轮写完才校验、才记入断点，所以它也是一次断线最多白传的量——约 TARGET_SLICE_SECS 秒的数据。
+fn run_length(write_slice: usize, remaining: u64) -> u64 {
+    let blocks = (write_slice as u64).div_ceil(CHUNK_SIZE).max(1);
+    (blocks * CHUNK_SIZE).min(remaining)
+}
 /// 第一块还没有测速数据，取中间值。
 const INITIAL_WRITE_SLICE: usize = 256 * 1024;
 const TARGET_SLICE_SECS: f64 = 2.0;
@@ -453,20 +470,29 @@ impl UploadShared<'_> {
         (self.callbacks.on_progress)(transferred, self.local_size, status, retries);
     }
 
-    /// 一块已写入（并按当前模式校验过）：记入断点并落盘。
-    fn complete_block(&self, offset: u64, len: u64, read_back: bool) -> Result<(), UploadError> {
+    /// 一轮数据已写入（并按当前模式校验过）：记入断点并落盘。
+    fn complete_range(&self, offset: u64, len: u64, read_back: bool) -> Result<(), UploadError> {
         let mut cp = self.checkpoint.lock().map_err(|e| UploadError::Sftp(e.to_string()))?;
         cp.done_ranges.insert(offset, offset + len);
         let total = cp.done_ranges.total();
         cp.uploaded_bytes = total;
         cp.verified_bytes = total;
         cp.all_chunks_verified &= read_back;
-        save_checkpoint(&cp).map_err(UploadError::Sftp)
+        save_checkpoint(&cp).map_err(checkpoint_error)
     }
 
     fn transferred(&self) -> u64 {
         self.checkpoint.lock().map(|cp| cp.uploaded_bytes).unwrap_or(0)
     }
+}
+
+/// 断点写不进本地磁盘（磁盘满、目录不可写）。这是本机的问题，重连服务器解决不了；
+/// 而断点落不了盘就无法保证续传，所以按本地错误停下来，而不是伪装成一个会被无限重试的「SFTP 错误」。
+fn checkpoint_error(detail: String) -> UploadError {
+    UploadError::LocalIo(crate::tr!(
+        format!("无法保存断点文件（{detail}）"),
+        format!("cannot save the checkpoint file ({detail})")
+    ))
 }
 
 /// 重连也不会好的错误：停止重试，把断点留给用户处理。
@@ -549,10 +575,9 @@ pub fn upload_with_resume(
         let result =
             lead_loop(&config, &shared, &resolved_remote_path, staged, started_fingerprint, &force_overwrite);
         shared.plan.finish();
-        if result.is_err() {
-            // 失败或取消：别让辅助连接在阻塞的网络 IO 里再等上几十秒才发现该退出了。
-            aborts.abort_all();
-        }
+        // 无论成败都打断还登记着的连接（成功时主连接已交还连接池、不在其中，剩下的只有辅助连接）：
+        // 辅助连接若正卡在一条已经死掉的连接上做收尾，会让一个早已传完并校验通过的任务迟迟不结束。
+        aborts.abort_all();
         result
     })
 }
@@ -624,12 +649,12 @@ fn lead_loop(
             }
         }
 
-        let (active_session, _) = session.as_ref().unwrap();
+        let (active_session, connection) = session.as_ref().unwrap();
         let transfer_result = if let Some(final_path) = &verified_target {
             promote_staged_file(active_session, &write_path_for(final_path), final_path, local_size)
                 .map(|()| final_path.clone())
         } else {
-            lead_transfer(active_session, shared, resolved_remote_path, staged, force_overwrite, &mut write_slice)
+            lead_transfer(active_session, shared, resolved_remote_path, staged, force_overwrite, &mut write_slice, *connection)
                 // 校验与传输放在同一个结果里：校验阶段的网络错误和传输中的一样，交给下面的重试分支
                 // 重连后再校验一次，而不是让一个已经传完的文件以失败告终。
                 .and_then(|final_path| {
@@ -687,9 +712,14 @@ fn lead_loop(
                 }
 
                 let retry_count = increment_retry_count(checkpoint)?;
-                if let Some((_, abort_id)) = session.take() {
+                if let Some((failed_session, abort_id)) = session.take() {
+                    // 先打断再丢弃：会话析构时还要向服务器道别，在一条死连接上会空等一次超时。
+                    shared.aborts.abort(abort_id);
+                    hurry_failed_session(&failed_session);
+                    drop(failed_session);
                     shared.aborts.remove(abort_id);
                 }
+                write_slice = (write_slice / SLICE_SHRINK_ON_ERROR).max(MIN_WRITE_SLICE);
                 let backoff_ms = backoff.next_delay_ms(shared.transferred());
                 let message = crate::tr!(
                     format!("传输中断（{err}），{backoff_ms}ms 后重连续传"),
@@ -711,8 +741,11 @@ fn lead_transfer(
     staged: bool,
     force_overwrite: &AtomicBool,
     write_slice: &mut usize,
+    connection: u64,
 ) -> Result<String, UploadError> {
     let sftp = session.sftp().map_err(|e| UploadError::Sftp(e.to_string()))?;
+    // 在 sftp 之后声明：出错时先打断连接，sftp 的析构才不会在一条死连接上空等。
+    let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
     let lock_target = || shared.target.lock().map_err(|e| UploadError::Sftp(e.to_string()));
     let existing = lock_target()?.clone();
     let (final_path, write_path) = match existing {
@@ -724,7 +757,7 @@ fn lead_transfer(
         }
     };
 
-    pump_pieces(session, &sftp, &write_path, shared, write_slice)?;
+    pump_pieces(session, &sftp, &write_path, shared, write_slice, connection)?;
     if let Some(fatal) = shared.plan.take_fatal() {
         return Err(fatal);
     }
@@ -738,6 +771,7 @@ fn lead_transfer(
     if final_size != shared.local_size {
         return Err(UploadError::SizeMismatch { local: shared.local_size, remote: final_size });
     }
+    teardown.done();
     Ok(final_path)
 }
 
@@ -758,7 +792,7 @@ fn prepare_upload(
     if final_path != resolved_remote_path {
         let mut cp = lock()?;
         cp.remote_path = final_path.clone();
-        save_checkpoint(&cp).map_err(UploadError::Sftp)?;
+        save_checkpoint(&cp).map_err(checkpoint_error)?;
         log::info!("resolved upload target: {final_path}");
     }
     ensure_remote_parent_directories(sftp, &final_path)?;
@@ -822,7 +856,7 @@ fn prepare_upload(
             cp.all_chunks_verified = true;
         }
         cp.done_ranges = done.clone();
-        save_checkpoint(&cp).map_err(UploadError::Sftp)?;
+        save_checkpoint(&cp).map_err(checkpoint_error)?;
     }
 
     // 每次开始都记录从哪里接着传：用户能在日志里看到断点续传确实生效、没有从头再来。
@@ -950,37 +984,64 @@ fn remote_block_hash(
     sha256_remote_handle_range(remote_file, offset, len, Some(on_activity))
 }
 
-/// 每写完一块立即核对远端内容；不一致则报错，这一块会被重新传。
-fn verify_written_block(
+/// 每写完一轮立即逐块核对远端内容；有一块不一致就报错，这一轮会被重新传。
+/// 优先让服务器一次算出这一轮所有块的哈希（请求连发、回复连收，总共约一个往返），
+/// 这条路走不通时逐块读回来算。
+fn verify_written_run(
     remote_file: &mut RemoteFile,
     hasher: &mut Option<BlockHasher>,
     local_bytes: &[u8],
     offset: u64,
     shared: &UploadShared<'_>,
+    on_activity: &dyn Fn(),
 ) -> Result<(), UploadError> {
-    let len = local_bytes.len() as u64;
-    let local_hash = sha256_bytes(local_bytes);
-    let used_remote_hasher = hasher.is_some();
-    let mut remote_hash = remote_block_hash(remote_file, hasher, offset, len, shared)?;
-    if local_hash != remote_hash && used_remote_hasher && hasher.is_some() {
-        // 服务器端算出来的不一致：下结论前先按老办法读回来确认一次，
-        // 免得因为那条捷径自身的问题（例如工具输出异常）把好数据判成坏的；确认是它的问题就不再用它。
-        remote_hash = sha256_remote_handle_range(remote_file, offset, len, Some(&shared.callbacks.on_activity))?;
-        if local_hash == remote_hash {
-            log::warn!("remote block hasher disagreed with read-back at offset {offset}; disabling it");
-            *hasher = None;
+    let blocks: Vec<(u64, &[u8])> = local_bytes
+        .chunks(CHUNK_SIZE as usize)
+        .enumerate()
+        .map(|(index, bytes)| (offset + index as u64 * CHUNK_SIZE, bytes))
+        .collect();
+    on_activity();
+    let from_server = hasher.as_mut().and_then(|active| {
+        let ranges: Vec<(u64, u64)> = blocks.iter().map(|(start, bytes)| (*start, bytes.len() as u64)).collect();
+        match active.hash_many(&ranges, shared.cancel) {
+            Ok(hashes) => Some(hashes),
+            Err(e) => {
+                log::info!("remote block hasher unavailable ({e}), reading blocks back instead");
+                None
+            }
         }
+    });
+    if from_server.is_none() {
+        *hasher = None;
     }
-    if local_hash == remote_hash {
-        log::info!("chunk verified offset={offset} len={len} hash={}", hex_encode(&local_hash));
-        return Ok(());
+
+    for (index, (start, bytes)) in blocks.iter().enumerate() {
+        let len = bytes.len() as u64;
+        let local_hash = sha256_bytes(bytes);
+        let mut remote_hash = match &from_server {
+            Some(hashes) => hashes[index],
+            None => sha256_remote_handle_range(remote_file, *start, len, Some(on_activity))?,
+        };
+        if local_hash != remote_hash && from_server.is_some() {
+            // 服务器端算出来的不一致：下结论前先按老办法读回来确认一次，免得因为那条捷径自身的
+            // 问题（例如工具输出异常）把好数据判成坏的；确认是它的问题就不再用它。
+            remote_hash = sha256_remote_handle_range(remote_file, *start, len, Some(on_activity))?;
+            if local_hash == remote_hash {
+                log::warn!("remote block hasher disagreed with read-back at offset {start}; disabling it");
+                *hasher = None;
+            }
+        }
+        if local_hash != remote_hash {
+            log::error!(
+                "chunk hash mismatch offset={start} len={len} local={} remote={}",
+                hex_encode(&local_hash),
+                hex_encode(&remote_hash)
+            );
+            return Err(UploadError::ChunkVerifyMismatch { offset: *start, len });
+        }
+        log::debug!("chunk verified offset={start} len={len} hash={}", hex_encode(&local_hash));
     }
-    log::error!(
-        "chunk hash mismatch offset={offset} len={len} local={} remote={}",
-        hex_encode(&local_hash),
-        hex_encode(&remote_hash)
-    );
-    Err(UploadError::ChunkVerifyMismatch { offset, len })
+    Ok(())
 }
 
 /// 从队列里不断领任务并传输，直到全部完成。主连接和辅助连接共用。
@@ -992,21 +1053,31 @@ fn pump_pieces(
     write_path: &str,
     shared: &UploadShared<'_>,
     write_slice: &mut usize,
+    connection: u64,
 ) -> Result<(), UploadError> {
     let mut local_file = File::open(shared.local_path).map_err(|e| UploadError::LocalIo(e.to_string()))?;
     let mut remote_file: Option<RemoteFile> = None;
     // 服务器端哈希进程按需启动（只有逐块校验才用得到），每个连接一个。
     let mut hasher: Option<BlockHasher> = None;
     let mut hasher_started = false;
-    let mut chunk_buffer = vec![0_u8; CHUNK_SIZE as usize];
+    // 在文件句柄和哈希通道之后声明，出错时先于它们执行（见 AbortUnlessDone）。
+    let teardown = AbortUnlessDone::new(shared.aborts, session, connection);
+    // 一轮最多写一整段任务，缓冲区按这个上限分配一次。
+    let mut run_buffer = vec![0_u8; PIECE_BYTES as usize];
 
     loop {
         if shared.cancel.load(Ordering::Relaxed) {
             return Err(UploadError::Cancelled);
         }
-        let mut piece = match shared.plan.claim() {
+        let mut piece = match shared.plan.claim(connection) {
             Claim::Piece(piece) => piece,
             Claim::Wait => {
+                // 自己没活干、在等别的连接：顺便看看有没有哪条已经卡死，有就打断它，
+                // 它手里的那段会退回队列由我接手，不必等它自己超时。
+                for stalled in shared.plan.take_stalled() {
+                    log::warn!("connection {stalled} made no progress for too long while others wait; aborting it");
+                    shared.aborts.abort(stalled);
+                }
                 keepalive_while_idle(session);
                 thread::sleep(PLAN_POLL);
                 continue;
@@ -1023,17 +1094,20 @@ fn pump_pieces(
                 return Err(UploadError::Cancelled);
             }
             let offset = piece.next;
-            let chunk_len = CHUNK_SIZE.min(piece.end - offset) as usize;
-            let chunk = &mut chunk_buffer[..chunk_len];
+            let run_len = run_length(*write_slice, piece.end - offset) as usize;
+            log::debug!("connection {connection}: writing {run_len} bytes at {offset} (slice {})", *write_slice);
+            let run = &mut run_buffer[..run_len];
             local_file.seek(SeekFrom::Start(offset)).map_err(|e| UploadError::LocalIo(e.to_string()))?;
-            local_file.read_exact(chunk).map_err(|e| UploadError::LocalIo(e.to_string()))?;
+            local_file.read_exact(run).map_err(|e| UploadError::LocalIo(e.to_string()))?;
 
             let write_started = Instant::now();
-            write_remote_chunk(remote, offset, chunk, *write_slice, |absolute| {
+            write_remote_chunk(remote, offset, run, *write_slice, |absolute| {
                 piece.set_partial(absolute - offset);
                 shared.report("uploading");
             })?;
-            *write_slice = next_write_slice(chunk_len, write_started.elapsed());
+            // 每轮最多比上一轮翻一倍：一次测速偏高（刚连上、缓冲区还空）就直接跳到上限的话，
+            // 下一轮可能一口气写出好几秒的数据，取消要等它写完才生效，断线时白传的也多。
+            *write_slice = next_write_slice(run_len, write_started.elapsed()).min(run_len * SLICE_GROWTH_LIMIT);
 
             let read_back = shared.strict.load(Ordering::Relaxed);
             if read_back {
@@ -1041,19 +1115,27 @@ fn pump_pieces(
                     hasher = BlockHasher::start(session, write_path);
                 }
                 shared.report("chunk_verifying");
-                verify_written_block(remote, &mut hasher, chunk, offset, shared)?;
+                // 读回校验不产生字节进度：除了给界面的无响应检测报平安，也要让调度知道这条连接还活着。
+                let alive = || {
+                    (shared.callbacks.on_activity)();
+                    piece.touch();
+                };
+                verify_written_run(remote, &mut hasher, run, offset, shared, &alive)?;
             }
 
-            shared.complete_block(offset, chunk_len as u64, read_back)?;
-            piece.advance(chunk_len as u64);
+            log::debug!("connection {connection}: {run_len} bytes at {offset} written and checked");
+            shared.complete_range(offset, run_len as u64, read_back)?;
+            piece.advance(run_len as u64);
             shared.report("uploading");
         }
     }
 
+    log::debug!("connection {connection}: no more pieces, closing the remote file");
     // 关闭句柄让服务器完成所有写入，之后才能用路径 stat 核对最终大小。
     if let Some(mut file) = remote_file {
         file.close().map_err(|e| UploadError::Sftp(e.to_string()))?;
     }
+    teardown.done();
     Ok(())
 }
 
@@ -1080,11 +1162,16 @@ fn helper_loop(config: &ConnectionConfig, shared: &UploadShared<'_>, index: usiz
 
         let result = connect_session(config).map_err(UploadError::Connect).and_then(|(session, abort)| {
             let abort_id = shared.aborts.register(abort);
-            let result = session
-                .sftp()
-                .map_err(|e| UploadError::Sftp(e.to_string()))
-                .and_then(|sftp| pump_pieces(&session, &sftp, &write_path, shared, &mut write_slice));
+            log::debug!("parallel upload thread {index} now uses connection {abort_id}");
+            let result = session.sftp().map_err(|e| UploadError::Sftp(e.to_string())).and_then(|sftp| {
+                let result = pump_pieces(&session, &sftp, &write_path, shared, &mut write_slice, abort_id);
+                log::debug!("connection {abort_id}: pump returned (ok={})", result.is_ok());
+                result
+            });
+            log::debug!("connection {abort_id}: sftp channel released");
             shared.aborts.remove(abort_id);
+            drop(session);
+            log::debug!("connection {abort_id}: session released");
             result
         });
         match result {
@@ -1100,7 +1187,8 @@ fn helper_loop(config: &ConnectionConfig, shared: &UploadShared<'_>, index: usiz
             }
             Err(err) => {
                 let delay = backoff.next_delay_ms(shared.transferred());
-                log::warn!("parallel upload connection {index} interrupted ({err}), retrying in {delay}ms");
+                write_slice = (write_slice / SLICE_SHRINK_ON_ERROR).max(MIN_WRITE_SLICE);
+                log::warn!("parallel upload thread {index} interrupted ({err}), retrying in {delay}ms");
                 if sleep_backoff::<UploadError>(shared.cancel, delay).is_err() {
                     return;
                 }
@@ -1216,7 +1304,8 @@ fn sha256_remote_handle_range(
         if let Some(defer) = on_read {
             defer();
         }
-        let to_read = (buffer.len() as u64).min(remaining) as usize;
+        // 读取大小随剩余量收紧：读回校验的范围之外的预读数据用不上，换位置时会被整批作废。
+        let to_read = bounded_read_len((buffer.len() as u64).min(remaining) as usize, remaining);
         let read_bytes = remote_file
             .read(&mut buffer[..to_read])
             .map_err(|e| UploadError::Sftp(e.to_string()))?;
@@ -1270,19 +1359,16 @@ fn open_remote_for_upload(sftp: &Sftp, remote_path: &str) -> Result<RemoteFile, 
     .map_err(|e| UploadError::Sftp(e.to_string()))
 }
 
-/// 根据上一块的实测写入速度决定下一块的分片大小（取 2 的幂，避免尺寸频繁抖动）。
+/// 根据上一轮的实测写入速度决定下一个分片的大小（取 2 的幂，避免尺寸频繁抖动）。
+/// 向上取整：实测速度里含有「等确认」的空转时间，总是略低于链路的真实速度；向下取整的话，
+/// 分片会卡在比目标小一档的地方上不去（例如 1 MB/s 的链路永远停在 1 MB，每块都要空等一次）。
 fn next_write_slice(bytes: usize, elapsed: std::time::Duration) -> usize {
     let secs = elapsed.as_secs_f64();
     if secs <= 0.0 {
         return MAX_WRITE_SLICE;
     }
     let target = (bytes as f64 / secs * TARGET_SLICE_SECS) as usize;
-    let power_of_two = if target == 0 {
-        MIN_WRITE_SLICE
-    } else {
-        1 << (usize::BITS - 1 - target.leading_zeros())
-    };
-    power_of_two.clamp(MIN_WRITE_SLICE, MAX_WRITE_SLICE)
+    target.next_power_of_two().clamp(MIN_WRITE_SLICE, MAX_WRITE_SLICE)
 }
 
 fn write_remote_chunk<F: FnMut(u64)>(
@@ -1326,8 +1412,8 @@ mod tests {
         use std::time::Duration;
         // 快速链路：1 MB 只用 0.1 s → 用满上限，尽量多的数据在途。
         assert_eq!(next_write_slice(1 << 20, Duration::from_millis(100)), MAX_WRITE_SLICE);
-        // 约 300 KB/s：2 秒约 600 KB → 取 2 的幂 512 KB。
-        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(3400)), 512 * 1024);
+        // 约 300 KB/s：2 秒约 600 KB → 向上取 2 的幂，1 MB。
+        assert_eq!(next_write_slice(1 << 20, Duration::from_millis(3400)), 1 << 20);
         // 弱网 20 KB/s：退到下限，保证进度仍然频繁刷新。
         assert_eq!(next_write_slice(1 << 20, Duration::from_secs(50)), MIN_WRITE_SLICE);
         assert_eq!(next_write_slice(1 << 20, Duration::ZERO), MAX_WRITE_SLICE);

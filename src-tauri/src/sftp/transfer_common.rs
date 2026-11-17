@@ -49,12 +49,35 @@ fn lock_error<E: TransferError>(err: impl std::fmt::Display) -> E {
 /// 避免出现在常规的目录列表里被误当成正式文件。
 const STAGING_SUFFIX: &str = ".resiliss-part";
 
+/// 文件名（单个路径分量）在常见文件系统上的字节数上限。
+const MAX_FILE_NAME_BYTES: usize = 255;
+/// 文件名太长、需要截短时附加的摘要长度（十六进制字符数），用来区分截短后同名的文件。
+const NAME_DIGEST_HEX: usize = 8;
+
 /// 目标文件对应的临时文件路径：`/opt/app/app.jar` → `/opt/app/.app.jar.resiliss-part`。
 /// 上传（远端路径）与下载（本地路径）共用同一命名，用户在两端看到的临时文件一致。
+/// 临时文件名比原名长，原名已接近文件系统上限时直接加前后缀会创建失败（上传表现为无限重试、
+/// 下载表现为本地错误），这时把原名截短并附上它的摘要。
 pub fn staging_path(final_path: &str) -> String {
-    match final_path.rsplit_once('/') {
-        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
-        None => format!(".{final_path}{STAGING_SUFFIX}"),
+    let (dir, name) = match final_path.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, final_path),
+    };
+    let budget = MAX_FILE_NAME_BYTES - 1 - STAGING_SUFFIX.len();
+    let staged_name = if name.len() <= budget {
+        format!(".{name}{STAGING_SUFFIX}")
+    } else {
+        let digest = &hex_encode(&sha256_bytes(name.as_bytes()))[..NAME_DIGEST_HEX];
+        // 截短点必须落在字符边界上，否则会切出半个多字节字符。
+        let mut keep = budget - NAME_DIGEST_HEX - 1;
+        while !name.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        format!(".{}~{digest}{STAGING_SUFFIX}", &name[..keep])
+    };
+    match dir {
+        Some(dir) => format!("{dir}/{staged_name}"),
+        None => staged_name,
     }
 }
 
@@ -66,6 +89,19 @@ pub fn is_staging_file(name: &str) -> bool {
 
 pub fn align_down(offset: u64) -> u64 {
     offset - (offset % CHUNK_SIZE)
+}
+
+/// libssh2 每次读取都会向服务器预先请求「本次缓冲区大小 × 这个倍数」的数据（sftp_read 的 max_read_ahead）。
+const SFTP_READ_AHEAD_FACTOR: u64 = 4;
+/// 单次读取的下限：接近边界时也不把读取切得过碎。此时预读最多越过边界这个值的几倍，浪费可以忽略。
+const MIN_BOUNDED_READ: usize = 8 * 1024;
+
+/// 这次读取最多读多少字节，才能让 libssh2 的预读基本不越过 `until_boundary`（距离本次任务终点的字节数）。
+/// 越过去的预读数据服务器照样会发，我们却用不上：之后一换位置（libssh2 的 seek）它们就被整批作废，
+/// 等于白占带宽。此前每下 1 MB 就换一次位置、每次作废约 3 MB 预读，下载因此只有带宽的四分之一。
+pub fn bounded_read_len(want: usize, until_boundary: u64) -> usize {
+    let within_read_ahead = (until_boundary / SFTP_READ_AHEAD_FACTOR) as usize;
+    want.min(within_read_ahead.max(MIN_BOUNDED_READ)).max(1)
 }
 
 /// 直接对内存字节求 SHA-256：刚传输的块内容已在缓冲区里，与另一端读回结果比对时省去一次读取。
@@ -231,10 +267,35 @@ mod tests {
     }
 
     #[test]
+    fn staging_name_never_exceeds_the_file_name_limit() {
+        // 81 个汉字 = 243 字节：原名合法，但直接加前后缀会超过 255 字节。
+        let long = "长".repeat(81);
+        let staged = staging_path(&format!("/data/{long}"));
+        let name = staged.rsplit('/').next().unwrap();
+        assert!(name.len() <= MAX_FILE_NAME_BYTES, "{} bytes", name.len());
+        assert!(is_staging_file(name));
+        // 截短后仍能区分不同的原名。
+        let other = staging_path(&format!("/data/{}短", "长".repeat(80)));
+        assert_ne!(staged, other);
+    }
+
+    #[test]
     fn staging_files_are_recognized_by_name() {
         assert!(is_staging_file(".app.jar.resiliss-part"));
         assert!(!is_staging_file("app.jar"));
         assert!(!is_staging_file("app.jar.resiliss-part"));
+    }
+
+    #[test]
+    fn reads_shrink_so_read_ahead_stays_inside_the_piece() {
+        const MB: usize = 1024 * 1024;
+        // 离终点还远：按需要的量读，预读（×4）仍在范围内。
+        assert_eq!(bounded_read_len(MB, 8 * MB as u64), MB);
+        // 只剩 1 MB：一次最多读四分之一，预读正好到终点。
+        assert_eq!(bounded_read_len(MB, MB as u64), MB / 4);
+        // 快到终点时不再无限切小。
+        assert_eq!(bounded_read_len(MB, 1024), MIN_BOUNDED_READ);
+        assert_eq!(bounded_read_len(100, 1024), 100);
     }
 
     #[test]

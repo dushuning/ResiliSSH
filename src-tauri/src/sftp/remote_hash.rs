@@ -18,6 +18,9 @@ const SHA256_HEX_LEN: usize = 64;
 const SLOWEST_REMOTE_HASH_BYTES_PER_SEC: u64 = 5 * 1024 * 1024;
 /// 在估算时间之外固定多等的余量（进程启动、磁盘缓存未命中等）。
 const REMOTE_HASH_GRACE: Duration = Duration::from_secs(60);
+/// 逐块哈希最多等多久。几 MB 的数据服务器瞬间就能算完，等不到回复只可能是连接出了问题；
+/// 取得比会话的单次操作超时短，意思是「第一次读超时就放弃」，而不是像整文件哈希那样接着等。
+const BLOCK_HASH_GRACE: Duration = Duration::from_secs(5);
 /// 单行回复的长度上限：正常只有 64 个十六进制字符加文件名，超过说明对面输出的不是哈希。
 const MAX_REPLY_BYTES: usize = 512;
 
@@ -180,13 +183,35 @@ impl BlockHasher {
         Some(Self { channel })
     }
 
+    /// 一次核对多块：请求连着发出去、回复连着收回来，总共约一个往返，而不是每块一个。
+    /// 每个 `(offset, len)` 的含义与 `hash` 相同。
+    pub fn hash_many(&mut self, blocks: &[(u64, u64)], cancel: &AtomicBool) -> Result<Vec<[u8; 32]>, String> {
+        let requests: String = blocks
+            .iter()
+            .map(|(offset, len)| {
+                debug_assert_eq!(offset % CHUNK_SIZE, 0, "block hasher works on block-aligned offsets");
+                format!("{} {len}\n", offset / CHUNK_SIZE)
+            })
+            .collect();
+        self.channel.write_all(requests.as_bytes()).and_then(|()| self.channel.flush()).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + BLOCK_HASH_GRACE;
+        blocks
+            .iter()
+            .map(|_| {
+                read_line(&mut self.channel, deadline, cancel, &|| {})
+                    .as_deref()
+                    .and_then(parse_hash)
+                    .ok_or_else(|| "remote block hasher gave no usable reply".to_string())
+            })
+            .collect()
+    }
+
     /// 服务器上 `[offset, offset+len)` 这一块的 SHA-256；`offset` 必须是块大小的整数倍。
     pub fn hash(&mut self, offset: u64, len: u64, cancel: &AtomicBool) -> Result<[u8; 32], String> {
         debug_assert_eq!(offset % CHUNK_SIZE, 0, "block hasher works on block-aligned offsets");
         let request = format!("{} {len}\n", offset / CHUNK_SIZE);
         self.channel.write_all(request.as_bytes()).and_then(|()| self.channel.flush()).map_err(|e| e.to_string())?;
-        // 一块最多 1 MB，服务器瞬间就能算完；这里的上限只是防止对面卡死时无限等下去。
-        let deadline = Instant::now() + REMOTE_HASH_GRACE;
+        let deadline = Instant::now() + BLOCK_HASH_GRACE;
         read_line(&mut self.channel, deadline, cancel, &|| {})
             .as_deref()
             .and_then(parse_hash)

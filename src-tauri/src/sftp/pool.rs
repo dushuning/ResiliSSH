@@ -9,7 +9,7 @@
 //! 主机、用户、凭据或跳板机链任何一项不同都不会复用。空闲超过 IDLE_TTL 自动断开。
 
 use super::client::{
-    connect_session, set_operation_timeout, ConnectError, ConnectionConfig, DEFAULT_OPERATION_TIMEOUT_MS,
+    connect_session, hurry_failed_session, set_operation_timeout, ConnectError, ConnectionConfig, DEFAULT_OPERATION_TIMEOUT_MS,
 };
 use sha2::{Digest, Sha256};
 use ssh2::Session;
@@ -137,6 +137,9 @@ pub fn with_session<T>(
     let result = operation(&session);
     if result.is_ok() {
         release(config, session, abort);
+    } else {
+        // 出错的会话不再留用；先让它的收尾尽快结束，免得调用方在一条坏连接上多等一两次超时。
+        hurry_failed_session(&session);
     }
     result
 }

@@ -74,6 +74,11 @@ pub fn expand_remote_paths(config: &ConnectionConfig, paths: &[String]) -> Resul
 fn expand_paths(sftp: &Sftp, paths: &[String]) -> ExpandedPaths {
     let mut out = ExpandedPaths { entries: Vec::new(), truncated: false, unreadable_dirs: Vec::new() };
     for raw in paths {
+        // 在处理下一个之前判断：恰好装满、后面也没有更多内容时不算被截断。
+        if out.entries.len() >= MAX_EXPANDED_FILES {
+            out.truncated = true;
+            break;
+        }
         let path = trim_trailing_slash(raw.trim());
         // 用户亲手选中的条目跟随符号链接（stat）：选中一个指向文件或目录的链接，意图就是下载它指向的内容，
         // 不跟随的话它既不是文件也不是目录，会被一声不响地丢掉。递归进入目录后则不再跟随（见 walk_remote）。
@@ -89,10 +94,6 @@ fn expand_paths(sftp: &Sftp, paths: &[String]) -> ExpandedPaths {
             push_remote_file(&mut out, path, String::new(), stat.size.unwrap_or(0));
         } else if stat.is_dir() {
             walk_remote(sftp, path, &entry_name(Path::new(path)), &mut out);
-        }
-        if out.entries.len() >= MAX_EXPANDED_FILES {
-            out.truncated = true;
-            break;
         }
     }
     out.entries.truncate(MAX_EXPANDED_FILES);
