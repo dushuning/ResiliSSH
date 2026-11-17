@@ -211,6 +211,11 @@ h2 {
   background: var(--warn);
 }
 
+/* 连接出问题时这里显示的是整句状态里的一段（如 reconnecting in 6 s），单独成行时首字母要大写。 */
+.mini-transfer-speed::first-letter {
+  text-transform: uppercase;
+}
+
 .mini-transfer-speed {
   min-height: 15px;
   font-size: 11px;
@@ -344,6 +349,19 @@ input[type="radio"] {
   opacity: 0.45;
 }
 
+/* 不走 .btn 的自绘按钮与可点击行：键盘聚焦时用同一种焦点环，而不是各浏览器默认的描边。 */
+.nav-item:focus-visible,
+.mini-transfer:focus-visible,
+.icon-btn:focus-visible,
+.path-star:focus-visible,
+.server-item:focus-visible,
+.remote-browse-item:focus-visible,
+.settings-row.is-link:focus-visible,
+.log-jump:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 /* 主操作用品牌渐变（取自应用图标），是界面里唯一的强调色块：每一页只有一个，一眼就能找到。 */
 .btn-primary {
   background: var(--brand-gradient);
@@ -386,6 +404,10 @@ input[type="radio"] {
   font-size: 12px;
 }
 
+.btn-link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
 /* 实心红：只用于确认框里不可撤销的主操作。 */
 .btn-danger {
   background: var(--danger);
@@ -425,6 +447,11 @@ input[type="radio"] {
 .btn-danger-soft {
   background: var(--danger-soft);
   color: var(--danger-text);
+}
+
+/* 与主按钮的悬停反馈同一种手法（调亮度），不为悬停单独引入一个颜色。 */
+.btn-danger-soft:hover:not(:disabled) {
+  filter: brightness(0.92);
 }
 
 .btn-danger-text {
@@ -530,6 +557,11 @@ input[type="radio"] {
   margin: 0;
   font-size: 12px;
   color: var(--text-tertiary);
+}
+
+/* 按需才有内容的提示（如语言切换提示）：没内容时连外边距一起收起，否则所在分组下方会多出一截空白。 */
+.hint:empty {
+  display: none;
 }
 
 .input-row {
@@ -1074,13 +1106,18 @@ input[type="radio"] {
   color: var(--text-tertiary);
 }
 
+/* 窄窗口加上批量进度标签后这一行很挤：文件名优先保住，让目标路径先省略。 */
 .run-summary strong {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 45%;
 }
 
 .run-summary .run-target {
+  flex: 1 1 0;
+  min-width: 0;
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1123,6 +1160,19 @@ input[type="radio"] {
   color: var(--warn-text);
 }
 
+/* 连接、重连、无响应时徽章前有一个呼吸的圆点：说明应用仍在处理，而不是停在了一个出错的状态上。 */
+.badge.retrying::before,
+.badge.stalled::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 6px 1px 0;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
 .map-frame {
   flex: 1;
   min-height: 150px;
@@ -1151,6 +1201,11 @@ input[type="radio"] {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+}
+
+/* 占位但不可见，见 syncMapLegend。 */
+.map-legend .is-reserved {
+  visibility: hidden;
 }
 
 .swatch {
@@ -1220,25 +1275,32 @@ input[type="radio"] {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  flex: 1;
   min-width: 0;
   padding-bottom: 2px;
 }
 
-.progress-detail {
+/* 这两行固定各占一行：重连时文案变长也只是省略，不能换行把上面的地图挤矮。 */
+.progress-detail,
+.progress-speed-line {
   font-size: 13px;
-  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.progress-detail {
+  color: var(--text-secondary);
 }
 
 .progress-speed-line {
-  font-size: 13px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
 }
 
+/* 重连 / 无响应：这一行此刻说的是「出了什么事、正在怎么处理」，保持与速度同样的字重，只换成提醒色。 */
 .progress-speed-line.stale {
   color: var(--warn-text);
-  font-weight: 500;
 }
 
 /* ───────── 传输：结果视图 ───────── */
@@ -1372,7 +1434,8 @@ input[type="radio"] {
 .result-subtitle {
   color: var(--text-secondary);
   white-space: pre-line;
-  word-break: break-all;
+  /* 长路径没有空格，要允许在任意处断开；但不能用 break-all，那样普通单词也会被拦腰截断。 */
+  overflow-wrap: anywhere;
 }
 
 .verify-summary {
@@ -1419,7 +1482,8 @@ input[type="radio"] {
 
 .servers-layout {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  /* minmax(0, 1fr)：单写 1fr 时这一列不会窄于内容的最小宽度，底部那排按钮放不下就会把整页撑出横向滚动。 */
+  grid-template-columns: 220px minmax(0, 1fr);
   gap: 24px;
   overflow: hidden;
 }
@@ -1427,7 +1491,7 @@ input[type="radio"] {
 /* 窄窗口下把宽度让给编辑表单：列表里的长名称本来就会省略显示，表单里的主机名却需要看全。 */
 @media (max-width: 860px) {
   .servers-layout {
-    grid-template-columns: 180px 1fr;
+    grid-template-columns: 180px minmax(0, 1fr);
     gap: 18px;
   }
 }
@@ -1578,6 +1642,8 @@ input[type="radio"] {
 .editor-actions {
   display: flex;
   align-items: center;
+  /* 正常情况下一行放得下；换行只是兜底，文案更长的语言也不至于把按钮挤出窗口。 */
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: auto;
   padding-top: 12px;
@@ -1710,12 +1776,16 @@ input[type="radio"] {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* 纵向 flex：没有记录时空状态靠 margin: auto 在列表里居中，与服务器列表一致。 */
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-l);
 }
 
 .history-row {
   position: relative;
+  flex: none;
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
@@ -1824,7 +1894,11 @@ input[type="radio"] {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 6px 0;
+  /* 纵向 flex：空状态靠 margin: auto 居中；日志行各占自己的高度。 */
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-l);
   background: var(--bg-elevated);
@@ -1834,20 +1908,32 @@ input[type="radio"] {
 }
 
 .log-row {
+  flex: none;
   display: grid;
-  /* 分类列按最长的英文分类（Permission）留宽；中文分类都是两个字，单独收窄，免得留白挤压正文 */
-  grid-template-columns: 62px 16px 78px 1fr;
-  align-items: start;
+  /* 分类列按最长的英文分类（Verification）留宽；中文分类都是两个字，单独收窄，免得留白挤压正文 */
+  grid-template-columns: 58px 8px 72px minmax(0, 1fr);
+  /* 时间、分类的字号比正文小：按基线对齐，三列的首行才落在同一条线上 */
+  align-items: baseline;
   gap: 8px;
-  padding: 3px 14px;
+  padding: 4px 8px;
+  border-radius: var(--radius-s);
 }
 
 :lang(zh) .log-row {
-  grid-template-columns: 62px 16px 30px 1fr;
+  grid-template-columns: 58px 8px 30px minmax(0, 1fr);
 }
 
 .log-row:hover {
   background: var(--bg-hover);
+}
+
+/* 警告和错误整行铺一层底色：几百行里往下扫，靠色块就能找到出问题的地方，不必逐行读圆点。 */
+.log-row.warn {
+  background: var(--warn-soft);
+}
+
+.log-row.error {
+  background: var(--danger-soft);
 }
 
 .log-time {
@@ -1860,9 +1946,8 @@ input[type="radio"] {
 .log-level {
   width: 7px;
   height: 7px;
-  /* 多行消息时圆点对齐首行，而不是整行垂直居中 */
-  align-self: start;
-  margin-top: 6px;
+  /* 圆点没有文字，基线对齐时取它的下边缘；上移一点让它落在首行小写字母的中部 */
+  transform: translateY(-1.5px);
   border-radius: 50%;
   background: var(--text-tertiary);
 }
@@ -1880,25 +1965,66 @@ input[type="radio"] {
 }
 
 .log-category {
-  font-size: 11px;
-  color: var(--text-tertiary);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.log-row.warn .log-category {
+  color: var(--warn-text);
+}
+
+.log-row.error .log-category {
+  color: var(--danger-text);
+}
+
+/* 正文一律用主文字色：整行已有底色标出级别，长段的棕色、红色文字反而不好读。 */
 .log-message {
   color: var(--text-primary);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
-.log-row.warn .log-message {
-  color: var(--warn-text);
+/* 空状态：图标 + 一句结论 + 一句说明，必要时带一个恢复操作。 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  margin: auto;
+  padding: 24px 16px;
+  text-align: center;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-.log-row.error .log-message {
-  color: var(--danger-text);
+.empty-state-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  margin-bottom: 4px;
+  border-radius: 50%;
+  background: var(--btn-secondary-bg);
+  color: var(--text-tertiary);
+}
+
+.empty-state-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.empty-state-detail {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.empty-state .btn {
+  margin-top: 8px;
 }
 
 .log-jump {

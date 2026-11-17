@@ -8,7 +8,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { connectionPayload, prepareConnection } from "./connection";
 import { bookmarkBtn, dropZone, fileChip, fileChipName, fileChipPath, hostInput, localPathInput, pathMenu, portInput, remotePathInput, resolvedPathHint, usernameInput } from "./dom";
 import { DEFAULT_SSH_PORT } from "./constants";
-import { asDir, describeError, fileNameOf, formatBytes, pathCompatible, remoteDirOf } from "./format";
+import { asDir, CLAUSE_SEPARATOR, describeError, fileNameOf, formatBytes, LABEL_SEPARATOR, LIST_SEPARATOR, pathCompatible, remoteDirOf } from "./format";
 import { showPage } from "./nav";
 import { clearProbeResult, scheduleBackgroundProbe } from "./probe";
 import { setStatus } from "./progress";
@@ -40,7 +40,7 @@ export function reportExpansionWarnings(expanded: ExpandedPaths) {
       }),
     );
   }
-  if (notes.length > 0) setStatus(notes.join("；"), "retry");
+  if (notes.length > 0) setStatus(notes.join(CLAUSE_SEPARATOR), "retry");
 }
 
 
@@ -238,7 +238,7 @@ export function updateDropZoneState() {
       return rel ? `${rel}/${fileNameOf(p)}` : fileNameOf(p);
     });
     fileChipPath.textContent =
-      (totalSize > 0 ? `${formatBytes(totalSize)} · ` : "") + names.join("、");
+      (totalSize > 0 ? `${formatBytes(totalSize)} · ` : "") + names.join(LIST_SEPARATOR);
     fileChipPath.title = names.join("\n");
   } else {
     fileChipName.textContent = fileNameOf(path);
@@ -345,7 +345,7 @@ export function updateResolvedPathHint() {
   const remote = remotePathInput.value.trim();
   if (resolved && resolved !== remote && resolved !== localPathInput.value.trim()) {
     const label = isDownloadMode() ? t("实际保存至") : t("实际上传至");
-    resolvedPathHint.textContent = `${label}：${resolved}`;
+    resolvedPathHint.textContent = `${label}${LABEL_SEPARATOR}${resolved}`;
     resolvedPathHint.classList.remove("hidden");
   } else {
     resolvedPathHint.classList.add("hidden");

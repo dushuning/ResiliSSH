@@ -173,7 +173,7 @@ export function appTemplate(appName: string): string {
                 <span><i class="swatch swatch-done"></i><span id="legendDoneLabel">${t("本次已传")}</span></span>
                 <span><i class="swatch swatch-active"></i>${t("正在传输")}</span>
                 <span><i class="swatch swatch-pending"></i>${t("待传")}</span>
-                <span class="hidden" id="legendRetry"><i class="swatch swatch-retry"></i>${t("断线重连处")}</span>
+                <span class="is-reserved" id="legendRetry"><i class="swatch swatch-retry"></i>${t("断线重连处")}</span>
                 <span class="map-caption" id="mapCaption"></span>
               </div>
               <div class="command-console hidden" id="commandConsole">
@@ -330,8 +330,8 @@ export function appTemplate(appName: string): string {
               <label><input type="radio" name="logFilter" value="warn" /><span>${t("警告及以上")}</span></label>
               <label><input type="radio" name="logFilter" value="error" /><span>${t("仅错误")}</span></label>
             </div>
-            <button class="btn btn-secondary btn-small" id="copyLogBtn" type="button">${icons.copy}${t("复制")}</button>
-            <button class="btn btn-plain btn-small" id="clearLogBtn" type="button">${t("清空")}</button>
+            <button class="btn btn-secondary btn-small" id="copyLogBtn" type="button" title="${t("复制当前显示的日志")}">${icons.copy}${t("复制")}</button>
+            <button class="btn btn-plain btn-small" id="clearLogBtn" type="button" title="${t("清空全部日志")}">${t("清空")}</button>
           </div>
         </header>
         <div class="page-body logs-layout">

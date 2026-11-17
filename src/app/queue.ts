@@ -7,7 +7,7 @@ import { connectionPayload, prepareConnection } from "./connection";
 import { DEFAULT_SSH_PORT } from "./constants";
 import { showConfirm, showConfirmChoice } from "./dialogs";
 import { forceOverwriteInput, hostInput, localPathInput, portInput, postCommandInput, profileSelect, queueChip, remotePathInput, resultFiles, transferBtn, usernameInput } from "./dom";
-import { asDir, describeError, fileNameOf } from "./format";
+import { asDir, COMMA_SEPARATOR, describeError, fileNameOf } from "./format";
 import { showPage } from "./nav";
 import { setSelectedDownloads, setSelectedUploads, updateResolvedPathHint } from "./paths";
 import { clearDockProgress } from "./dock";
@@ -542,7 +542,7 @@ export async function finishQueue(
     otherCount > 0 ? t("未完成 {otherCount} 个", { otherCount }) : "",
   ]
     .filter(Boolean)
-    .join("，");
+    .join(COMMA_SEPARATOR);
   const commandNote = template ? t("\n因有文件未成功，传完后命令没有执行") : "";
   if (cancelled) {
     showResult("paused", download ? t("批量下载已取消") : t("批量上传已取消"), `${summary}${commandNote}`, stats);

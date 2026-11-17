@@ -4,6 +4,7 @@
  */
 
 import { locale, t } from "../i18n";
+import { icons } from "./icons";
 
 export type LogLevel = "info" | "success" | "warn" | "error";
 export type LogCategory =
@@ -56,6 +57,14 @@ function formatClock(tsMs: number): string {
   return new Date(tsMs).toLocaleTimeString(locale(), { hour12: false });
 }
 
+/** 视图之外的控件（筛选、复制、清空）与视图之间的接线，见 bindControls。 */
+export interface ActivityLogControls {
+  /** 条目数变化时通知：total 是全部条目数，shown 是当前筛选下显示的条目数。 */
+  onCountsChange(total: number, shown: number): void;
+  /** 用户在空状态里点了「显示全部」。 */
+  onShowAll(): void;
+}
+
 export class ActivityLogView {
   private entries: ActivityEntry[] = [];
   private lastId = 0;
@@ -63,6 +72,7 @@ export class ActivityLogView {
   private visible = false;
   private unreadErrors = 0;
   private following = true;
+  private controls: ActivityLogControls | null = null;
 
   constructor(
     private readonly list: HTMLElement,
@@ -75,6 +85,15 @@ export class ActivityLogView {
     });
     jumpButton.addEventListener("click", () => this.scrollToBottom());
     this.render();
+  }
+
+  /**
+   * 筛选、复制、清空这些控件在视图之外：视图只把「现在有多少条」告诉它们（没有内容时复制/清空应当禁用），
+   * 并在空状态的「显示全部」被点击时请它们把筛选切回去，自己不去碰那些 DOM。
+   */
+  bindControls(controls: ActivityLogControls) {
+    this.controls = controls;
+    this.notifyCounts();
   }
 
   /** 页面加载时补拉后端缓冲里的历史；与实时事件按 id 去重，先监听后补拉也不会重复。 */
@@ -96,11 +115,17 @@ export class ActivityLogView {
       this.unreadErrors += 1;
       this.updateBadge();
     }
-    if (!this.matches(entry)) return;
+    if (!this.matches(entry)) {
+      // 空状态里写着「隐藏了 N 条」，被筛掉的新条目也要让这个数字跟着变。
+      if (this.list.querySelector(".empty-state")) this.render();
+      else this.notifyCounts();
+      return;
+    }
 
-    this.list.querySelector(".list-empty")?.remove();
+    this.list.querySelector(".empty-state")?.remove();
     this.list.append(this.renderRow(entry));
     while (this.list.childElementCount > MAX_ENTRIES) this.list.firstElementChild?.remove();
+    this.notifyCounts();
 
     if (this.following) this.scrollToBottom();
     else this.jumpButton.classList.remove("hidden");
@@ -142,21 +167,52 @@ export class ActivityLogView {
     return LEVEL_RANK[entry.level] >= FILTER_MIN_RANK[this.filter];
   }
 
+  private notifyCounts() {
+    this.controls?.onCountsChange(this.entries.length, this.entries.filter((e) => this.matches(e)).length);
+  }
+
   private render() {
     const visible = this.entries.filter((e) => this.matches(e));
     if (visible.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "list-empty";
-      empty.textContent =
-        this.entries.length === 0
-          ? t("暂无日志\n连接、认证、传输、重连、校验的每一步都会记录在这里")
-          : t("当前筛选条件下没有日志");
-      this.list.replaceChildren(empty);
+      this.list.replaceChildren(this.renderEmptyState());
       this.jumpButton.classList.add("hidden");
-      return;
+    } else {
+      this.list.replaceChildren(...visible.map((e) => this.renderRow(e)));
+      this.scrollToBottom();
     }
-    this.list.replaceChildren(...visible.map((e) => this.renderRow(e)));
-    this.scrollToBottom();
+    this.notifyCounts();
+  }
+
+  /**
+   * 两种「空」要分开说：真的还没有日志，还是被筛选藏起来了。后一种必须写明藏了多少条并给出一键恢复，
+   * 否则用户会以为日志丢了。
+   */
+  private renderEmptyState(): HTMLElement {
+    const hiddenCount = this.entries.length;
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    const icon = document.createElement("span");
+    icon.className = "empty-state-icon";
+    icon.innerHTML = icons.logs;
+    const title = document.createElement("div");
+    title.className = "empty-state-title";
+    const detail = document.createElement("div");
+    detail.className = "empty-state-detail";
+    empty.append(icon, title, detail);
+    if (hiddenCount === 0) {
+      title.textContent = t("还没有日志");
+      detail.textContent = t("连接、认证、传输、重连、校验的每一步都会记录在这里");
+      return empty;
+    }
+    title.textContent = this.filter === "error" ? t("没有错误") : t("没有警告或错误");
+    detail.textContent = t("当前筛选隐藏了 {count} 条日志", { count: hiddenCount });
+    const showAll = document.createElement("button");
+    showAll.type = "button";
+    showAll.className = "btn btn-secondary btn-small";
+    showAll.textContent = t("显示全部");
+    showAll.addEventListener("click", () => this.controls?.onShowAll());
+    empty.append(showAll);
+    return empty;
   }
 
   private renderRow(entry: ActivityEntry): HTMLElement {

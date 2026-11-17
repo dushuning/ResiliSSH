@@ -37,7 +37,8 @@ for (const file of walk(SRC)) {
   const code = stripComments(readFileSync(file, "utf8"));
   for (const m of code.matchAll(/\bt\(\s*"((?:[^"\\]|\\.)*)"/g)) used.add(unescape(m[1]));
   const withoutT = code.replace(/\bt\(\s*"((?:[^"\\]|\\.)*)"/g, "t(\"\")");
-  for (const m of withoutT.matchAll(/["'`]([^"'`\n]*[一-鿿][^"'`\n]*)["'`]/g)) {
+  // 除了汉字，也查全角标点（、，；：（）等）：只写了标点的拼接符同样会原样出现在英文界面里。
+  for (const m of withoutT.matchAll(/["'`]([^"'`\n]*[一-鿿、-〿！-｠][^"'`\n]*)["'`]/g)) {
     if (!ALLOWED.some((a) => m[1].includes(a))) leftovers.push(`${file.replace(SRC, "src/")}: ${m[1]}`);
   }
 }

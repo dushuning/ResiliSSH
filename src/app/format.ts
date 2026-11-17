@@ -1,6 +1,16 @@
 // 纯函数工具：字节、速度、时间、路径的格式化与解析，不依赖任何界面状态。
 import { locale, t } from "../i18n";
 
+/**
+ * 拼接文案用的标点随界面语言走：中文是全角的顿号、逗号、分号、冒号，英文是半角加空格。
+ * 写死全角标点的话，英文界面里会出现「a.jar、b.jar」「Uploading to：/path」这样的混排。
+ */
+export const LIST_SEPARATOR = t("、");
+export const COMMA_SEPARATOR = t("，");
+export const CLAUSE_SEPARATOR = t("；");
+export const LABEL_SEPARATOR = t("：");
+
+
 export function fileNameOf(path: string): string {
   return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
 }

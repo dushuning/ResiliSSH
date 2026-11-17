@@ -6,20 +6,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { clarifyTransferError } from "./backendText";
 import { commandContextFor, describeCommandFailure, runPostCommand, showCommandResult, updateSaveCommandButton } from "./command";
 import { connectionPayload, prepareConnection } from "./connection";
-import { TRANSFER_LOCK_SELECTORS, UI_STALL_WARN_MS } from "./constants";
+import { TRANSFER_LOCK_SELECTORS } from "./constants";
 import { blockMap, browseRemoteBtn, cancelBtn, composeView, dropHint, dropZoneIcon, hostInput, pickFileBtn, forceOverwriteInput, languageHint, forceOverwriteLabel, localPathInput, localPathLabel, modeHint, pathHint, pickFolderBtn, postCommandInput, progressDetail, progressWrap, remotePathInput, remotePathLabel, resultBackBtn, resultCard, resultCommand, resultIcon, resultStats, resultSubtitle, resultTitle, resultView, runView, statusText, testConnBtn, transferBtn, localField, remoteField, verifySummary, viewLogBtn } from "./dom";
 import { asDir, fileNameOf, formatBytes, formatDuration, prefersReducedMotion } from "./format";
 import { loadHistory, refreshCheckpointFromDisk, restoreActiveCheckpoint } from "./history";
 import { isQueueSelection, updateBookmarkButton, updateResolvedPathHint } from "./paths";
 import { clearLastProbe, clearProbeDebounce, confirmDownloadAction, confirmUploadAction, probeRemoteDownload, probeRemoteUpload, showDownloadProbeResult, showProbeResult, updateTransferStatePanel } from "./probe";
-import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showProgressSpeed, showReconnectingSpeedText, showTransferStatus, showVerifySummary, showWaitingSpeedText, startProgressWatchdog, stopProgressWatchdog, updateProgress, updateProgressDetail } from "./progress";
+import { applyActiveTransferBadge, beginRunVisuals, hideProgressSpeed, hideTransferStatus, hideVerifySummary, markProgressActivity, recordSpeedSample, refreshLiveVisuals, refreshSpeedDisplay, resetSpeedTracker, setBadge, setProgressState, showLinkTrouble, showProgressSpeed, showTransferStatus, showVerifySummary, startProgressWatchdog, stopProgressWatchdog, syncMapLegend, updateProgress, updateProgressDetail } from "./progress";
 import { clearDockProgress } from "./dock";
 import { recordReceipt, syncReceiptVisibility } from "./receipt";
 import { updateRemoteBrowseModeUi } from "./remoteBrowse";
 import { clearSavedBatch } from "./savedBatch";
 import { readParallelConnections } from "./settings";
 import { isBusy, state } from "./state";
-import { ByteRange, DownloadCheckpoint, ReceiptFile, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadStart } from "./types";
+import { ByteRange, DownloadCheckpoint, DownloadRetryEvent, ReceiptFile, ResultKind, RunStats, TransferDirection, TransferView, UploadCheckpoint, UploadRetryEvent, UploadStart } from "./types";
 
 export function isDownloadMode(): boolean {
   return state.transferDirection === "download";
@@ -505,6 +505,24 @@ export function showResult(
 }
 
 
+/**
+ * 后端排定了一次重连（上传、下载共用）：记下退避时间供倒计时使用，在地图上标出断线位置，
+ * 并切到「重连中」的呈现。
+ */
+export function handleRetryEvent(event: UploadRetryEvent | DownloadRetryEvent) {
+  state.retryCount = event.retry_count;
+  state.retryDelayMs = event.delay_ms;
+  state.retryScheduledAt = Date.now();
+  state.isReconnecting = true;
+  state.isConnecting = false;
+  blockMap.markRetry();
+  syncMapLegend();
+  updateProgressDetail(state.progressTransferredBytes, state.progressTotalBytes, state.retryCount);
+  showLinkTrouble();
+  showTransferStatus(event.message, "retry");
+}
+
+
 export function handleProgressUpdate(
   transferred: number,
   total: number,
@@ -529,15 +547,12 @@ export function handleProgressUpdate(
   const uploading = direction === "upload";
 
   if (status === "stalled") {
+    // 后端判定无响应后会主动断开并重连，所以从这一刻起就是「重连中」。
     state.isReconnecting = true;
     progressWrap.classList.add("stalled");
-    applyActiveTransferBadge(direction);
-    showWaitingSpeedText(
-      state.lastProgressEventAt > 0 ? Date.now() - state.lastProgressEventAt : UI_STALL_WARN_MS,
-    );
     updateProgressDetail(transferred, total, retry_count);
+    showLinkTrouble();
     showTransferStatus(message, "retry");
-    refreshLiveVisuals();
     return;
   }
 
@@ -675,12 +690,9 @@ export function handleProgressUpdate(
 
   if (status === "retrying") {
     state.isReconnecting = true;
-    setProgressState("retrying");
-    setBadge(t("重试中"), "retrying");
-    showReconnectingSpeedText();
     updateProgressDetail(transferred, total, retry_count);
+    showLinkTrouble();
     showTransferStatus(message, "retry");
-    refreshLiveVisuals();
     return;
   }
 

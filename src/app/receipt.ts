@@ -6,7 +6,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { connectionPayload } from "./connection";
 import { COPY_FEEDBACK_MS } from "./constants";
 import { copyReceiptBtn, resultReceipt, saveReceiptBtn } from "./dom";
-import { describeError, formatBytes, formatDuration } from "./format";
+import { describeError, formatBytes, formatDuration, LABEL_SEPARATOR } from "./format";
 import { setStatus } from "./progress";
 import { state } from "./state";
 import { ReceiptFile, RunReceipt, RunStats, TransferDirection } from "./types";
@@ -80,15 +80,18 @@ async function buildReceiptText(receipt: RunReceipt): Promise<string> {
   const server = receipt.via.length > 0
     ? t("{endpoint}（经 {via}）", { endpoint: receipt.endpoint, via: receipt.via.join(" → ") })
     : receipt.endpoint;
+  // 冒号和括号随界面语言走：凭证会被贴给同事，英文凭证里不能混进全角标点。
+  const field = (label: string, value: string) => `${label}${LABEL_SEPARATOR}${value}`;
+  const withNote = (text: string, note: string) => t("{text}（{note}）", { text, note });
   const lines = [
     t("ResiliSSH 传输凭证"),
     "",
-    `${t("方向")}：${download ? t("下载") : t("上传")}`,
-    `${t("目标服务器")}：${server}`,
-    `${t("开始时间")}：${formatTimestamp(receipt.startedAt)}`,
-    `${t("完成时间")}：${formatTimestamp(receipt.finishedAt)}（${formatDuration(receipt.elapsedMs)}）`,
-    `${t("校验方式")}：${receipt.verification}`,
-    `${t("自动重连")}：${t("{retries} 次", { retries: receipt.retries })}`,
+    field(t("方向"), download ? t("下载") : t("上传")),
+    field(t("目标服务器"), server),
+    field(t("开始时间"), formatTimestamp(receipt.startedAt)),
+    field(t("完成时间"), withNote(formatTimestamp(receipt.finishedAt), formatDuration(receipt.elapsedMs))),
+    field(t("校验方式"), receipt.verification),
+    field(t("自动重连"), t("{retries} 次", { retries: receipt.retries })),
     "",
     t("文件（{count} 个）：", { count: receipt.files.length }),
   ];
@@ -96,12 +99,12 @@ async function buildReceiptText(receipt: RunReceipt): Promise<string> {
     const digest = digests[i];
     lines.push(
       "",
-      `  ${t("本地")}：${file.local}`,
-      `  ${t("远端")}：${file.remote}`,
-      `  ${t("大小")}：${digest ? `${formatBytes(digest.size)}（${digest.size} B）` : t("无法读取")}`,
-      `  SHA-256：${digest?.sha256 ?? t("无法读取（本地文件可能已被移动或修改）")}`,
+      `  ${field(t("本地"), file.local)}`,
+      `  ${field(t("远端"), file.remote)}`,
+      `  ${field(t("大小"), digest ? withNote(formatBytes(digest.size), `${digest.size} B`) : t("无法读取"))}`,
+      `  ${field("SHA-256", digest?.sha256 ?? t("无法读取（本地文件可能已被移动或修改）"))}`,
     );
-    if (file.skipped) lines.push(`  ${t("说明")}：${t("两端已完全一致，本次未传输")}`);
+    if (file.skipped) lines.push(`  ${field(t("说明"), t("两端已完全一致，本次未传输"))}`);
   });
   lines.push(
     "",

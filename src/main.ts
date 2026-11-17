@@ -18,7 +18,7 @@ import { clearCheckpointFor, loadHistory, refreshCheckpointFromDisk, restoreActi
 import { showPage } from "./app/nav";
 import { isQueueSelection, openPathMenu, pickLocalFolders, pickLocalPaths, setupDragDrop, toggleBookmark, updateDropZoneState, updateResolvedPathHint } from "./app/paths";
 import { clearLastProbe, clearProbeResult, invalidateProbeOnEdit, runBackgroundProbe, updateTransferStatePanel } from "./app/probe";
-import { refreshLiveVisuals, setBadge, setProgressState, setStatus, showReconnectingSpeedText, showTransferStatus, syncMapLegend, updateProgressDetail } from "./app/progress";
+import { setBadge, setProgressState, setStatus, showTransferStatus, syncMapLegend } from "./app/progress";
 import { offerSavedBatchOnLaunch, startQueueFlow } from "./app/queue";
 import { clearSavedBatch } from "./app/savedBatch";
 import { applyRemoteBrowseSelection, applyRemoteDownloadPicks, closeRemoteBrowseOverlay, createRemoteBrowseDir, hideRemoteBrowseNewDirForm, loadRemoteBrowseDir, openRemoteBrowseDialog, remoteBrowsePicked, showRemoteBrowseNewDirForm, updateRemoteBrowseModeUi } from "./app/remoteBrowse";
@@ -26,7 +26,7 @@ import { applyHostSelection, applyProfile, defaultProfileName, restoreLastServer
 import { applyParallelConnections, applyThemePreference, initLanguagePreference, initParallelConnections, initThemePreference } from "./app/settings";
 import { copyReceipt, saveReceipt } from "./app/receipt";
 import { isBusy, state } from "./app/state";
-import { clearStartPhase, getTransferredBytes, handleProgressUpdate, isDownloadMode, setTransferring, showStartPhase, showTransferView, startDownloadFlow, startUploadFlow, syncBusyLock, updateModeHint, updateTransferButtonLabel, updateTransferDirectionUI } from "./app/transfer";
+import { clearStartPhase, getTransferredBytes, handleProgressUpdate, handleRetryEvent, isDownloadMode, setTransferring, showStartPhase, showTransferView, startDownloadFlow, startUploadFlow, syncBusyLock, updateModeHint, updateTransferButtonLabel, updateTransferDirectionUI } from "./app/transfer";
 import { ConnectionProfile, DownloadCheckpoint, DownloadProgressEvent, DownloadRetryEvent, PageId, ThemePreference, TransferDirection, UploadCheckpoint, UploadProgressEvent, UploadRetryEvent } from "./app/types";
 
 // 先告诉后端界面语言：之后后端生成的错误信息、活动日志都按这个语言输出。
@@ -493,9 +493,22 @@ copyLogBtn.addEventListener("click", async () => {
 });
 
 
-document.querySelector<HTMLButtonElement>("#clearLogBtn")!.addEventListener("click", () => {
+const clearLogBtn = document.querySelector<HTMLButtonElement>("#clearLogBtn")!;
+
+clearLogBtn.addEventListener("click", () => {
   activityLog.clear();
   void invoke("clear_activity_log").catch(() => {});
+});
+
+
+activityLog.bindControls({
+  // 没有可复制 / 可清空的内容时把按钮置灰，免得点了像是没反应。
+  onCountsChange: (total, shown) => {
+    copyLogBtn.disabled = shown === 0;
+    clearLogBtn.disabled = total === 0;
+  },
+  // 走单选框自己的 click：选中状态和筛选结果由同一个 change 事件更新，不会对不上。
+  onShowAll: () => document.querySelector<HTMLInputElement>('input[name="logFilter"][value="all"]')!.click(),
 });
 
 
@@ -587,7 +600,8 @@ void listen("transfer-close-requested", async () => {
   const ok = await showConfirm(
     t("传输进行中"),
     t("关闭窗口将取消当前传输。已传输的部分会保留为断点，下次打开可以接着传。"),
-    { ok: t("关闭并取消传输"), cancel: t("继续传输"), tone: "danger" },
+    // 取消按钮不复用「继续传输」：那个词在结果页指「接着传」（英文 Resume），这里的意思是「别关窗口」。
+    { ok: t("关闭并取消传输"), cancel: t("不关闭"), tone: "danger" },
   );
   if (!ok) return;
 
@@ -708,38 +722,9 @@ void listen<DownloadProgressEvent>("download-progress", (event) => {
 });
 
 
-void listen<UploadRetryEvent>("upload-retry", (event) => {
-  state.retryCount = event.payload.retry_count;
-  state.retryDelayMs = event.payload.delay_ms;
-  state.retryScheduledAt = Date.now();
-  state.isReconnecting = true;
-  state.isConnecting = false;
-  blockMap.markRetry();
-  syncMapLegend();
-  updateProgressDetail(state.progressTransferredBytes, state.progressTotalBytes, state.retryCount);
-  setProgressState("retrying");
-  setBadge(t("重试中"), "retrying");
-  showReconnectingSpeedText();
-  showTransferStatus(event.payload.message, "retry");
-  refreshLiveVisuals();
-});
+void listen<UploadRetryEvent>("upload-retry", (event) => handleRetryEvent(event.payload));
 
-
-void listen<DownloadRetryEvent>("download-retry", (event) => {
-  state.retryCount = event.payload.retry_count;
-  state.retryDelayMs = event.payload.delay_ms;
-  state.retryScheduledAt = Date.now();
-  state.isReconnecting = true;
-  state.isConnecting = false;
-  blockMap.markRetry();
-  syncMapLegend();
-  updateProgressDetail(state.progressTransferredBytes, state.progressTotalBytes, state.retryCount);
-  setProgressState("retrying");
-  setBadge(t("重试中"), "retrying");
-  showReconnectingSpeedText();
-  showTransferStatus(event.payload.message, "retry");
-  refreshLiveVisuals();
-});
+void listen<DownloadRetryEvent>("download-retry", (event) => handleRetryEvent(event.payload));
 
 
 setupDragDrop();
